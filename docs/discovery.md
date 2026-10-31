@@ -355,6 +355,24 @@ task index rather than scanning every saved pair decision. Deeper blocks are
 smaller, but their number can increase when a surviving parent splits. These
 counts describe an interleaved queue, not a sequence of completed depth stages.
 
+For a readable diagnosis and a saved snapshot:
+
+```bash
+python benchmarks/inspect_discovery.py --out kovar_v090 --summary --json-out progress_1.json
+# Run again later; use a new output filename to retain the earlier snapshot.
+python benchmarks/inspect_discovery.py --out kovar_v090 --summary \
+  --previous progress_1.json --json-out progress_2.json
+```
+
+`--summary` includes depth reporting automatically. It bounds finished top-level
+branches using opened branches and pending blocks, including internal-category
+branches. Percentages measure search-policy coverage, not the fraction of time
+elapsed or individually tested pairs. An ETA requires two comparable snapshots
+with non-overlapping completion intervals and assumes recent branch throughput
+continues. Distance, beta and export are excluded. Add `--log path/to/job.out`
+for recent query throughput. The diagnosis reads pending tasks without scanning
+the complete decisions table; use snapshots rather than frequent polling.
+
 An annotated distal map can use the existing network helper directly:
 
 ```bash
