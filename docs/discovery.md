@@ -1,6 +1,6 @@
 # Unitig discovery in KOVAR 0.9.2
 
-Current execution revision: **`prefit-compact-1`**, tagged `v0.9.2-perf1`.
+Current execution revision: **`prefit-compact-2`**, tagged `v0.9.2-perf2`.
 The original `v0.9.2` tag remains unchanged. `--version` still reports 0.9.2;
 the startup banner, identities and summaries identify the execution revision.
 
@@ -39,6 +39,12 @@ The default `--prefit-nulls all` fits the full unique-response pool before pair
 testing. Existing local/imported valid fits are reused; only missing models
 are fitted. Each finished model or failed-fit status is checkpointed. The
 stage reports checked canonical patterns, status counts and complement aliases.
+Completed stages resume without launching fitting workers or revisiting every
+model. Interrupted stages check only inventory entries not yet committed for
+the requested cache format/rank. The first migration from perf1 inventories
+existing manifests once; it does not refit valid models. Model manifests remain
+recovery records if a worker finishes before its inventory transaction commits.
+Scoring still verifies each numerical cache on its first worker access.
 Failed fits stay explicitly unresolved. A failed canonical complement fit is
 not blindly copied: its missing native complement is attempted independently.
 
@@ -268,7 +274,7 @@ adjusted on resume; they are execution settings.
 Changing scientific settings requires a new output. Distances/beta can be added
 later, but changed distance inputs/cutoffs cannot overwrite earlier results.
 
-### Resume a released v0.9.0, v0.9.1 or original v0.9.2 run
+### Resume a released v0.9.0, v0.9.1 or v0.9.2 run
 
 Stop the running job **before updating its shared source checkout**. Then run
 v0.9.2 against the same OUT and original persistent work directory with `--resume`.
@@ -278,6 +284,8 @@ up as `run_identity.v090.json`, `run_identity.v091.json` or `run_identity.v092.j
 and null models are retained. Unknown edited implementations or changed science
 are rejected. The score test, Bonferroni family/alpha, gate and joint-cell rules
 are unchanged. Execution order changes do not provide a new recovery guarantee.
+Verified `v0.9.2-perf1` work also resumes; its identity backup is named
+`run_identity.v092.prefit-compact-1.json` to retain the earlier release backup.
 
 ### Reuse existing nulls
 

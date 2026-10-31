@@ -100,6 +100,14 @@ def worker_state():
         observed_usage=s.get('observed_usage'),observed_target=s.get('observed_target'))
 
 
+def sampled_worker_state():
+    now=time.monotonic()
+    if now-_STATE.get('last_snapshot',0)<5:
+        return None
+    _STATE['last_snapshot']=now
+    return worker_state()
+
+
 def cache_charge(cache):
     if cache is None:
         return 1024
@@ -107,10 +115,11 @@ def cache_charge(cache):
     size=4096
     arrays=[v for k,v in cache.items() if k!="K" and isinstance(v,np.ndarray)]
     arrays.extend(v for v in vars(cache["decomp"]).values() if isinstance(v,np.ndarray))
+    shared=[a for a in (_STATE.get('K'),getattr(_STATE.get('eigen'),'eigenvectors',None))
+            if a is not None]
     for array in arrays:
         key=(array.__array_interface__["data"][0],array.nbytes)
-        if any(np.shares_memory(array,shared) for shared in
-               (_STATE.get("K",np.empty(0)),getattr(_STATE.get("eigen"),"eigenvectors",np.empty(0)))):
+        if any(np.shares_memory(array,other) for other in shared):
             continue
         if key not in seen:
             seen.add(key)
@@ -207,7 +216,7 @@ def _view(value, pattern, canonical):
     return cache,status
 
 
-def get_null(pattern, external=None):
+def get_null(pattern, external=None, *, manifest=None):
     s=_STATE
     pressure_guard()
     if s.get('active_null') is not None and s['active_null'][0]==pattern:
@@ -219,12 +228,15 @@ def get_null(pattern, external=None):
         value=s['nulls'].get(canonical)
     else:
         meta=null_meta(canonical)
-        source=meta if meta.exists() else Path(external) if external else None
+        source,record=manifest if manifest is not None else (None,None)
+        if manifest is None:
+            source=meta if meta.exists() else Path(external) if external else None
         cache=None
         if source is not None:
             started=time.perf_counter()
             metric('null_cache_disk_loads')
-            record=json.loads(source.read_text())
+            if record is None:
+                record=json.loads(source.read_text())
             if record['array'] is not None:
                 cache=null_cache.load(record,source,s['K'],s['eigen'],verify_product)
                 if not np.array_equal(cache['y'],bits([canonical])[0]):
@@ -254,8 +266,12 @@ def get_null(pattern, external=None):
             started=time.perf_counter()
             if cache is not None and cache['decomp'].eigenvectors.shape[1]<min(rank,len(cache['y'])):
                 null_cache.complete(cache,s['K'],s['eigen'])
-            record=null_cache.save(meta.parent,canonical,cache,record,s['K'],s['eigen'],compact=compact,rank=rank)
+            record=null_cache.save(meta.parent,canonical,cache,record,s['K'],s['eigen'],compact=compact,rank=rank,
+                                   previous_record=record if source==meta else {})
+            source=meta
+            s.setdefault('inventory_updates',{})[canonical]=dict(pattern=canonical,record=record,source=str(meta),local=True)
             metric('cache_save_worker_seconds',time.perf_counter()-started)
+        s['last_null_manifest']=(source,record)
         if cache is not None:
             cache['_pattern']=canonical
             cache['_inverse_spectrum']=1/(1+cache['tau']*cache['decomp'].eigenvalues)
@@ -273,8 +289,10 @@ def ensure_complete(cache):
     if needed and null_cache.complete(cache,_STATE['K'],_STATE['eigen']):
         metric('cache_reconstruct_worker_seconds',time.perf_counter()-started)
         metric('cache_reconstructions')
+        cache.get('_base',cache)['_charge_dirty']=True
     base=cache.get('_base',cache)
-    base['_inverse_spectrum']=1/(1+cache['tau']*cache['decomp'].eigenvalues)
+    if needed or '_inverse_spectrum' not in base:
+        base['_inverse_spectrum']=1/(1+cache['tau']*cache['decomp'].eigenvalues)
     cache['_inverse_spectrum']=base['_inverse_spectrum']
 
 
@@ -291,23 +309,28 @@ def prefit_profiled(job):
     ready=record is not None and null_cache.compatible(record,compact,rank,s['info']['n'])
     if ready and record.get('array'):
         product=source.parent/record['array']['name']
-        ready=product.is_file() and (not record['array'].get('bytes') or
-                                    product.stat().st_size==record['array']['bytes'])
+        try:
+            size=product.stat().st_size
+            ready=not record['array'].get('bytes') or size==record['array']['bytes']
+        except FileNotFoundError:
+            ready=False
         if not ready:
             raise ValueError(f'Missing/truncated saved null: {product}')
     if not ready:
         mapping=s.get('canonical')
         s['canonical']=None
         try:
-            _,status=get_null(pattern,external)
+            get_null(pattern,external,manifest=(source,record))
         finally:
             s['canonical']=mapping
-        record=json.loads((meta if meta.exists() else source).read_text())
+        source,record=s.pop('last_null_manifest')
     # All validation/checksums occur on first actual numerical read. Inventory
     # resumes avoid rereading every already-compact array merely to count it.
     s['nulls'].items.clear()
     s['nulls'].bytes=0
+    s.pop('inventory_updates',None)
     return dict(pattern=pattern,status=record['status'],mode=record.get('mode','failed'),
+                record=record,source=str(source),local=source==meta,
                 metrics={k:v-before.get(k,0) for k,v in s['metrics'].items()},worker_state=worker_state())
 
 
@@ -440,7 +463,7 @@ def score(job):
             value,status=active[1]
             base=value.get('_base',value)
             key=base.get('_pattern')
-            if key in _STATE['nulls']:
+            if base.pop('_charge_dirty',False) and key in _STATE['nulls']:
                 _STATE['nulls'].put(key,(base,status),cache_charge(base))
     return result
 
@@ -455,7 +478,8 @@ def score_profiled(job):
     if "nulls" in _STATE:
         metrics["null_cache_evictions"]=_STATE["nulls"].evictions-old_evictions
         metrics["cache_peak_bytes_worker"]=_STATE["nulls"].peak_bytes
-    return dict(rows=rows,metrics=metrics,worker_state=worker_state())
+    return dict(rows=rows,metrics=metrics,worker_state=sampled_worker_state(),
+                inventory=list(_STATE.pop('inventory_updates',{}).values()))
 
 
 def beta(job):

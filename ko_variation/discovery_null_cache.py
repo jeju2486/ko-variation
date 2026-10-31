@@ -56,13 +56,16 @@ def load(record, meta, K, eigen, verify):
     return cache
 
 
-def save(folder, pattern, cache, record, K, eigen, *, compact=True, rank=128):
+def save(folder, pattern, cache, record, K, eigen, *, compact=True, rank=128, previous_record=None):
     """Publish data before its manifest; release superseded LOCAL arrays last."""
     folder=Path(folder)
     folder.mkdir(parents=True,exist_ok=True)
     meta=folder/f'null_{pattern:09d}.json'
     previous=None
-    if meta.exists():
+    if previous_record is not None:
+        if previous_record.get('array'):
+            previous=folder/previous_record['array']['name']
+    elif meta.exists():
         import json
         old=json.loads(meta.read_text())
         if old.get('array'):

@@ -17,16 +17,7 @@ from .diagnostics import (
 
 guard_blas_environment(default_threads=1)
 
-import numpy as np
-import pandas as pd
-import scipy
-
 from . import __version__
-from .checkpoint import CheckpointError, CheckpointStore, fingerprint_inputs
-from .glmm import prepare_kinship
-from .io_utils import read_fake_fasta, read_pairs, validate_pairs
-from .kinship import build_tree_covariance
-from .scan import ScanConfig, ScanMetrics, scan_pairs_glmm
 
 
 def parse_args(argv=None):
@@ -138,6 +129,9 @@ def _checkpoint_identity(
     blas_libraries: str,
 ) -> dict[str, object]:
     """Scientific inputs/settings that must match before work can be reused."""
+    import numpy as np
+    import pandas as pd
+    import scipy
 
     return {
         "tool": "KO-Variation",
@@ -190,6 +184,14 @@ def main(argv=None):
         return discover(arguments[1:])
     started = time.time()
     args = parse_args(arguments)
+    # Discovery does not use the legacy pair-table scanner/checkpoint stack.
+    import numpy as np
+    import pandas as pd
+    from .checkpoint import CheckpointError, CheckpointStore, fingerprint_inputs
+    from .glmm import prepare_kinship
+    from .io_utils import read_fake_fasta, read_pairs, validate_pairs
+    from .kinship import build_tree_covariance
+    from .scan import ScanConfig, ScanMetrics, scan_pairs_glmm
     runtime = collect_parallel_runtime(args.threads)
     out = Path(args.out)
     if out.exists() and any(out.iterdir()) and not args.overwrite and not args.resume:

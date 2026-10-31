@@ -15,7 +15,6 @@ import shutil
 import sqlite3
 import subprocess
 import time
-import zipfile
 
 import numpy as np
 import scipy
@@ -26,6 +25,7 @@ from . import __version__, __discovery_revision__
 from . import discovery_score as kernels
 from .discovery_store import atomic_json, connect, digest, prepare, write_gzip
 from .discovery_execution import ResponsePool, bounded_map
+from . import discovery_inventory as inventory
 from .memory_budget import ByteLRU, detect_budget, plan_workers, MIB
 
 
@@ -112,7 +112,7 @@ def identity(args):
     code = {name: digest(Path(__file__).with_name(name)) for name in
             ("discovery.py", "discovery_store.py", "discovery_score.py", "discovery_execution.py", "memory_budget.py",
              "discovery_compat.py", "discovery_eligibility.py", 'discovery_null_cache.py','discovery_prefit.py',
-             "null_identity.py", "glmm.py", "kinship.py")}
+             "discovery_inventory.py", "discovery_import.py", "null_identity.py", "glmm.py", "kinship.py")}
     from .null_identity import null_source_hash
     return dict(version=__version__, execution_revision=__discovery_revision__,inputs=inputs, settings=settings, code=code,
                 numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
@@ -142,6 +142,7 @@ def schema(db):
     CREATE INDEX IF NOT EXISTS distance_pending ON distance(status,u,v);
     CREATE INDEX IF NOT EXISTS distance_pattern ON distance(pu,pv,distance);
     """)
+    inventory.initialize(db)
 
 
 def get_meta(db, key, default=None):
@@ -292,13 +293,14 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
                 known[pair]=(gate,final)
     external={}
     responses=sorted({v for _,v in missing})
-    for block in batches(responses,400):
+    for block in batches(responses if getattr(args,'_has_external_nulls',True) else [],400):
         marks=','.join('?' for _ in block)
         external.update(db.execute(f'SELECT pid,path FROM external_nulls WHERE pid IN ({marks})',block))
         external.update(db.execute(f'SELECT a.pid,e.path FROM null_aliases a JOIN external_nulls e '
                                    f'ON e.pid=a.canonical WHERE a.pid IN ({marks})',block))
     totals=dict(driver_db_read_seconds=time.perf_counter()-read_started)
     pending=[]
+    models=[]
     def flush():
         if not pending:
             return
@@ -310,6 +312,8 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
             db.executemany('INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?,?,?)',pending)
             count+=sum((row[0],row[1]) in new_pairs for row in pending)
             set_meta(db,"queried_pairs_count",count)
+            inventory.record_models(db,models)
+        models.clear()
         pending.clear()
         merge_metrics(totals,dict(driver_db_write_seconds=time.perf_counter()-write_started))
     def jobs():
@@ -318,6 +322,7 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
     states={}
     for payload in bounded_map(pool,kernels.score_profiled,jobs(),args.threads,ordered=False):
         result=payload['rows']
+        models.extend(payload.get('inventory',[]))
         merge_metrics(totals,payload['metrics'])
         if payload.get('worker_state'):
             states[str(payload['worker_state']['pid'])]=payload['worker_state']
@@ -530,12 +535,15 @@ def search(db, info, pool, args):
         set_meta(db,'search_complete',True)
 
 
-def import_nulls(db, work, info, args):
+def import_nulls(db, work, info, args, *, current_identity=None):
     """Reuse v0.9 caches, or explicitly verify the former benchmark preparation.
 
     NPZ preparation components are extracted to disk before mapping, rather
     than loading the entire former unitig pool into RAM.
     """
+    if not args.reuse_nulls_from:
+        return
+    current_identity=current_identity or identity(args)
     sources,seen = deque(args.reuse_nulls_from),set()
     while sources:
         supplied = sources.popleft()
@@ -554,7 +562,6 @@ def import_nulls(db, work, info, args):
         root = supplied.parent if supplied.name == "null_models" else supplied
         prior_identity=json.loads((root/"run_identity.json").read_text())
         if str(prior_identity.get("version","")).startswith("0.9."):
-            current_identity=identity(args)
             if any(prior_identity.get(k)!=current_identity.get(k) for k in ("numpy","scipy","null_model_source_sha256")):
                 raise ValueError("Prior v0.9 null-fitting environment/source differs")
             summary = json.loads((root/"run_summary.json").read_text()) if (root/"run_summary.json").exists() else {}
@@ -563,10 +570,11 @@ def import_nulls(db, work, info, args):
             if (prior_info["samples"]!=info["samples"] or
                     any(prior_info["products"][k]!=info["products"][k] for k in ("patterns.bin","K.npy"))):
                 raise ValueError("Prior prepared patterns/covariance differ")
-            for meta in (prior_work/"null_models").glob("*/null_*.json"):
-                record = json.loads(meta.read_text())
+            records=((json.loads(meta.read_text())["pattern"],str(meta))
+                     for meta in (prior_work/"null_models").glob("*/null_*.json"))
+            for batch in batches(records,1000):
                 with db:
-                    db.execute("INSERT OR IGNORE INTO external_nulls VALUES (?,?)", (record["pattern"], str(meta)))
+                    db.executemany("INSERT OR IGNORE INTO external_nulls VALUES (?,?)",batch)
             borrowed=sqlite3.connect((prior_work/"work.sqlite").resolve().as_uri()+"?mode=ro",uri=True)
             try:
                 for batch in batches(borrowed.execute("SELECT pid,path FROM external_nulls"),1000):
@@ -575,51 +583,9 @@ def import_nulls(db, work, info, args):
             finally:
                 borrowed.close()
         else:
-            prior = json.loads((root/"run_identity.json").read_text())
-            # v2 borrowed most models in place from v1; follow those verified
-            # provenance links rather than importing only the newly fitted ones.
-            for source in prior.get("reused_null_sources",[]):
-                sources.append(Path(source["path"]))
-            old_preparation = Path(prior["settings"]["benchmark_dir"])/"preparation.npz"
-            if not old_preparation.exists():
-                raise ValueError(f"Previous benchmark preparation is required for safe reuse: {old_preparation}")
-            from .null_identity import null_source_hash, LEGACY_GLMM_HASHES, LEGACY_NULL_SOURCE
-            current = null_source_hash()
-            source = prior.get("null_model_source_sha256")
-            if source != current:
-                hashes = [r.get("sha256") for r in prior.get("inputs",[]) if r.get("name")=="glmm.py"]
-                # Some legacy identities store the scorer hash separately.
-                hashes += [prior.get("glmm_source_sha256"), prior.get("glmm_sha256"),prior.get("code",{}).get("glmm.py")]
-                if not (current == LEGACY_NULL_SOURCE and any(h in LEGACY_GLMM_HASHES for h in hashes)):
-                    raise ValueError("Prior benchmark null-fitting code is not verified compatible")
-            versions = prior.get("versions",prior)
-            if versions.get("numpy") != np.__version__ or versions.get("scipy") != scipy.__version__:
-                raise ValueError("Prior benchmark NumPy/SciPy versions differ")
-            if prior["settings"].get("null_max_iter") != 100 or prior["settings"].get("null_tolerance") != 1e-7:
-                raise ValueError("Prior null fitting settings differ")
-            expected = [r["sha256"] for r in prior["inputs"] if r["name"] == "preparation.npz"]
-            if expected != [digest(old_preparation)]:
-                raise ValueError("Previous benchmark preparation changed")
-            extracted = work/"import_preparation"
-            extracted.mkdir(exist_ok=True)
-            with zipfile.ZipFile(old_preparation) as archive:
-                for name in ("samples.npy", "K.npy", "packed.npy"):
-                    with archive.open(name) as source_file, (extracted/name).open("wb") as target:
-                        shutil.copyfileobj(source_file,target,1<<20)
-            if (list(np.load(extracted/"samples.npy", mmap_mode="r")) != info["samples"] or
-                    not np.array_equal(np.load(extracted/"K.npy", mmap_mode="r"), np.load(work/"K.npy", mmap_mode="r"))):
-                raise ValueError("Previous sample order/covariance differs; reuse rejected")
-            packed = np.load(extracted/"packed.npy", mmap_mode="r")
-            for meta in (root/"null_models").glob("null_*.json"):
-                old_pattern = json.loads(meta.read_text())["pattern"]
-                row = db.execute("SELECT id FROM patterns WHERE bits=?", (packed[old_pattern].tobytes(),)).fetchone()
-                if row:
-                    with db:
-                        db.execute("INSERT OR IGNORE INTO external_nulls VALUES (?,?)", (row[0],str(meta)))
-            del packed
-            for path in extracted.iterdir():
-                path.unlink()
-            extracted.rmdir()
+            from .discovery_import import import_benchmark_nulls
+            sources.extend(Path(item['path']) for item in prior_identity.get('reused_null_sources',[]))
+            import_benchmark_nulls(db,work,info,root,prior_identity)
         with db:
             set_meta(db,"imported:"+str(supplied),True)
 
@@ -758,12 +724,7 @@ def export(db, info, work, args, total_seconds):
         beta_status_counts=dict(db.execute("SELECT status,count(*) FROM beta GROUP BY status")),
         queried_pairs=sum(counts.values()),total_pattern_pairs=math.comb(info["patterns"],2),
         unqueried_pairs=math.comb(info["patterns"],2)-sum(counts.values()))
-    null_statuses={}
-    null_seconds=0.
-    for meta in (work/"null_models").glob("*/null_*.json"):
-        record=json.loads(meta.read_text())
-        null_statuses[record["status"]]=null_statuses.get(record["status"],0)+1
-        null_seconds+=record["fit_seconds"]
+    null_statuses,null_seconds=inventory.local_summary(db,work)
     summary.update(saved_local_null_statuses=null_statuses,
                    saved_local_null_fit_seconds=null_seconds,
                    available_imported_nulls=db.execute("SELECT count(*) FROM external_nulls").fetchone()[0])
@@ -829,7 +790,8 @@ def main(argv=None):
             family = args.bonferroni_tests or family
             if args.screen_p < args.alpha/family:
                 raise ValueError("Screening gate must be at least as permissive as final significance")
-            import_nulls(db,work,info,args)
+            import_nulls(db,work,info,args,current_identity=expected)
+            args._has_external_nulls=db.execute('SELECT 1 FROM external_nulls LIMIT 1').fetchone() is not None
             n=info['n']
             args._plan=plan_workers(args._memory_info,n,args.threads,args.batch_size)
             with db:

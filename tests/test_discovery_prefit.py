@@ -117,7 +117,13 @@ class PrefitTests(unittest.TestCase):
             db.close()
             summary=json.loads((out/'null_stage_summary.json').read_text())
             self.assertEqual(summary['complement_aliases'],1)
-            self.assertEqual(main(common+['--resume','--require-cached-nulls']),0)
+            aliases=work/'null_canonical.npy'
+            stamp=aliases.stat().st_mtime_ns
+            (out/'null_stage_summary.json').unlink()
+            with patch('ko_variation.discovery_prefit.ProcessPoolExecutor',side_effect=AssertionError('rechecked completed stage')):
+                self.assertEqual(main(common+['--resume','--require-cached-nulls']),0)
+            self.assertEqual(aliases.stat().st_mtime_ns,stamp)
+            self.assertEqual(json.loads((out/'null_stage_summary.json').read_text()),summary)
             db=connect(work/'work.sqlite')
             self.assertEqual(get_meta(db,'prefit_runtime_totals')['new_null_fits'],before)
             self.assertEqual(get_meta(db,'runtime_totals').get('new_null_fits',0),0)
