@@ -27,6 +27,7 @@ def main():
     parser.add_argument('--log',type=Path,help='Current Slurm .out log, preferably the live server copy')
     parser.add_argument('--cpus',type=int,default=24)
     parser.add_argument('--detailed',action='store_true',help='Scan decision/task tables; can be expensive on very large runs')
+    parser.add_argument('--hierarchy-depth',action='store_true',help='Report node levels and pending blocks by depth; reads pending tasks, not all decisions')
     parser.add_argument('--model-history',action='store_true',help='Read every saved model JSON for historical fitting costs (automatic for v0.9.0)')
     args=parser.parse_args()
     manifest=json.loads((args.out/'run_identity.json').read_text())
@@ -59,6 +60,7 @@ def main():
     db=sqlite3.connect((work/'work.sqlite').resolve().as_uri()+'?mode=ro',uri=True,timeout=30)
     db.execute('PRAGMA query_only=ON')
     try:
+        db.execute('BEGIN')
         report['meta']={key:json.loads(value) for key,value in db.execute(
             "SELECT key,value FROM meta WHERE key IN ('hierarchy_complete','search_initialized','root_cursor','response_coarse_columns','response_coarse_next',"
             "'coarse_scheduled_count','search_complete','distance_expanded','runtime_totals','prefit_runtime_totals',"
@@ -85,6 +87,22 @@ def main():
         if 'coarse_scheduled_count' in report['meta']:
             report['coarse_pairs_scheduled']=report['meta']['coarse_scheduled_count']
             report['still_processing_within_root_categories']=report['coarse_pairs_scheduled']==0
+        if args.hierarchy_depth:
+            scheduled=report.get('coarse_pairs_scheduled',0)
+            report['coarse_pairs_not_yet_scheduled']=max(0,report['coarse_category_pairs']-scheduled)
+            report['nodes_by_depth']=[dict(depth=level,nodes=count) for level,count in db.execute(
+                'SELECT level,count(*) FROM nodes WHERE level>=0 GROUP BY level ORDER BY level')]
+            # A cross-block can have different depths on its two sides. Group
+            # them explicitly rather than inventing a single current depth.
+            report['pending_blocks_by_depth']=[dict(depth_a=a,depth_b=b,pending_blocks=count,
+                member_pair_upper_bound=pairs) for a,b,count,pairs in db.execute(
+                'SELECT min(a.level,b.level) AS da,max(a.level,b.level) AS db,count(*),'
+                'sum(CASE WHEN t.a=t.b THEN a.size*(a.size-1)/2 ELSE a.size*b.size END) '
+                'FROM tasks t JOIN nodes a ON a.id=t.a JOIN nodes b ON b.id=t.b '
+                'WHERE t.done=0 GROUP BY da,db ORDER BY da,db')]
+            report['depth_note']=('Depth 0 is the coarse category level. Coarse comparisons and refinements '
+                'interleave. Pending blocks include in-flight work; member-pair upper bounds are before '
+                'pruning/cache reuse and exclude coarse comparisons not yet scheduled. Scheduled is not completed.')
     finally:
         db.close()
     if args.log:
@@ -93,8 +111,11 @@ def main():
             r'search: ([\d,]+) queried pattern pairs; (\d+)s',text)]
         if updates:
             q,t=updates[-1]
+            initial_q,initial_t=updates[0]
+            elapsed=t-initial_t
             report['latest_log']=dict(queried_pairs=q,search_elapsed_seconds=t,
-                                     average_queries_per_second=q/t if t else None)
+                observed_new_queries=q-initial_q,observed_window_seconds=elapsed,
+                average_queries_per_second=(q-initial_q)/elapsed if elapsed>0 else None)
             # Fit duration sum is only comparable when cache and log cover the
             # same fresh invocation. This occupancy estimate is not CPU profiling.
             fresh=text.startswith('Starting new work:') and 'External null-cache import: none' in text

@@ -348,6 +348,13 @@ cache limits, resident bytes/model counts, admission refusals and observed
 memory usage/target. The inspector prefers `coarse_scheduled_count` over the
 legacy row cursor; it is still not an overall-completion percentage.
 
+For depth information from an existing running job, add `--hierarchy-depth` to
+the inspector. It reports category counts and pending comparison blocks by
+both node depths, plus coarse pairs not yet scheduled. It reads the pending
+task index rather than scanning every saved pair decision. Deeper blocks are
+smaller, but their number can increase when a surviving parent splits. These
+counts describe an interleaved queue, not a sequence of completed depth stages.
+
 An annotated distal map can use the existing network helper directly:
 
 ```bash
