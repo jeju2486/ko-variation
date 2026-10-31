@@ -7,31 +7,7 @@ import sys
 from typing import Any, Iterable, Mapping
 
 
-BLAS_ENVIRONMENT_VARIABLES = (
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "OMP_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-)
-
-
-def guard_blas_environment(default_threads: int = 1) -> dict[str, str]:
-    """Set conservative native-thread defaults before NumPy/SciPy import.
-
-    Explicit user settings are preserved. The returned values are suitable for
-    later reporting, but the loaded-library inspection in
-    :func:`collect_parallel_runtime` is the authoritative runtime view.
-    """
-
-    if default_threads < 1:
-        raise ValueError("default_threads must be positive")
-    default = str(default_threads)
-    configured: dict[str, str] = {}
-    for variable in BLAS_ENVIRONMENT_VARIABLES:
-        if not os.environ.get(variable, "").strip():
-            os.environ[variable] = default
-        configured[variable] = os.environ[variable]
-    return configured
+from .memory_budget import BLAS_ENVIRONMENT_VARIABLES, guard_blas_environment
 
 
 @dataclass(frozen=True)

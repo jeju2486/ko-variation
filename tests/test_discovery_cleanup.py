@@ -9,9 +9,9 @@ from unittest.mock import patch
 
 import numpy as np
 
-from ko_variation import discovery_score as kernels, discovery_inventory as inventory
+from ko_variation import discovery_score as kernels, discovery_nulls as inventory
 from ko_variation.discovery import schema,get_meta,set_meta,merge_metrics
-from ko_variation.discovery_prefit import prefit,publish_aliases
+from ko_variation.discovery_nulls import prefit,publish_aliases
 from ko_variation.discovery_store import connect,atomic_json
 from ko_variation.memory_budget import ByteLRU
 
@@ -39,7 +39,7 @@ class CleanupTests(unittest.TestCase):
                 return dict(entry(pid),status='OK',mode='zero',metrics={'new_null_fits':1},worker_state={'pid':1})
             def executor(**kwargs):
                 return ThreadPoolExecutor(max_workers=kwargs['max_workers'])
-            with patch('ko_variation.discovery_prefit.ProcessPoolExecutor',side_effect=executor),\
+            with patch('ko_variation.discovery_nulls.ProcessPoolExecutor',side_effect=executor),\
                  patch('ko_variation.discovery_score.prefit_profiled',side_effect=fit):
                 prefit(db,work,{'patterns':3},args,{},get_meta,set_meta,merge_metrics)
             self.assertEqual(seen,[1,2])

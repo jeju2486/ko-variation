@@ -8,7 +8,7 @@ from unittest.mock import patch
 import numpy as np
 
 from ko_variation import discovery_score as kernels
-from ko_variation import discovery_null_cache as store
+from ko_variation import discovery_nulls as store
 from ko_variation.discovery import schema,set_meta,get_meta,coarse_tasks,main
 from ko_variation.discovery_store import connect,digest
 from ko_variation.glmm import _weighted_eigen,prepare_kinship_eigensystem,score_predictor_block
@@ -46,7 +46,7 @@ class PrefitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             folder=Path(temporary)
             record=store.save(folder,0,cache,dict(status='OK',fit_seconds=1),K,eigen,rank=8)
-            loaded=store.load(record,folder/'null_000000000.json',K,eigen,self.verify)
+            loaded=store.load(record,folder/'null_000000000.json',eigen,self.verify)
             self.assertEqual(record['mode'],'sketch')
             self.assertEqual(loaded['decomp'].eigenvectors.shape,(48,8))
             with patch.dict(kernels._STATE,dict(K=K,eigen=eigen,metrics={}),clear=True),\
@@ -66,7 +66,7 @@ class PrefitTests(unittest.TestCase):
                 self.assertEqual(record['mode'],mode)
                 with np.load(folder/record['array']['name']) as arrays:
                     self.assertNotIn('eigenvectors',arrays.files)
-                loaded=store.load(record,folder/'null_000000000.json',K,eigen,self.verify)
+                loaded=store.load(record,folder/'null_000000000.json',eigen,self.verify)
                 observed=[r.score_z for r in score_predictor_block(X,loaded,compute_spa_adjustment=False)]
                 np.testing.assert_allclose(observed,expected,rtol=1e-10,atol=1e-10)
 
@@ -120,7 +120,7 @@ class PrefitTests(unittest.TestCase):
             aliases=work/'null_canonical.npy'
             stamp=aliases.stat().st_mtime_ns
             (out/'null_stage_summary.json').unlink()
-            with patch('ko_variation.discovery_prefit.ProcessPoolExecutor',side_effect=AssertionError('rechecked completed stage')):
+            with patch('ko_variation.discovery_nulls.ProcessPoolExecutor',side_effect=AssertionError('rechecked completed stage')):
                 self.assertEqual(main(common+['--resume','--require-cached-nulls']),0)
             self.assertEqual(aliases.stat().st_mtime_ns,stamp)
             self.assertEqual(json.loads((out/'null_stage_summary.json').read_text()),summary)

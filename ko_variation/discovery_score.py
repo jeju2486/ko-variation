@@ -15,7 +15,7 @@ import numpy as np
 from threadpoolctl import threadpool_limits
 
 from .discovery_store import digest, open_patterns
-from . import discovery_null_cache as null_cache
+from . import discovery_nulls as null_cache
 from .glmm import (KinshipEigensystem, _WeightedEigen, fit_logistic_mixed,
                    fit_null_glmm, score_predictor_block)
 from .memory_budget import ByteLRU, working_usage, process_rss, MIB
@@ -238,7 +238,7 @@ def get_null(pattern, external=None, *, manifest=None):
             if record is None:
                 record=json.loads(source.read_text())
             if record['array'] is not None:
-                cache=null_cache.load(record,source,s['K'],s['eigen'],verify_product)
+                cache=null_cache.load(record,source,s['eigen'],verify_product)
                 if not np.array_equal(cache['y'],bits([canonical])[0]):
                     raise ValueError('Cached null response differs')
             if record['status']=='OK' and cache is None:
@@ -307,15 +307,6 @@ def prefit_profiled(job):
     compact=s['settings'].get('null_cache_format','full')=='compact'
     rank=s['settings'].get('null_cache_rank',128)
     ready=record is not None and null_cache.compatible(record,compact,rank,s['info']['n'])
-    if ready and record.get('array'):
-        product=source.parent/record['array']['name']
-        try:
-            size=product.stat().st_size
-            ready=not record['array'].get('bytes') or size==record['array']['bytes']
-        except FileNotFoundError:
-            ready=False
-        if not ready:
-            raise ValueError(f'Missing/truncated saved null: {product}')
     if not ready:
         mapping=s.get('canonical')
         s['canonical']=None

@@ -9,11 +9,7 @@ import time
 # Set conservative defaults before importing NumPy/SciPy so response-level
 # worker processes do not silently multiply a second native thread pool. User
 # settings remain authoritative and are inspected and reported at runtime.
-from .diagnostics import (
-    collect_parallel_runtime,
-    estimate_scan_memory,
-    guard_blas_environment,
-)
+from .memory_budget import guard_blas_environment
 
 guard_blas_environment(default_threads=1)
 
@@ -185,6 +181,7 @@ def main(argv=None):
     started = time.time()
     args = parse_args(arguments)
     # Discovery does not use the legacy pair-table scanner/checkpoint stack.
+    from .diagnostics import collect_parallel_runtime, estimate_scan_memory
     import numpy as np
     import pandas as pd
     from .checkpoint import CheckpointError, CheckpointStore, fingerprint_inputs

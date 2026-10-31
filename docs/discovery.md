@@ -1,10 +1,10 @@
 # Unitig discovery in KOVAR 0.9.2
 
-Current execution revision: **`prefit-compact-2`**, tagged `v0.9.2-perf2`.
+Current execution revision: **`streamlined-1`**, tagged `v0.9.2-streamlined1`.
 The original `v0.9.2` tag remains unchanged. `--version` still reports 0.9.2;
 the startup banner, identities and summaries identify the execution revision.
 
-`ko-variation discover` (also `ko-variation-discover`) accepts PAN-GWES unitig
+`ko-variation-discover` (also `ko-variation discover`) accepts PAN-GWES unitig
 presence/absence directly. SpydrPick, MI and ARACNE are not required. The old
 `ko-variation --pairs ...` scanner remains available for existing workflows.
 
@@ -14,7 +14,7 @@ presence/absence directly. SpydrPick, MI and ARACNE are not required. The old
 python -m pip install -e .
 ko-variation --version
 
-ko-variation discover \
+ko-variation-discover \
   --fasta graph.sample_ids.fasta --tree core.treefile \
   --unitigs graph.unitigs --paths graph.paths \
   --unitig-distance /path/to/unitig_distance --kmer-length 61 \
@@ -284,8 +284,8 @@ up as `run_identity.v090.json`, `run_identity.v091.json` or `run_identity.v092.j
 and null models are retained. Unknown edited implementations or changed science
 are rejected. The score test, Bonferroni family/alpha, gate and joint-cell rules
 are unchanged. Execution order changes do not provide a new recovery guarantee.
-Verified `v0.9.2-perf1` work also resumes; its identity backup is named
-`run_identity.v092.prefit-compact-1.json` to retain the earlier release backup.
+Verified `v0.9.2-perf1` and `v0.9.2-perf2` work also resumes. Their identity
+backups include the previous execution revision, retaining earlier release backups.
 
 ### Reuse existing nulls
 

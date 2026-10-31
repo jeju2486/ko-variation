@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from ko_variation.memory_budget import (ByteLRU,cgroup_limits,detect_budget,plan_workers,GIB)
 from ko_variation.discovery_execution import bounded_map,ResponsePool
-from ko_variation.discovery_compat import migrate_identity,V090_CODE
+from ko_variation.null_identity import migrate_identity,V090_CODE
 from ko_variation.discovery_store import connect
 from ko_variation.discovery import schema,search,get_meta
 from ko_variation import discovery_score as kernels

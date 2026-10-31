@@ -16,10 +16,10 @@ affinity, bulk database operations and verified release-checkpoint migration.
 Necessary joint-cell bounds skip ineligible hierarchy blocks while preserving
 their external associations. Coarse comparisons and queued refinements interleave.
 
-The current **0.9.2 execution revision `prefit-compact-2`** pre-fits the unique
+The current **0.9.2 execution revision `streamlined-1`** pre-fits the unique
 response pool, stores compact numerical caches, and groups coarse comparisons
 by response for reuse. The original `v0.9.2` Git tag is unchanged; use the
-`v0.9.2-perf2` tag or `codex/downstream-resume-progress` for this update.
+`v0.9.2-streamlined1` tag or `codex/downstream-resume-progress` for this update.
 
 The legacy candidate-table scanner reports one result for each unordered pair. The separate
 `ko-variation-annotation` helper selects distal significant signals, calculates
@@ -29,7 +29,7 @@ See [downstream usage and interpretation](docs/downstream.md).
 ## Installation
 
 ```bash
-git clone --branch v0.9.2-perf2 https://github.com/jeju2486/Pair-logistic-mds.git
+git clone --branch v0.9.2-streamlined1 https://github.com/jeju2486/Pair-logistic-mds.git
 cd Pair-logistic-mds
 pip install -e .
 ko-variation --version
@@ -248,6 +248,14 @@ See `docs/model.md`, `docs/interpretation.md`, and `docs/research_basis.md` for
 more detail.
 
 ## Version history
+
+### 0.9.2 execution revision streamlined-1
+
+- consolidate null prefit, numerical storage and inventory in `discovery_nulls.py`;
+- consolidate release identity checks and optional old-cache import in existing modules;
+- keep legacy diagnostics off the discovery import path;
+- defer duplicate prefit array checks to first numerical access;
+- retain verified perf1/perf2 checkpoints and the unchanged statistical model.
 
 ### 0.9.2 execution revision prefit-compact-2
 

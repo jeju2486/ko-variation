@@ -16,6 +16,9 @@ import sqlite3
 import subprocess
 import time
 
+from .memory_budget import guard_blas_environment
+guard_blas_environment(default_threads=1)
+
 import numpy as np
 import scipy
 from scipy.stats import chi2
@@ -23,9 +26,9 @@ from threadpoolctl import threadpool_limits
 
 from . import __version__, __discovery_revision__
 from . import discovery_score as kernels
-from .discovery_store import atomic_json, connect, digest, prepare, write_gzip
+from .discovery_store import atomic_json, connect, digest, prepare, write_gzip, import_benchmark_nulls
 from .discovery_execution import ResponsePool, bounded_map
-from . import discovery_inventory as inventory
+from . import discovery_nulls as nulls
 from .memory_budget import ByteLRU, detect_budget, plan_workers, MIB
 
 
@@ -111,8 +114,7 @@ def identity(args):
     inputs = {k: digest(getattr(args, k)) for k in ("fasta", "tree", "exclude_samples") if getattr(args, k)}
     code = {name: digest(Path(__file__).with_name(name)) for name in
             ("discovery.py", "discovery_store.py", "discovery_score.py", "discovery_execution.py", "memory_budget.py",
-             "discovery_compat.py", "discovery_eligibility.py", 'discovery_null_cache.py','discovery_prefit.py',
-             "discovery_inventory.py", "discovery_import.py", "null_identity.py", "glmm.py", "kinship.py")}
+             "discovery_eligibility.py", "discovery_nulls.py", "null_identity.py", "glmm.py", "kinship.py")}
     from .null_identity import null_source_hash
     return dict(version=__version__, execution_revision=__discovery_revision__,inputs=inputs, settings=settings, code=code,
                 numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
@@ -136,13 +138,14 @@ def schema(db):
     CREATE INDEX IF NOT EXISTS discovery_hits ON decisions(final,u,v);
     CREATE TABLE IF NOT EXISTS external_nulls(pid INTEGER PRIMARY KEY,path TEXT);
     CREATE TABLE IF NOT EXISTS null_aliases(pid INTEGER PRIMARY KEY,canonical INTEGER);
+    CREATE TABLE IF NOT EXISTS null_inventory(pid INTEGER PRIMARY KEY,status TEXT,mode TEXT,
+      fit_seconds REAL,source TEXT,local INTEGER,signature TEXT);
     CREATE TABLE IF NOT EXISTS beta(u INTEGER,v INTEGER,value REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS distance(u INTEGER,v INTEGER,pu INTEGER,pv INTEGER,
       distance REAL,connected INTEGER,status TEXT DEFAULT 'PENDING',PRIMARY KEY(u,v)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS distance_pending ON distance(status,u,v);
     CREATE INDEX IF NOT EXISTS distance_pattern ON distance(pu,pv,distance);
     """)
-    inventory.initialize(db)
 
 
 def get_meta(db, key, default=None):
@@ -312,7 +315,7 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
             db.executemany('INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?,?,?)',pending)
             count+=sum((row[0],row[1]) in new_pairs for row in pending)
             set_meta(db,"queried_pairs_count",count)
-            inventory.record_models(db,models)
+            nulls.record_models(db,models)
         models.clear()
         pending.clear()
         merge_metrics(totals,dict(driver_db_write_seconds=time.perf_counter()-write_started))
@@ -583,7 +586,6 @@ def import_nulls(db, work, info, args, *, current_identity=None):
             finally:
                 borrowed.close()
         else:
-            from .discovery_import import import_benchmark_nulls
             sources.extend(Path(item['path']) for item in prior_identity.get('reused_null_sources',[]))
             import_benchmark_nulls(db,work,info,root,prior_identity)
         with db:
@@ -724,7 +726,7 @@ def export(db, info, work, args, total_seconds):
         beta_status_counts=dict(db.execute("SELECT status,count(*) FROM beta GROUP BY status")),
         queried_pairs=sum(counts.values()),total_pattern_pairs=math.comb(info["patterns"],2),
         unqueried_pairs=math.comb(info["patterns"],2)-sum(counts.values()))
-    null_statuses,null_seconds=inventory.local_summary(db,work)
+    null_statuses,null_seconds=nulls.local_summary(db,work)
     summary.update(saved_local_null_statuses=null_statuses,
                    saved_local_null_fit_seconds=null_seconds,
                    available_imported_nulls=db.execute("SELECT count(*) FROM external_nulls").fetchone()[0])
@@ -770,7 +772,7 @@ def main(argv=None):
         if manifest.exists():
             if not args.resume:
                 raise ValueError("Existing work requires --resume")
-            from .discovery_compat import migrate_identity
+            from .null_identity import migrate_identity
             if migrate_identity(json.loads(manifest.read_text()),expected,manifest):
                 print('[KOVAR] verified released checkpoint migrated; saved patterns, hierarchy, decisions and nulls retained',flush=True)
         else:
@@ -814,8 +816,7 @@ def main(argv=None):
                   f"{info['patterns']*estimate/(1<<30):.1f} GiB; "
                   "pair checkpoints and expanded unitig results require additional disk space",flush=True)
             if not get_meta(db,'search_complete') or args.prefit_only:
-                from .discovery_prefit import prefit
-                prefit(db,work,info,args,settings,get_meta,set_meta,merge_metrics)
+                nulls.prefit(db,work,info,args,settings,get_meta,set_meta,merge_metrics)
                 if args.prefit_only:
                     return 0
             if args.prefit_nulls=='all':
