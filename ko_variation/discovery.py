@@ -29,6 +29,7 @@ from . import discovery_score as kernels
 from .discovery_store import atomic_json, connect, digest, prepare, write_gzip, import_benchmark_nulls
 from .discovery_execution import ResponsePool, bounded_map
 from . import discovery_nulls as nulls
+from . import coarse_screen
 from .memory_budget import ByteLRU, detect_budget, plan_workers, MIB
 
 
@@ -59,6 +60,10 @@ def parser():
     p.add_argument("--bonferroni-tests", type=int, help="Frozen larger hypothesis family; never smaller than all pattern pairs")
     p.add_argument("--screen-p", type=float, default=.001, help="Hierarchy exploration only, not final alpha")
     p.add_argument("--search", choices=["hierarchy", "exhaustive"], default="hierarchy")
+    p.add_argument('--coarse-screen',choices=['pc','none'],default='pc',help='Tree-PC screen before coarse KOVAR tasks [pc]; none retains the full coarse scan')
+    p.add_argument('--screen-pcs',type=int,default=40)
+    p.add_argument('--coarse-retain',type=float,default=.10,help='Global fraction of coarse pairs retained by absolute residual correlation [.10]')
+    p.add_argument('--screen-block-size',type=int,default=256,help='Maximum residual-screen row block [256]; reduced automatically for memory')
     p.add_argument("--exact", action="store_true", help="Disable spectral bounds (benchmark/reference)")
     p.add_argument("--coarse-r2", type=float, default=.8)
     p.add_argument("--refine-r2", type=float, nargs="+", default=[.9, .95, .98, .99])
@@ -73,6 +78,7 @@ def parser():
     p.add_argument("--distal-bp", type=int, default=10000)
     p.add_argument("--no-beta", action="store_true", help="Keep significance/distance results without post-hoc refits")
     p.add_argument("--reuse-nulls-from", type=Path, action="append", default=[], help="Previous v0.9 output or combined benchmark output")
+    p.add_argument('--reuse-prepared-from',type=Path,help='Copy compatible prepared data/hierarchy into this NEW output and borrow its null caches')
     p.add_argument("--require-cached-nulls", action="store_true")
     p.add_argument('--prefit-nulls',choices=['all','needed'],default='all',
                    help='Fit all unique response nulls before scoring [all]; needed retains on-demand fitting')
@@ -86,7 +92,7 @@ def parser():
 
 
 def validate(args):
-    for name in ("threads", "batch_size", "distance_batch_size", "leaf_size", "max_reps", "kmer_length",'null_cache_rank'):
+    for name in ("threads", "batch_size", "distance_batch_size", "leaf_size", "max_reps", "kmer_length",'null_cache_rank','screen_block_size'):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_','-')} must be positive")
     if args.memory_gb is not None and (not np.isfinite(args.memory_gb) or args.memory_gb < .25):
@@ -98,6 +104,11 @@ def validate(args):
     if not 0 < args.coarse_r2 < 1 or any(not args.coarse_r2 < t <= 1 for t in args.refine_r2):
         raise ValueError("Refinement thresholds must exceed the coarse threshold and be <=1")
     args.refine_r2 = sorted(set(args.refine_r2))
+    if args.screen_pcs<0 or not 0<args.coarse_retain<=1:
+        raise ValueError('PC count must be nonnegative and --coarse-retain must be in (0,1]')
+    if args.search=='exhaustive': args.coarse_screen='none'
+    if args.coarse_screen=='pc' and args.rep_policy!='single':
+        raise ValueError('PC coarse screening currently requires --rep-policy single; use --coarse-screen none for coverage representatives')
     if args.prefit_only:
         args.prefit_nulls='all'
     if args.unitig_distance and not (args.unitigs and args.paths):
@@ -108,13 +119,14 @@ def identity(args):
     # Execution resources can change on resume; statistical settings cannot.
     omitted = {"threads", "memory_gb", "out", "tmp_dir", "resume", "reuse_nulls_from", "require_cached_nulls",
                "unitig_distance", "unitigs", "paths", "edges", "kmer_length", "distal_bp", "no_beta", "distance_batch_size", "batch_size",
-               'prefit_nulls','prefit_only','null_cache_format','null_cache_rank'}
+               'prefit_nulls','prefit_only','null_cache_format','null_cache_rank','screen_block_size','reuse_prepared_from'}
+    if args.coarse_screen=='none' or args.search=='exhaustive': omitted.update(('coarse_screen','screen_pcs','coarse_retain'))
     settings = {k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()
                 if k not in omitted and not k.startswith('_')}
     inputs = {k: digest(getattr(args, k)) for k in ("fasta", "tree", "exclude_samples") if getattr(args, k)}
     code = {name: digest(Path(__file__).with_name(name)) for name in
             ("discovery.py", "discovery_store.py", "discovery_score.py", "discovery_execution.py", "memory_budget.py",
-             "discovery_eligibility.py", "discovery_nulls.py", "null_identity.py", "glmm.py", "kinship.py")}
+             "discovery_eligibility.py", "discovery_nulls.py", "coarse_screen.py", "null_identity.py", "glmm.py", "kinship.py")}
     from .null_identity import null_source_hash
     return dict(version=__version__, execution_revision=__discovery_revision__,inputs=inputs, settings=settings, code=code,
                 numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
@@ -415,6 +427,7 @@ def search(db, info, pool, args):
     frontier=plan.get('frontier_tasks',max(128,args.threads*64))
     nodes=NodeCache(db,min(64*MIB,max(MIB,int(args.memory_gb*(1<<30)*.03))))
     eligibility=None
+    screen_info=get_meta(db,'coarse_screen_summary')
     if args.search=='hierarchy' and getattr(args,'min_cell_count',0)>0:
         from .discovery_eligibility import Eligibility
         eligibility=Eligibility(db,pool,args,info)
@@ -430,7 +443,8 @@ def search(db, info, pool, args):
               f"disk_loads={runtime.get('null_cache_disk_loads',0):,}; "
               f"ineligible_blocks={hierarchy.get('eligibility_pruned_internal_blocks',0)+hierarchy.get('eligibility_pruned_cross_blocks',0):,}; "
               f"proxy_pruned_blocks={hierarchy.get('representative_pruned_blocks',0):,}; "
-              f"bounded_pairs={runtime.get('bound_decided_pairs',0):,}; exact_pairs={runtime.get('exact_pairs',0):,}",flush=True)
+              f"bounded_pairs={runtime.get('bound_decided_pairs',0):,}; exact_pairs={runtime.get('exact_pairs',0):,}"
+              +(f"; coarse_opened={get_meta(db,'coarse_scheduled_count',0):,}/{screen_info['selected_pairs']:,}" if screen_info else ''),flush=True)
         last=time.monotonic()
     if args.search=='exhaustive':
         response,offset=get_meta(db,'exhaustive_cursor',[1,0])
@@ -457,6 +471,9 @@ def search(db, info, pool, args):
         ordered=[row[0] for row in db.execute('SELECT n.id FROM nodes n JOIN reps r ON r.node=n.id '
                                              'WHERE n.parent=0 GROUP BY n.id ORDER BY max(r.pid),n.id')]
         old_position={node:i for i,node in enumerate(roots)}
+        filtered=getattr(args,'coarse_screen','none')=='pc'
+        arrays=coarse_screen.open_candidates(Path(args.tmp_dir) if args.tmp_dir else args.out/'.kovar_work',
+            get_meta(db,'coarse_screen_summary')['selected_pairs']) if filtered else None
         while True:
             # Reserve at least 3/4 of each frontier for queued refinements and
             # at most 1/4 for fresh coarse comparisons. Neither waits for the
@@ -464,7 +481,10 @@ def search(db, info, pool, args):
             quota=max(1,frontier//4)
             tasks=db.execute('SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT ?',
                              (max(1,frontier-quota),)).fetchall()
-            fresh,coarse_done=coarse_tasks(db,roots,ordered,frontier-len(tasks),old_position,args.threads)
+            if filtered:
+                fresh,coarse_done=coarse_screen.candidate_tasks(db,arrays,frontier-len(tasks),get_meta,set_meta,args.threads)
+            else:
+                fresh,coarse_done=coarse_tasks(db,roots,ordered,frontier-len(tasks),old_position,args.threads)
             tasks.extend(fresh)
             if not tasks:
                 if coarse_done: break
@@ -738,6 +758,8 @@ def export(db, info, work, args, total_seconds):
     summary['block_eligibility_pruning']='necessary marginal counts and anchor-radius Hamming bounds; categories retained'
     summary['memory_budget']=getattr(args,'_memory_info',None)
     summary['execution_plan']=getattr(args,'_plan',None)
+    summary['coarse_screen']=get_meta(db,'coarse_screen_summary')
+    summary['reused_prepared_from']=get_meta(db,'reused_prepared_from')
     atomic_json(args.out/"run_summary.json",summary)
 
 
@@ -785,7 +807,12 @@ def main(argv=None):
                 with db:
                     set_meta(db,'queried_pairs_count',db.execute('SELECT count(*) FROM decisions').fetchone()[0])
             with threadpool_limits(limits=args.threads):
+                if args.reuse_prepared_from:
+                    from .discovery_store import reuse_prepared
+                    reuse_prepared(args,db,work,expected)
                 info = prepare(args,db,work)
+            if args.reuse_prepared_from and args.reuse_prepared_from not in args.reuse_nulls_from:
+                args.reuse_nulls_from.append(args.reuse_prepared_from)
             family = math.comb(info["patterns"],2)
             if args.bonferroni_tests is not None and args.bonferroni_tests < family:
                 raise ValueError("Bonferroni family cannot be smaller than all unique-pattern pairs")
@@ -827,6 +854,9 @@ def main(argv=None):
             with ResponsePool(args.threads,kernels.initialize,(str(work),info,settings)) as pool:
                 if args.search=="hierarchy":
                     make_hierarchy(db,info,pool,args)
+                    if args.coarse_screen=='pc':
+                        coarse_screen.prepare_screen(db,work,info,args,get_meta,set_meta)
+                        with db: set_meta(db,'active_stage','pair_search')
                 search(db,info,pool,args)
             # Release every score-worker cache before the external graph tool
             # gets its own memory budget. Refit workers start lazily afterwards.

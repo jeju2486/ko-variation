@@ -1,6 +1,6 @@
 # Unitig discovery in KOVAR 0.9.2
 
-Current execution revision: **`streamlined-1`**, tagged `v0.9.2-streamlined1`.
+Current execution revision: **`pc-screen-1`**, tagged `v0.9.2-pcscreen1`.
 The original `v0.9.2` tag remains unchanged. `--version` still reports 0.9.2;
 the startup banner, identities and summaries identify the execution revision.
 
@@ -32,6 +32,55 @@ columns including count and minimum distance (columns 6 and 8, one-based).
 To defer graph-distance calculation and beta fitting, omit `--unitig-distance`.
 Add it on a later `--resume`; no significance scan is repeated. Use `--no-beta`
 for significance plus distance only. A subsequent resume can add beta.
+
+## Coarse PC screening and reuse
+
+Hierarchy search defaults to `--coarse-screen pc --screen-pcs 40 --coarse-retain
+0.10`. Single observed representatives are residualized against an intercept
+and the leading PCs of the centered tree covariance. This uses the same tree-PC
+adjustment definition as the earlier screener benchmark. Fewer PCs are used if
+fewer positive directions are available; at least one residual direction remains.
+Normalized residual dot products are computed in float64, ranked as float32
+absolute correlations, and selected globally across coarse category pairs.
+Ties use deterministic response-major representative order. This is a ranking
+heuristic, not a calibrated association test. Retention is not guaranteed to
+recover all KOVAR signals. Use `--coarse-screen none` as a reference; exhaustive
+search automatically bypasses this coarse screen.
+
+The top 10% applies to scorable pairs. Pairs involving a representative with
+undefined residual correlation (zero residual variance) are retained as extra
+fallbacks, rather than assigned zero association. Their count is reported.
+These candidates enter the unchanged KOVAR exploration gate. Within-category
+work is retained; categories and members are not deleted by this filter.
+The final Bonferroni family remains all unique-pattern pairs, not the selected
+candidate count. Coverage representatives require `--coarse-screen none`.
+
+The screen writes temporary float32 scores, selects the cutoff in four bounded
+radix passes and streams retained node-index pairs to a binary checkpoint.
+`--threads` controls native matrix threads and parallel selection histograms;
+there are no concurrent numerical worker jobs during this screen. Row blocks
+are bounded by `--screen-block-size` and the memory budget. Finished raw scores
+and residual arrays are deleted; candidate indices and root mapping remain for
+restart. Rejected pairs never create individual SQLite task records.
+
+Use a separate output to adopt the new filter while borrowing expensive work:
+
+```bash
+ko-variation-discover --fasta graph.sample_ids.fasta --tree core.treefile \
+  --out kovar_pc40 --threads 24 --coarse-screen pc --coarse-retain 0.10 \
+  --reuse-prepared-from /path/to/old/output
+```
+
+Inputs, exclusions, preparation settings, null-fitting source and numerical
+environment must match. Small prepared arrays and database mappings are copied.
+A completed compatible hierarchy is copied too; otherwise it is rebuilt.
+Compatible null caches are borrowed in place automatically. Keep their source
+output/work directory available. This command also works without the reuse
+option on another computer. Old task/decision tables are not copied: the result
+must not depend on which additional pairs were tested in an earlier unfiltered
+run. To resume an old unscreened search, pass `--coarse-screen none`; adopting
+the filter needs a new output. Changing retention or PC settings also needs a
+new output. Adding graph distance later and distal-only beta fitting are unchanged.
 
 ## Null stage and compact numerical caches
 
@@ -370,7 +419,8 @@ branches. Percentages measure search-policy coverage, not the fraction of time
 elapsed or individually tested pairs. An ETA requires two comparable snapshots
 with non-overlapping completion intervals and assumes recent branch throughput
 continues. Distance, beta and export are excluded. Add `--log path/to/job.out`
-for recent query throughput. The diagnosis reads pending tasks without scanning
+for recent query throughput. For screened runs, the summary distinguishes
+the full coarse universe from the retained candidate denominator. The diagnosis reads pending tasks without scanning
 the complete decisions table; use snapshots rather than frequent polling.
 
 An annotated distal map can use the existing network helper directly:

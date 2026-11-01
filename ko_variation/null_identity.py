@@ -73,13 +73,27 @@ PREFIT2_CODE = {
 }
 
 
+STREAMLINED_CODE = {
+    'discovery.py': {'ca41f614df147c08c0c7a56b56b1aa31ca767fd6adc6ae8647b8d57883ae37d2', '0139d9dcb305591a16a18b058a7fca26bda97374f7a497f87a32c32d772052c5'},
+    'discovery_store.py': {'6cbe446140bc2ec9615bab568533c455e01955cfa3f0932fad528722d677d4dd', '7cf9431df20ad623491c507c5dfeee46c644750437bc1893338517cfba4a0204'},
+    'discovery_score.py': {'35f67fd54c642c21b05dad4522e020918889551420c10b48a7b00117974aa8e6', 'd595508747ded5dcbb0f131d7f42d256c95a8cc561a5d862ac10a828562b8574'},
+    'discovery_execution.py': {'2d5bdcdb80f30505a35256b48be02d0cf1cef0e6179c9d46e185589da02ba529', '7b2c1a5e0e85c46b41b6cd1d67d9b31255da33f98cc92209a2175d0328e812d4'},
+    'memory_budget.py': {'0a5b6920c945866c553c8631933b44349ed0136d8563d50d82ffcb4fa950f5cf', '96caa0cf2ce6afa84b870b6893292378fa08ac3f075b3aea7a4f33178ae2bc96'},
+    'discovery_eligibility.py': {'de0c9017ad641b726c8e1d7f1d77c598329e47b4f0642ea678945284cff4ab12', 'b98409612eecbdc42c9d9157cef25c261da4761a6c1d83045f2fb7334ce02f1a'},
+    'discovery_nulls.py': {'c289e94917e7c3d672a25e1d710b5efce3ee1217f2cd4a366a04057085aacb66', 'd972465719c5f311a980f3808cc00f3936be0c1466171fb736f911a77e6fbb05'},
+    'null_identity.py': {'40b44800892d466ee8cdc86458f786573b53f7ce6ba940a350f973b0e252bc1f', 'edb0f02a8baafe3750d6dc8cb84d92eb17e0c30ccd1639f01b1b4bc90e6c19fd'},
+    'glmm.py': {'0dc23fb4765055a12ffe8f173cef7ef30214a26a7ee98f7fdad9ddc2f3a87081', 'ab8fecb0f4af96feb6c77d8d2ff3a054d026bae20ec4b005da939ebb5f4b82b4'},
+    'kinship.py': {'e08b3b1a7926159b4a6d56b9a3600120df038c363f20934a9ebb89c9c43862c6', '35ac6734cd8976956cbcaf5d6b6f91af09a234eca19c5ead7425dae9f7a5eef7'},
+}
+
+
 def migrate_identity(previous, expected, manifest):
     """Accept only known release code with identical scientific inputs/settings."""
     from .discovery_store import atomic_json
     if previous == expected:
         return False
     release = {"0.9.0":V090_CODE, "0.9.1":V091_CODE, "0.9.2":V092_CODE}.get(previous.get("version"))
-    release={'prefit-compact-1':PREFIT1_CODE,'prefit-compact-2':PREFIT2_CODE}.get(
+    release={'prefit-compact-1':PREFIT1_CODE,'prefit-compact-2':PREFIT2_CODE,'streamlined-1':STREAMLINED_CODE}.get(
         previous.get('execution_revision'),release)
     if release is None or set(previous.get("code",{})) != set(release):
         raise ValueError("Input/code/statistical settings changed; use a new output")

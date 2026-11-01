@@ -39,13 +39,17 @@ def benchmark():
     results=[]
     reference=set()
     for name,options in (("exact",["--search","exhaustive","--exact"]),
-                         ("bounds",["--search","exhaustive"]),("hierarchy_bounds",[])):
+                         ("bounds",["--search","exhaustive"]),
+                         ("hierarchy_bounds",['--coarse-screen','none']),
+                         ("hierarchy_pc10",['--coarse-screen','pc'])):
         out=args.out/name
         command=common+["--out",str(out)]+options
         if (out/".kovar_work"/"run_identity.json").exists():
             command += ["--resume"]
         if name!="exact":
             command += ["--reuse-nulls-from",str(args.out/"exact")]
+        if name.startswith('hierarchy_'):
+            command += ['--reuse-prepared-from',str(args.out/'exact')]
         saved=out/'run_summary.json'
         if saved.exists():
             summary=json.loads(saved.read_text())
@@ -66,7 +70,31 @@ def benchmark():
             reference=hits
         metrics=summary.get('runtime_totals',{})
         prefit=summary.get('prefit_runtime_totals',{})
+        screened=summary.get('coarse_screen') or {}
+        gate_total=gate_retained=None
+        if name=='hierarchy_pc10':
+            import numpy as np
+            db=sqlite3.connect(out/'.kovar_work'/'work.sqlite')
+            lookup=dict(db.execute('SELECT node,pid FROM reps'));db.close()
+            roots=np.load(out/'.kovar_work'/'coarse_screen'/'roots.npy')
+            pairs=np.fromfile(out/'.kovar_work'/'coarse_screen'/'candidates.u32',dtype='<u4').reshape(-1,2)
+            size=summary['unique_patterns']
+            retained={min(lookup[int(roots[a])],lookup[int(roots[b])])*size+
+                      max(lookup[int(roots[a])],lookup[int(roots[b])]) for a,b in pairs}
+            db=sqlite3.connect(args.out/'hierarchy_bounds'/'.kovar_work'/'work.sqlite')
+            gates=db.execute("WITH roots(pid) AS (SELECT r.pid FROM reps r JOIN nodes n ON n.id=r.node WHERE n.parent=0) "
+                "SELECT u,v FROM decisions WHERE gate!=-1 AND status!='INELIGIBLE_NOT_SCREENED' "
+                "AND u IN roots AND v IN roots")
+            gate_total=gate_retained=0
+            for u,v in gates:
+                gate_total+=1;gate_retained+=int(u*size+v in retained)
+            db.close()
         results.append(dict(method=name,seconds=summary["seconds_this_invocation"],
+                            coarse_pairs_before_screen=screened.get('total_pairs'),
+                            coarse_pairs_after_screen=screened.get('selected_pairs'),
+                            coarse_screen_seconds=screened.get('elapsed_total_seconds'),
+                            coarse_gate_or_unresolved_reference=gate_total,
+                            coarse_gate_or_unresolved_recall=gate_retained/gate_total if gate_total else 'NA',
                             queries=summary["queried_pairs"],reference_hits=len(reference),hits=len(hits),
                             missed=len(reference-hits),extra=len(hits-reference),
                             recall=len(reference&hits)/len(reference) if reference else "NA",

@@ -74,6 +74,61 @@ def records(path):
             yield name, b"".join(chunks)
 
 
+def reuse_prepared(args, db, work, expected):
+    """Copy immutable preparation/hierarchy; never copy old search decisions."""
+    if (work/'prepared.json').exists(): return
+    source=args.reuse_prepared_from.resolve()
+    prior=json.loads((source/'run_identity.json').read_text())
+    source_work=Path(prior.get('work_directory',source/'.kovar_work'))
+    if source_work.resolve()==work.resolve():
+        raise ValueError('--reuse-prepared-from needs a separate new output directory')
+    if prior.get('inputs')!=expected['inputs']:
+        raise ValueError('Reuse source FASTA/tree/exclusions differ from this run')
+    for key in ('numpy','scipy','null_model_source_sha256'):
+        if prior.get(key)!=expected[key]: raise ValueError(f'Reuse source {key} differs')
+    for key in ('min_maf','tree_missing_samples'):
+        if prior['settings'].get(key)!=expected['settings'].get(key):
+            raise ValueError(f'Reuse source preparation setting differs: {key}')
+    info=json.loads((source_work/'prepared.json').read_text())
+    for name in ('patterns.bin','K.npy','K_values.npy','K_vectors.npy'):
+        if digest(source_work/name)!=info['products'][name]:
+            raise ValueError(f'Reuse source prepared product changed: {name}')
+        shutil.copyfile(source_work/name,work/name)
+    reader=sqlite3.connect((source_work/'work.sqlite').resolve().as_uri()+'?mode=ro',uri=True)
+    try:
+        reader.execute('BEGIN')
+        row=reader.execute("SELECT value FROM meta WHERE key='hierarchy_complete'").fetchone()
+        hierarchy=bool(row and json.loads(row[0]))
+        if hierarchy:
+            keys=('coarse_r2','refine_r2','leaf_size','rep_policy','max_reps')
+            hierarchy=all(prior['settings'].get(k)==expected['settings'].get(k) for k in keys)
+        tables=['patterns','unitigs']+(['nodes','members','reps','block_eligibility'] if hierarchy else [])
+        available={r[0] for r in reader.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'null_aliases' in available: tables.append('null_aliases')
+        # One transaction avoids partially imported tables. Immutable arrays are
+        # small relative to the null cache and can be recopied after interruption.
+        with db:
+            for table in tables:
+                definition=reader.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone()[0]
+                exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone()
+                if not exists: db.execute(definition)
+                db.execute(f'DELETE FROM {table}')
+                cursor=reader.execute(f'SELECT * FROM {table}')
+                while True:
+                    rows=cursor.fetchmany(4096)
+                    if not rows: break
+                    marks=','.join('?' for _ in rows[0])
+                    db.executemany(f'INSERT INTO {table} VALUES ({marks})',rows)
+            for sql, in reader.execute("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name IN ('patterns','unitigs') AND sql IS NOT NULL"):
+                db.execute(sql.replace('CREATE INDEX ','CREATE INDEX IF NOT EXISTS ',1))
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('hierarchy_complete',?)",(json.dumps(hierarchy),))
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('reused_prepared_from',?)",(json.dumps(str(source)),))
+    finally:
+        reader.close()
+    atomic_json(work/'prepared.json',info)
+    print(f'[KOVAR] reused prepared patterns/tree; hierarchy reused={hierarchy}; source={source}',flush=True)
+
+
 def prepare(args, db, work):
     if args.memory_gb is None:
         from .memory_budget import detect_budget

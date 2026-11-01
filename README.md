@@ -16,10 +16,13 @@ affinity, bulk database operations and verified release-checkpoint migration.
 Necessary joint-cell bounds skip ineligible hierarchy blocks while preserving
 their external associations. Coarse comparisons and queued refinements interleave.
 
-The current **0.9.2 execution revision `streamlined-1`** pre-fits the unique
+The current **0.9.2 execution revision `pc-screen-1`** pre-fits the unique
 response pool, stores compact numerical caches, and groups coarse comparisons
-by response for reuse. The original `v0.9.2` Git tag is unchanged; use the
-`v0.9.2-streamlined1` tag or `codex/downstream-resume-progress` for this update.
+by response for reuse. Hierarchy search now defaults to a 40-PC residual screen
+retaining the global top 10% of scorable absolute coarse correlations, plus
+undefined-correlation rescues. This extra screen is heuristic; use
+`--coarse-screen none` for the full coarse reference. The original `v0.9.2` Git tag is unchanged; use the
+`v0.9.2-pcscreen1` tag or `codex/downstream-resume-progress` for this update.
 
 The legacy candidate-table scanner reports one result for each unordered pair. The separate
 `ko-variation-annotation` helper selects distal significant signals, calculates
@@ -29,7 +32,7 @@ See [downstream usage and interpretation](docs/downstream.md).
 ## Installation
 
 ```bash
-git clone --branch v0.9.2-streamlined1 https://github.com/jeju2486/Pair-logistic-mds.git
+git clone --branch v0.9.2-pcscreen1 https://github.com/jeju2486/Pair-logistic-mds.git
 cd Pair-logistic-mds
 pip install -e .
 ko-variation --version
@@ -248,6 +251,15 @@ See `docs/model.md`, `docs/interpretation.md`, and `docs/research_basis.md` for
 more detail.
 
 ## Version history
+
+### 0.9.2 execution revision pc-screen-1
+
+- screen coarse representatives in threaded matrix blocks before creating KOVAR tasks;
+- select a global retained fraction with disk-backed ranks and deterministic ties;
+- resume correlation/selection/materialization stages and remove temporary scores;
+- reuse compatible preparation, hierarchy and nulls in a separate filtered output;
+- retain the full-pattern Bonferroni family and the existing KOVAR gate/beta rules;
+- benchmark screened and full coarse pipelines, including gate and final-hit recovery.
 
 ### 0.9.2 execution revision streamlined-1
 

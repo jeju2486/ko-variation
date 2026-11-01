@@ -59,7 +59,7 @@ class DiscoveryTests(unittest.TestCase):
             folder = Path(temporary)
             fasta,tree,unitigs = self.inputs(folder)
             common = ["--fasta",str(fasta),"--tree",str(tree),"--unitigs",str(unitigs),
-                      "--min-cell-count","1","--screen-p","0.01","--batch-size","3","--threads","2","--memory-gb","1"]
+                      "--min-cell-count","1","--screen-p","0.01","--batch-size","3","--threads","2","--memory-gb","1","--coarse-screen","none"]
             out = folder/"bounded"
             self.assertEqual(main(common+["--out",str(out),"--search","exhaustive"]),0)
             work = out/".kovar_work"
@@ -105,8 +105,8 @@ class DiscoveryTests(unittest.TestCase):
             self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
             self.assertTrue((work/'run_identity.v092.json').exists())
             self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
-            from ko_variation.null_identity import PREFIT1_CODE,PREFIT2_CODE
-            for revision,code in [('prefit-compact-1',PREFIT1_CODE),('prefit-compact-2',PREFIT2_CODE)]:
+            from ko_variation.null_identity import PREFIT1_CODE,PREFIT2_CODE,STREAMLINED_CODE
+            for revision,code in [('prefit-compact-1',PREFIT1_CODE),('prefit-compact-2',PREFIT2_CODE),('streamlined-1',STREAMLINED_CODE)]:
                 previous=json.loads((work/'run_identity.json').read_text())
                 previous['execution_revision']=revision
                 previous['code']={key:sorted(values)[0] for key,values in code.items()}

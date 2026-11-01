@@ -31,7 +31,7 @@ def search_progress(report, internal):
     conservative. This measures the search policy's work, not elapsed time.
     """
     meta=report['meta']
-    total=report['coarse_category_pairs']+internal
+    total=report.get('coarse_pairs_required',report['coarse_category_pairs'])+internal
     pending=sum(row['pending_blocks'] for row in report['pending_blocks_by_depth'])
     opened=min(total,report.get('coarse_pairs_scheduled',0)+internal) if meta.get('search_initialized') else 0
     lower=max(0,opened-pending)
@@ -78,6 +78,12 @@ def print_summary(report):
         print('This run is exhaustive; hierarchy branch progress does not apply.')
         print(f"Queried pattern pairs: {report.get('queried_pairs')}")
         return
+    screen=report['meta'].get('coarse_screen_summary')
+    if screen:
+        print(f"PC screen retained: {screen['selected_pairs']:,} / {screen['total_pairs']:,}; search coverage below concerns retained work")
+    elif report['meta'].get('coarse_screen_progress'):
+        state=report['meta']['coarse_screen_progress']
+        print(f"PC screen stage: {state['stage']}; correlations {state.get('scored_pairs',0):,} / {state['total_pairs']:,}")
     if meta.get('search_complete'):
         print('Hierarchy search: 100% complete (distance/beta/export may still remain).')
     elif progress['ready'] and progress['total_branches']:
@@ -85,7 +91,7 @@ def print_summary(report):
         print(f'Estimated search coverage: {lo:.2f}% to {hi:.2f}% of top-level branches finished')
     else:
         print('Search percentage: unavailable until hierarchy construction and search initialization finish.')
-    print(f"Coarse comparisons opened: {report.get('coarse_pairs_scheduled',0):,} / {report['coarse_category_pairs']:,}")
+    print(f"Coarse comparisons opened: {report.get('coarse_pairs_scheduled',0):,} / {report.get('coarse_pairs_required',report['coarse_category_pairs']):,}")
     print(f"Coarse comparisons not yet opened: {report['coarse_pairs_not_yet_scheduled']:,}")
     print(f"Pending blocks (including in-flight): {progress['pending_blocks']:,}")
     print(f"Remaining top-level branches: {progress['total_branches']-progress['finished_branches_upper']:,}"
@@ -154,10 +160,13 @@ def main():
         report['meta']={key:json.loads(value) for key,value in db.execute(
             "SELECT key,value FROM meta WHERE key IN ('hierarchy_complete','search_initialized','root_cursor','response_coarse_columns','response_coarse_next',"
             "'coarse_scheduled_count','search_complete','distance_expanded','runtime_totals','prefit_runtime_totals',"
-            "'active_stage','null_stage_progress','null_stage_summary','worker_state','hierarchy_metrics','queried_pairs_count','memory_budget','resource_plan')")}
+            "'active_stage','null_stage_progress','null_stage_summary','worker_state','hierarchy_metrics','queried_pairs_count','memory_budget','resource_plan',"
+            "'coarse_screen_summary','coarse_screen_progress','pc_coarse_cursor','reused_prepared_from')")}
         roots=db.execute('SELECT count(*) FROM nodes WHERE parent=0').fetchone()[0]
         report['coarse_categories']=roots
         report['coarse_category_pairs']=roots*(roots-1)//2
+        screen=report['meta'].get('coarse_screen_summary')
+        report['coarse_pairs_required']=screen['selected_pairs'] if screen else report['coarse_category_pairs']
         report['queried_pairs']=report['meta'].get('queried_pairs_count')
         report['runtime_totals']=report['meta'].pop('runtime_totals',{})
         report['hierarchy_metrics']=report['meta'].pop('hierarchy_metrics',{})
@@ -179,7 +188,7 @@ def main():
             report['still_processing_within_root_categories']=report['coarse_pairs_scheduled']==0
         if args.hierarchy_depth or args.summary or args.previous:
             scheduled=report.get('coarse_pairs_scheduled',0)
-            report['coarse_pairs_not_yet_scheduled']=max(0,report['coarse_category_pairs']-scheduled)
+            report['coarse_pairs_not_yet_scheduled']=max(0,report['coarse_pairs_required']-scheduled)
             report['nodes_by_depth']=[dict(depth=level,nodes=count) for level,count in db.execute(
                 'SELECT level,count(*) FROM nodes WHERE level>=0 GROUP BY level ORDER BY level')]
             # A cross-block can have different depths on its two sides. Group
