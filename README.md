@@ -36,6 +36,11 @@ pipeline. The sample-labelled A/C FASTA must preserve original graph columns:
 A=absence, C=presence. The tree needs branch lengths and matching sample IDs.
 The external PAN-GWES graph-distance executable is supplied separately.
 
+The [portable Bash runner](examples/run_discovery.sh) takes the same options
+and automatically resumes an existing checkpoint. It uses the installed Python
+environment, accepts `KOVAR_PYTHON=/path/to/python`, and has no scheduler or
+account-specific paths. See [portable running instructions](docs/portable_runner.md).
+
 Defaults are MAF >=0.05, minimum final joint-cell count 20, 40 tree PCs and
 10% coarse-pair retention. PC and representative screening are heuristics;
 use `--coarse-screen none` or `--search exhaustive` for the corresponding
