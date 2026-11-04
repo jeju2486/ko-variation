@@ -1,23 +1,20 @@
-# Validation status and release criteria
+# Validation scope
 
-KOVAR 0.8.3 remains experimental. Unit tests establish software contracts, not
-biological validity or calibrated type-I error.
+Software checks cover bounded score decisions, numerical reference agreement,
+checkpoint reuse, multi-worker scheduling, distance classification and selected
+beta output. These checks do not establish biological validity or complete
+candidate recovery by the heuristic PC/hierarchy screen.
 
-The release suite checks canonical pair reversal invariance, rejection of
-duplicate unordered pairs, inclusive 5% MAF handling, the one-cell default,
-graph-count filtering before model scheduling, response-pattern reuse, SPA
-policy, score-only checkpoint recovery, kinship validation, and single versus
-multi-process agreement.
+Keep frozen simulation and observed-data benchmarks with sample IDs, input hashes,
+software versions and hypothesis-family definitions. Compare candidate recovery,
+null calibration, failure rates and runtime on the target hardware. Report
+preparation, null fitting, pair search and beta fitting separately.
 
-Statistical validation still requires simulation across realistic bacterial
-tree shapes, sample sizes, locus frequencies, lineage concentration, linkage,
-recombination, and null/associated pair generation. Compare normal-score and
-automatic-SPA calibration, power, failure rates, and sensitivity to tree error.
-Reference small-matrix comparisons should cover logistic regression at
-`tau=0`, PQL null estimates, score variances, singular positive-semidefinite
-covariances, separation, and variance-component boundaries.
+PC-count and candidate-budget results describe the tested panels and reference,
+not all bacterial populations. Eigensolver comparisons need coefficient,
+probability and convergence agreement alongside speed. Repeated timings of the
+same pairs are not independent biological replicates. External annotation and
+graph tools require their own versions and deployment validation.
 
-Before confirmatory use, require acceptable null calibration at the intended
-frequency range, reproducible seeds and dependency versions, explicit failure
-statuses, exact hypothesis counts, and external biological validation. Resume
-must also be tested on the target scheduler/filesystem before a multi-day run.
+The publication cleanup retires scanner-only tests together with the removed
+scanner. Discovery, shared numerical functions and downstream tests remain.

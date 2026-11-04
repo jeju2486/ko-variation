@@ -5,8 +5,7 @@ The original `v0.9.2` tag remains unchanged. `--version` still reports 0.9.2;
 the startup banner, identities and summaries identify the execution revision.
 
 `ko-variation-discover` (also `ko-variation discover`) accepts PAN-GWES unitig
-presence/absence directly. SpydrPick, MI and ARACNE are not required. The old
-`ko-variation --pairs ...` scanner remains available for existing workflows.
+presence/absence directly. SpydrPick, MI and ARACNE are not required. Historical candidate-table scans use the v0.8.3 tag in a separate environment.
 
 ## Install and run
 

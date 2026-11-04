@@ -1,81 +1,32 @@
 # Package architecture
 
-```text
-Pair-logistic-mds/
-|-- README.md
-|-- pyproject.toml
-|-- requirements.txt
-|-- docs/
-|   |-- architecture.md
-|   |-- interpretation.md
-|   |-- model.md
-|   |-- research_basis.md
-|   `-- validation.md
-|-- ko_variation/
-|   |-- cli.py          # small public interface and pipeline orchestration
-|   |-- io_utils.py     # binary FASTA and pair-table contracts
-|   |-- kinship.py      # rooted-tree covariance
-|   |-- glmm.py         # PQL null fit and score calculations
-|   |-- spa.py          # optional score-tail calibration
-|   |-- scan.py         # canonical pairs, filters, task reuse, correction
-|   |-- checkpoint.py   # atomic score-task shards and strict resume
-|   |-- diagnostics.py  # runtime, thread, memory, and timing metadata
-|   |-- selection_cli.py # streamed full-scan selection; preserves n_tests
-|   |-- annotation_inputs.py # portable Pyseer/Bakta input preparation
-|   |-- locus_annotation.py  # coordinate-based assignment and ambiguity audit
-|   |-- annotation_cli.py    # selected effects, resume/progress and exports
-|   |-- postprocess.py       # selection rule and selected PQL coefficients
-|   |-- effect_checkpoint.py # resumable per-pair coefficient fits
-|   |-- network.py           # gene aggregation; no gene-level significance test
-|   |-- network_display.py   # shared PNG/SVG/offline D3 layout and display
-|   |-- network_cli.py       # redraw saved effects without refitting
-|   |-- workflow_cache.py    # shared completed-stage cache
-|   |-- amr_report.py        # read-only phenotype/determinant/network report
-|   `-- data/amr_determinants.tsv # curated species/drug mappings with sources
-|-- tests/
-`-- run_kovar_v083_*.sh
-```
+The installed package has one discovery pipeline and optional downstream stages.
+Benchmarks, ARC runners and research outputs are outside its runtime modules.
 
-## Execution flow
+| Stage | Modules | Role |
+|---|---|---|
+| Public command | cli | Thin discovery entry point and version |
+| Preparation/storage | discovery_store, kinship | Streamed A/C inputs, unique patterns, tree covariance, SQLite |
+| Candidate search | discovery, coarse_screen, discovery_eligibility | PC shortlist, hierarchical tasks, joint-cell eligibility |
+| Numerical workers | discovery_score, glmm | Adaptive score decisions and selected-pair beta fits |
+| Null models | discovery_nulls, null_identity | Fitting, bounded caches, immutable imports and compatible restarts |
+| CPU/memory | discovery_execution, memory_budget | Bounded scheduling and allocation-aware budgets |
+| Annotation | annotation_inputs, locus_annotation | Unitig-to-gene assignment and ambiguity |
+| Effects/selection | selection_cli, annotation_cli, postprocess, effect_checkpoint | Existing-table selection and resumable refits |
+| Networks | network, network_display, network_cli, functional_annotation | Gene aggregation and PNG/SVG/HTML display |
+| Biology reports | amr_report, phenotype, phenotype_lmm | Determinant representation and held-out MIC comparisons |
+| Shared utilities | checkpoint, workflow_cache, io_utils, spa | Fingerprints, atomic outputs and numerical/input helpers |
 
-```text
-read and validate A/C FASTA, pair table, rooted tree
-  -> canonicalize each pair to u < v
-  -> apply graph-count, MAF, and joint-cell filters
-  -> group eligible response loci by exact/complement pattern
-  -> build K eigensystem once
-  -> fit one PQL null per canonical response pattern
-  -> score all associated predictors in blocks; apply SPA policy
-  -> reconstruct checkpointed results
-  -> calculate BH and Bonferroni values
-  -> atomically write scientific and metadata outputs
-```
+`checkpoint.py` now contains only fingerprint and atomic-write utilities used
+by downstream stages. The obsolete candidate-scan shard store, scanner and
+scanner-only diagnostics were removed. Existing downstream cache serialization
+is preserved. The discovery numerical source and execution identity are unchanged.
 
-Checkpointing covers the only multi-day task stage: response-null fitting and
-pair scoring. Numerical tuning is internal so the public CLI exposes scientific
-choices rather than implementation detail.
+The `benchmarks/` directory contains PC-count recovery and frozen significance
+benchmarks plus beta/eigensolver comparisons. It is excluded from package
+installation and the main run. Historical reference generation can call an
+independently installed v0.8.3 scanner; its code is not duplicated here.
 
-## Deliberately separate work
-
-Physical-distance classification, gene annotation, selected alternative fits, and
-network exports are implemented in the separate `ko-variation-annotation` CLI
-and downstream modules (see `downstream.md`). Keeping them outside the scanner
-prevents screening significance, biological annotation, and post-selection
-effect estimation from being confused.
-
-## Downstream boundaries
-
-The public commands accept explicit paths and have no ARC scheduler assumptions.
-`ko-variation-select` streams a full result table into a small selected table.
-`ko-variation-map-loci` prepares and resolves DNA annotations.
-`ko-variation-annotation` estimates selected effects and exports networks.
-`ko-variation-network` redraws saved effects. `ko-variation-amr-report` joins
-metadata, annotation labels and an existing selected network without fitting.
-Completed-stage caching
-is shared; numerical effect checkpoints remain separate. The R-backed distance
-plot is still available through `ko-variation-plot` and is not a network export.
-
-ARC-specific submission scripts and their wrapper-only cache CLI were removed.
-The portable v0.8.3 example runners remain because they contain no account paths
-or scheduler settings. AMR reporting uses a bundled, incomplete starter catalogue
-or an explicitly supplied custom catalogue. Mutation calling remains deferred.
+The `examples/` directory contains portable commands and synthetic downstream
+inputs. ARC-specific runners and workspace cleanup scripts are distributed
+separately. Paths, allocations and user accounts are not part of the package.

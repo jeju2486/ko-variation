@@ -409,7 +409,7 @@ def tree_plot(tree, samples, X, features, phenotypes, groups, out, dpi):
     cmap.set_bad("white")
     image = axes[2].pcolormesh([-.5, .5], boundaries, np.ma.masked_invalid(values[rows, None]),
                               cmap=cmap, shading="flat", rasterized=False)
-    axes[2].set_title("log₂ MIC", fontsize=8)
+    axes[2].set_title("logâ‚‚ MIC", fontsize=8)
     # An ordinary colourbar shrinks just the MIC axes and breaks tip/row alignment.
     bar = axes[2].inset_axes([0, -.045, 1, .012])
     fig.colorbar(image, cax=bar, orientation="horizontal")
@@ -458,7 +458,7 @@ def main(argv=None):
     if args.folds < 3 or args.random_sets < 1 or args.min_count < 1 or args.dpi < 72:
         parser.error("folds >=3, random-sets/min-count >=1, dpi >=72 required")
     if args.group_method == "fastbaps" and args.clusters is None:
-        parser.error("fastBAPS grouping requires --clusters FILE; infer it first with ko-variation-fastbaps")
+        parser.error("Grouping requires --clusters FILE with externally inferred sample,cluster labels")
     if args.group_method == "complete" and (args.groups < 3 or args.clusters is not None):
         parser.error("Legacy complete grouping requires groups >=3 and does not accept --clusters")
     if args.seed < 0 or args.interaction_bootstrap < 0 or args.interaction_min_cell < 1:

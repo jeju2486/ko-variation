@@ -5,7 +5,6 @@ Run from the repository root: python examples/downstream/reproduce.py
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from ko_variation.scan import ScanConfig, scan_pairs_glmm
 from ko_variation.annotation_cli import main
 
 
@@ -16,8 +15,9 @@ def reproduce():
     matrix = np.array([[1, 1]] * 30 + [[1, 0]] * 10 + [[0, 1]] * 10 + [[0, 0]] * 30, dtype=np.uint8)
     matrix = np.column_stack([matrix, matrix[:, 0], 1 - matrix[:, 1]])
     pairs = pd.DataFrame(dict(u=[0, 0, 2], v=[1, 3, 3], distance=[20000, 50000, 30000]))
-    # Zero covariance provides an exact no-relatedness reproducibility oracle.
-    results, _ = scan_pairs_glmm(pairs, matrix, np.zeros((80, 80)), ScanConfig(progress=False, spa_mode="off"))
+    # Explicit synthetic selected evidence exercises the downstream workflow.
+    # These invented demonstration values are not a statistical benchmark.
+    results = pairs.assign(p_primary=1e-12, status="OK")
     results.to_csv(root / "ko_variation.tsv", sep="\t", index=False)
     (root / "binary.fa").write_text("".join(f">s{i}\n{''.join('C' if v else 'A' for v in row)}\n" for i, row in enumerate(matrix)), encoding="utf-8")
     (root / "tree.nwk").write_text("(" + ",".join(f"s{i}:1" for i in range(len(matrix))) + ");\n", encoding="utf-8")
