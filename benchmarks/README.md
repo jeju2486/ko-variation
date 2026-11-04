@@ -7,7 +7,8 @@ the repository root with KOVAR importable. Store results outside this source tre
 |---|---|---|
 | MI vs tree-PC ranking, PC count/retention | `python -m benchmarks.screen_benchmark` | recovery.tsv, ranks, timings, frozen panel/reference |
 | Extend/redraw completed PC results | `benchmarks.screen_benchmark_extend`, `python -m benchmarks.plot_screen_benchmark --out DIR` | extended_pcs and PNG/SVG |
-| Exact vs adaptive significance, hierarchy and PC40 recovery | `python benchmarks/discovery_benchmark.py` | comparison.tsv and per-arm summaries/checkpoints |
+| Exact vs adaptive significance, hierarchy and PC40 recovery | `python -m benchmarks.discovery_benchmark` | comparison.tsv and per-arm summaries/checkpoints |
+| Redraw saved significance benchmark | `python -m benchmarks.plot_discovery_benchmark --out DIR` | recovery, wall-time and query-count PNG/SVG |
 | Full vs warm/score beta | `python benchmarks/beta_benchmark.py` | beta_results.tsv, beta_summary.json, plots |
 | Full-refit eigensolvers | `python benchmarks/beta_eigensolver_benchmark.py` | eigensolver_results.tsv, eigensolver_summary.json, plots |
 | Progress of a discovery run | `python benchmarks/inspect_discovery.py` | read-only snapshots and ETA comparisons |
@@ -30,3 +31,16 @@ The beta/eigensolver benchmarks read prepared arrays and a frozen selection.
 Their scripts/outputs and checkpoints are independent of the main search. See
 [beta details](beta_benchmark.md) and [eigensolver details](beta_eigensolver_benchmark.md).
 No benchmark is a default dependency of discovery.
+
+For a fresh production significance benchmark, `--source-run DIR` samples a
+frozen random panel from an existing run's prepared **unique patterns**. Add
+`--patterns 1000 --seed 42 --threads 4 --out NEW_DIR`. The full source-pattern
+Bonferroni family is retained by default. Selection uses no phenotype or
+association results. Existing `--fasta PANEL --tree TREE` inputs remain supported.
+The benchmark never sends the full genome to exhaustive comparison by default.
+Plotting a saved `comparison.tsv` performs no fitting and preserves its timings.
+
+The PC-count benchmark retains its historical design and requires an independent
+installed v0.8.3 reference Python for fresh reference fits. Its reference family
+is recorded separately from the production significance benchmark. These two
+recovery percentages describe their respective candidate/reference universes.

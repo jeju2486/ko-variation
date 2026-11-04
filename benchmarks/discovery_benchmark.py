@@ -6,18 +6,66 @@ This compares the release code paths, not a separate scoring implementation.
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
+import shutil
 import sqlite3
 
 from ko_variation.discovery import main,identity,parser as discovery_parser
-from ko_variation.discovery_store import records
+from ko_variation.discovery_store import records, atomic_json, digest, open_patterns
 from ko_variation.memory_budget import detect_budget
+
+
+def prepare_panel(source, out, count, seed):
+    """Freeze a genotype-only panel from existing immutable preparation.
+
+    Selection does not inspect significance, phenotype or network membership.
+    Sampling is over unique patterns, not over duplicated unitig columns.
+    """
+    import numpy as np
+    source = source.resolve()
+    if not (source/'run_identity.json').exists():
+        source /= 'results'
+    identity = json.loads((source/'run_identity.json').read_text())
+    work = Path(identity.get('work_directory',source/'.kovar_work'))
+    info = json.loads((work/'prepared.json').read_text())
+    tree = Path(identity['settings']['tree'])
+    if count < 3 or count > info['patterns']:
+        raise ValueError('Panel size must be 3..number of prepared unique patterns')
+    if digest(work/'patterns.bin') != info['products']['patterns.bin']:
+        raise ValueError('Source prepared patterns changed')
+    selected = np.sort(np.random.default_rng(seed).choice(info['patterns'],count,replace=False))
+    frozen = dict(pattern_product=info['products']['patterns.bin'], tree_sha256=digest(tree),
+                  selected_patterns=selected.tolist(), samples=info['samples'], seed=seed)
+    directory = out/'panel_inputs'
+    directory.mkdir(parents=True,exist_ok=True)
+    fasta, target_tree = directory/'panel.fasta', directory/'tree.nwk'
+    manifest = directory/'panel.json'
+    if manifest.exists():
+        saved = json.loads(manifest.read_text())
+        if saved['identity'] != frozen or saved['fasta_sha256'] != digest(fasta) or \
+                frozen['tree_sha256'] != digest(target_tree):
+            raise ValueError('Frozen panel changed; use a new benchmark output')
+    else:
+        packed = open_patterns(work,info)
+        X = np.unpackbits(packed[selected],axis=1,bitorder='little')[:,:info['n']].T
+        temporary = fasta.with_suffix('.partial')
+        with temporary.open('w') as stream:
+            for sample, row in zip(info['samples'],X):
+                stream.write('>'+sample+'\n'+''.join('C' if b else 'A' for b in row)+'\n')
+        temporary.replace(fasta)
+        shutil.copyfile(tree,target_tree)
+        atomic_json(manifest,dict(identity=frozen,fasta_sha256=digest(fasta)))
+    return fasta,target_tree,math.comb(info['patterns'],2)
 
 
 def benchmark():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--fasta",type=Path,required=True)
-    p.add_argument("--tree",type=Path,required=True)
+    p.add_argument("--fasta",type=Path)
+    p.add_argument("--tree",type=Path)
+    p.add_argument('--source-run',type=Path,help='Existing discovery run; sample a frozen unique-pattern panel')
+    p.add_argument('--patterns',type=int,default=1000,help='Unique patterns when using --source-run [1000]')
+    p.add_argument('--seed',type=int,default=42)
     p.add_argument("--out",type=Path,required=True)
     p.add_argument("--threads",type=int,default=4)
     p.add_argument("--memory-gb",type=float,default=None)
@@ -26,6 +74,16 @@ def benchmark():
     p.add_argument("--screen-p",type=float,default=.001)
     p.add_argument("--bonferroni-tests",type=int,help="Freeze the full study's hypothesis family for sampled panels")
     args=p.parse_args()
+    args.out = args.out.resolve()
+    if args.source_run:
+        if args.fasta or args.tree or args.patterns > args.max_loci:
+            p.error('--source-run replaces --fasta/--tree; --patterns cannot exceed --max-loci')
+        args.fasta,args.tree,family = prepare_panel(args.source_run,args.out,args.patterns,args.seed)
+        if args.bonferroni_tests is None:
+            args.bonferroni_tests = family
+    elif not args.fasta or not args.tree:
+        p.error('Supply either --source-run or both --fasta and --tree')
+    args.fasta,args.tree = args.fasta.resolve(),args.tree.resolve()
     _,sequence=next(records(args.fasta))
     if len(sequence)>args.max_loci:
         p.error("Input exceeds --max-loci; use a frozen small panel, not the full genome")
