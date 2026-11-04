@@ -95,6 +95,17 @@ def migrate_identity(previous, expected, manifest):
     release = {"0.9.0":V090_CODE, "0.9.1":V091_CODE, "0.9.2":V092_CODE}.get(previous.get("version"))
     release={'prefit-compact-1':PREFIT1_CODE,'prefit-compact-2':PREFIT2_CODE,'streamlined-1':STREAMLINED_CODE}.get(
         previous.get('execution_revision'),release)
+    # The released PC40 checkpoint predates cumulative beta progress. Only
+    # orchestration/reporting changed; all numerical sources must still match.
+    if previous.get('version') == expected.get('version') == '0.9.2' and \
+            previous.get('execution_revision') == expected.get('execution_revision') == 'pc-screen-1':
+        release = {name:{value} for name,value in expected['code'].items()}
+        release.update({
+            'discovery.py': {'ed0f27ddee6a7b90a45d6002ffbe147a0787a7cef01520d78304bc25fae3b78e',
+                             '863b895d1abb375162f2a11548aa52b3e50ccc6443f23ac6c7a3785a7bd1399c'},
+            'null_identity.py': {'dc344fa33bad4180ce81f4cd7e21f2cd900c789af2c558906bc2155cc4471133',
+                                '1090804280e62d96dfe71caaf311c416806da96eb40d8b25e1560fd82f5aa91c'},
+        })
     if release is None or set(previous.get("code",{})) != set(release):
         raise ValueError("Input/code/statistical settings changed; use a new output")
     if any(previous["code"][key] not in values for key,values in release.items()):

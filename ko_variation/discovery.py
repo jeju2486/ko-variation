@@ -696,17 +696,55 @@ def distance_and_beta(db, work, pool, args):
             product.unlink()
         print(f"[KOVAR] distance: committed {len(rows):,} unitig pairs",flush=True)
     if not args.no_beta:
-        cursor = db.execute("SELECT DISTINCT d.pu,d.pv FROM distance d LEFT JOIN beta b ON b.u=d.pu AND b.v=d.pv "
-                            "WHERE d.status='DISTAL' AND b.u IS NULL ORDER BY d.pv,d.pu")
-        jobs = ((u,v) for u,v in cursor)
-        completed,last=0,time.monotonic()
-        for row in bounded_map(pool,kernels.beta,jobs,args.threads,ordered=False):
-            with db:
-                db.execute("INSERT OR IGNORE INTO beta VALUES (?,?,?,?)",row)
-            completed+=1
-            if time.monotonic()-last>25:
-                print(f"[KOVAR] beta: {completed:,} pattern pairs committed this invocation",flush=True)
-                last=time.monotonic()
+        # Freeze a disk-backed queue before writing beta rows. Repeated unitig
+        # mappings share one fit; committed attempts never re-enter the queue.
+        db.execute('DROP TABLE IF EXISTS temp.beta_queue')
+        db.execute('CREATE TEMP TABLE beta_queue(u INTEGER,v INTEGER,PRIMARY KEY(v,u)) WITHOUT ROWID')
+        db.execute("INSERT OR IGNORE INTO beta_queue SELECT pu,pv FROM distance WHERE status='DISTAL'")
+        total = db.execute('SELECT count(*) FROM beta_queue').fetchone()[0]
+        statuses = dict(db.execute('SELECT b.status,count(*) FROM beta b JOIN beta_queue q '
+                                   'ON b.u=q.u AND b.v=q.v GROUP BY b.status'))
+        saved_before = sum(statuses.values())
+        db.execute('DELETE FROM beta_queue WHERE EXISTS '
+                   '(SELECT 1 FROM beta b WHERE b.u=beta_queue.u AND b.v=beta_queue.v)')
+        db.commit()
+        completed = 0
+        started = last = time.monotonic()
+
+        def publish_beta_progress(finished=False):
+            nonlocal last
+            now = time.monotonic()
+            saved = saved_before+completed
+            remaining = total-saved
+            eta = (now-started)/completed*remaining if completed else None
+            progress = dict(stage='beta_complete' if finished else 'beta',
+                            total_distal_pattern_pairs=total, saved=saved, remaining=remaining,
+                            saved_before_invocation=saved_before, committed_this_invocation=completed,
+                            status_counts=statuses, seconds_this_invocation=now-started,
+                            eta_seconds=eta, work_directory=str(work.resolve()))
+            atomic_json(args.out/'beta_progress.json',progress)
+            message = f'; rough ETA {eta/3600:.2f} h' if eta is not None else ''
+            print(f"[KOVAR] beta: {saved:,}/{total:,} pattern pairs saved; {remaining:,} remaining; "
+                  f"{completed:,} new this invocation; {statuses.get('OK',0):,} OK; "
+                  f"{saved-statuses.get('OK',0):,} non-OK{message}",flush=True)
+            last = now
+
+        publish_beta_progress()
+        jobs = db.execute('SELECT u,v FROM beta_queue ORDER BY v,u')
+        try:
+            for row in bounded_map(pool,kernels.beta,jobs,args.threads,ordered=False):
+                # SQLite uses synchronous=FULL; publish progress only after commit.
+                # A crash can repeat in-flight work, never an acknowledged fit.
+                with db:
+                    db.execute("INSERT OR IGNORE INTO beta VALUES (?,?,?,?)",row)
+                completed += 1
+                statuses[row[3]] = statuses.get(row[3],0)+1
+                if time.monotonic()-last>25:
+                    publish_beta_progress()
+        finally:
+            jobs.close()
+        publish_beta_progress(finished=True)
+        db.execute('DROP TABLE beta_queue')
 
 
 def export(db, info, work, args, total_seconds):

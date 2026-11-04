@@ -9,7 +9,6 @@ Benchmarks, ARC runners and research outputs are outside its runtime modules.
 | Preparation/storage | discovery_store, kinship | Streamed A/C inputs, unique patterns, tree covariance, SQLite |
 | Candidate search | discovery, coarse_screen, discovery_eligibility | PC shortlist, hierarchical tasks, joint-cell eligibility |
 | Numerical workers | discovery_score, glmm | Adaptive score decisions and selected-pair beta fits |
-| Beta restart | beta_resume | Resume full refits from saved distances; reuse the existing beta kernel/table |
 | Null models | discovery_nulls, null_identity | Fitting, bounded caches, immutable imports and compatible restarts |
 | CPU/memory | discovery_execution, memory_budget | Bounded scheduling and allocation-aware budgets |
 | Annotation | annotation_inputs, locus_annotation | Unitig-to-gene assignment and ambiguity |
@@ -21,7 +20,9 @@ Benchmarks, ARC runners and research outputs are outside its runtime modules.
 `checkpoint.py` now contains only fingerprint and atomic-write utilities used
 by downstream stages. The obsolete candidate-scan shard store, scanner and
 scanner-only diagnostics were removed. Existing downstream cache serialization
-is preserved. The discovery numerical source and execution identity are unchanged.
+is preserved. The numerical fitting/score kernels are unchanged. The normal
+discovery pipeline reports cumulative beta checkpoints and accepts the verified
+earlier PC40 checkpoint after matching inputs, settings and numerical code.
 
 The `benchmarks/` directory contains PC-count recovery and frozen significance
 benchmarks plus beta/eigensolver comparisons. It is excluded from package

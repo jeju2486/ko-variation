@@ -55,15 +55,10 @@ must match. `--threads` is the total CPU budget. Memory follows the allocation;
 `--memory-gb` optionally caps it. `--tmp-dir` must persist across jobs.
 Borrowed null directories must remain accessible until retained runs finish.
 
-Once discovery and distances are finished, restart only full beta fitting with:
-
-```bash
-python -m ko_variation.beta_resume --out results --threads 4
-```
-
-This reuses every committed beta and fits only missing distal pattern pairs.
-`beta_progress.json` reports saved/remaining fits, statuses and a rough ETA.
-See [beta restart details](docs/discovery.md#restart-only-beta-fitting).
+The same `--resume` command skips committed beta fits. Its beta-stage log and
+`beta_progress.json` report cumulative saved/remaining pattern pairs, OK/non-OK
+statuses and new fits in the current invocation. There is no separate beta
+restart command. See [beta checkpoints](docs/discovery.md#beta-checkpoints).
 
 The first discovery output must be empty. For a wrapper that prepares inputs
 itself, use sibling directories `run/prepared_inputs` and `run/results`, and
