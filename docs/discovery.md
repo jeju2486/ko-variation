@@ -449,3 +449,47 @@ sampled panel. The comparison table includes fitting/loading/bound/exact worker
 times and coordinator database times. Exact invocation time includes fitting;
 the next arms reuse models, so these are not independent cold-run timings.
 There are no full ARC runtime or whole-pool recovery guarantees in this release.
+
+## Restart only beta fitting
+
+```bash
+python -m ko_variation.beta_resume --out results --threads 4
+# Installed equivalent after updating the package:
+ko-variation-beta --out results --threads 4
+```
+
+Use the existing discovery results directory, or its parent containing
+`results/`. The helper locates the persistent work directory from
+`run_identity.json`. Discovery and distance expansion must be complete and no
+distance rows may remain `PENDING`. If distances are unfinished, repeat the
+normal discovery command with `--resume` first.
+
+The helper uses the same full logistic mixed-model refit as discovery, without
+score approximation. It skips saved fits, including non-OK attempts; add
+`--retry-failed` to explicitly retry only non-OK fits. Each completed pattern
+pair is committed immediately to the existing `beta` table. Following an
+interruption, only uncommitted/in-flight fits repeat. Multiple unitig pairs
+sharing one ordered pattern pair reuse one beta. Local and unknown-distance
+pairs are excluded from fitting.
+
+The queue uses SQLite temporary storage on disk and a bounded worker queue;
+`--threads` is the total worker CPU budget. `--memory-gb` optionally caps the
+allocation-aware memory plan. There is no all-pairs Python list. The same
+coordinator lock prevents simultaneous discovery and beta writers. Stop the
+existing job before switching modes, and retain the work directory and its
+SQLite WAL/SHM files. The helper checks saved numerical code, NumPy/SciPy
+versions and prepared-array fingerprints; it does not reread raw FASTA/graph
+inputs, repeat pair search, fit nulls or rerun the distance executable.
+
+`beta_progress.json` updates initially, every 30 seconds by default (after a fit
+completes), and on completion. It reports saved/remaining pattern pairs,
+OK/non-OK statuses, current-invocation commits and a rough recent-invocation
+ETA. Saved means attempted and committed, not necessarily a successful fit.
+Use `--progress-seconds` to change the reporting interval. Final
+`associations.tsv.gz`, `unitigs.tsv.gz` and `run_summary.json` are regenerated
+atomically after fitting finishes. Their public values include all saved fits,
+including those completed before restart. `--unitigs` optionally supplies the
+sequence-source label if no existing unitig export is available.
+
+This helper adds no changes to the discovery numerical source or checkpoint
+identity, so existing matching `pc-screen-1` runs remain resumable.
