@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/jeju2486/Pair-logistic-mds"
+Repository = "https://github.com/jeju2486/ko-variation"
 
 [project.optional-dependencies]
 network = ["matplotlib>=3.6", "networkx>=2.8"]
