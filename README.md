@@ -1,176 +1,94 @@
 # KOVAR
 
-KOVAR (KO-Variation) screens candidate pairs of binary pangenome loci for
-covariation after adjustment for shared ancestry. It uses a phylogeny-derived
-sample covariance, a binary logistic mixed-model null fit, and a score test.
-The output is evidence against no adjusted association; it is not an effect
-size, a causal direction, or proof of biological epistasis.
+KOVAR identifies associations between binary pangenome features after adjustment
+for a phylogeny-derived sample covariance. Direct unitig discovery combines
+unique-pattern reuse, a global tree-PC coarse screen, hierarchical search and
+adaptive significance bounds. The output describes covariation; it does not
+establish causality or biological epistasis.
 
-Version 0.8.3 reports one result for each unordered pair. Physical-linkage
-classification, gene annotation, and effect-size estimation are deliberately
-left for a future separate `ko-variation-annotation` tool.
+## Install
 
-## Installation
+From this release checkout, using Python 3.10 or newer:
 
 ```bash
-git clone https://github.com/jeju2486/Pair-logistic-mds.git
-pip install -e .
+python -m pip install -e .
+# Optional network/figure and quantitative-phenotype dependencies:
+python -m pip install -e '.[network,phenotype]'
 ko-variation --version
 ```
 
-Python 3.10 or newer is required. KOVAR depends on NumPy, pandas, SciPy, and
-threadpoolctl.
+The package version is 0.9.2; the numerical execution revision remains
+`pc-screen-1`. The publication cleanup changes interfaces and optional helpers,
+while keeping the discovery, null-fitting and score kernels unchanged.
 
-## Quick start
+## Discover covariation
 
 ```bash
-ko-variation \
-  --fasta binary.fa \
-  --pairs candidates.tsv \
-  --tree rooted_tree.nwk \
-  --out kovar_results \
-  --threads 32
+ko-variation discover \
+  --fasta graph.sample_ids.fasta --tree rooted_tree.nwk \
+  --unitigs graph.unitigs --paths graph.paths \
+  --unitig-distance /path/to/unitig_distance --kmer-length 61 \
+  --out results --threads 4
 ```
 
-SPA is `auto` by default. To resume an interrupted run, repeat the identical
-command and add `--resume`. To start a new run in a non-empty output directory,
-use `--overwrite`.
+`ko-variation-discover` and `python -m ko_variation.discovery` run the same
+pipeline. The sample-labelled A/C FASTA must preserve original graph columns:
+A=absence, C=presence. The tree needs branch lengths and matching sample IDs.
+The external PAN-GWES graph-distance executable is supplied separately.
 
-## Inputs
+Defaults are MAF >=0.05, minimum final joint-cell count 20, 40 tree PCs and
+10% coarse-pair retention. PC and representative screening are heuristics;
+use `--coarse-screen none` or `--search exhaustive` for the corresponding
+references. Bonferroni alpha is 0.05 across all unique-pattern pairs, including
+pairs not selected by the heuristic screen. The exploration gate is separate.
 
-`--fasta` is an aligned fake FASTA with identical locus order and length in all
-samples. `A` means absence (0) and `C` means presence (1).
+Significance selects candidate edges; post-hoc beta describes their magnitude.
+Significant pairs <=10 kb remain in the table with beta skipped. Distal pairs
+are >10 kb by default. Exact P-values are optional when bounds certify the
+significance decision. See [discovery](docs/discovery.md),
+[model](docs/model.md) and [interpretation](docs/interpretation.md).
 
-`--pairs` is a whitespace-, comma-, or tab-delimited file containing zero-based
-`u` and `v` locus columns. A headerless nine-column PAN-GWES file is interpreted
-as:
+## Restart and resources
 
-```text
-u v distance ARACNE MI count M2 min_distance max_distance
-```
+Repeat the same command with `--resume`. Input cohort and scientific settings
+must match. `--threads` is the total CPU budget. Memory follows the allocation;
+`--memory-gb` optionally caps it. `--tmp-dir` must persist across jobs.
+Borrowed null directories must remain accessible until retained runs finish.
 
-Pairs are canonicalized to `u < v`. Duplicate unordered pairs, self-pairs, and
-out-of-range loci stop the run. Candidate rows are not filtered by MI inside
-KOVAR.
+The first discovery output must be empty. For a wrapper that prepares inputs
+itself, use sibling directories `run/prepared_inputs` and `run/results`, and
+pass only `run/results` to `--out`. [Full run/cache instructions](docs/discovery.md).
 
-`--tree` must be a rooted Newick tree with branch lengths. Tip labels must match
-FASTA sample names exactly. KOVAR does not build a fallback GRM in 0.8.3.
+## Results
 
-## How the calculation works
+- `unitigs.tsv.gz`: original unitig IDs and their unique-pattern assignments.
+- `associations.tsv.gz`: significant candidates, exact/bounded P-value fields,
+  distance classification, beta and fitting status.
+- `run_summary.json`: hypothesis family, decisions, resources and provenance.
+- `.kovar_work`: durable preparation, null models and search/distance/beta state.
 
-For the deterministic computational orientation `u -> v`, KOVAR fits the null
-model
+## Downstream commands
 
-```text
-logit P(v_i = 1) = alpha_v + b_iv
-b_v ~ N(0, tau_v K)
-```
+| Purpose | Command | Guide |
+|---|---|---|
+| Prepare/resolve annotations | `ko-variation-map-loci` | [annotation](docs/downstream.md) |
+| Select/refit existing tables | `ko-variation-select`, `ko-variation-annotation` | [downstream](docs/downstream.md) |
+| Draw covariation maps | `ko-variation-network` | [networks](docs/functional_map.md) |
+| Functional annotation | `ko-variation-prepare-proteins` | [functional map](docs/functional_map.md) |
+| Match AMR phenotypes/determinants | `ko-variation-amr-report` | [AMR report](docs/amr_report.md) |
+| Quantitative MIC comparison | `ko-variation-phenotype` | [phenotype](docs/phenotype.md) |
+| Optional distance/significance plot | `ko-variation-plot` | [downstream](docs/downstream.md) |
 
-where `K` is the root-to-MRCA covariance derived once from the tree. PQL updates
-the fitted probabilities, working weights, and response-specific variance
-component. Identical or complementary binary response patterns reuse one null
-fit. Candidate predictors sharing a response are then scored in matrix blocks.
+Historical result tables remain readable by the downstream helpers. The old
+`--pairs` scanner, standalone D audit and fastBAPS wrapper were retired from
+this package. Use the historical v0.8.3 tag in a separate environment for old
+candidate-table scans; supply externally generated population labels to MIC
+analysis. [Package structure](docs/architecture.md).
 
-The normal score statistic tests `H0: beta_uv = 0`. With `--spa-mode auto`, an
-experimental saddlepoint approximation is attempted only for a score-tail
-result in sparse context; otherwise the normal score p-value remains primary.
-This is motivated by SPAtest and SAIGE but is not a reproduction of SAIGE.
+## Benchmarks
 
-Because the reported hypothesis is unordered, reversing an input pair produces
-the same canonical pair and p-value. The computational response orientation is
-an implementation device, not a claim about causal or evolutionary direction.
-
-## Filters
-
-Filters are applied before expensive response-model scheduling:
-
-- If a recognized `count` column is present, `count >= ceil(0.05 * N)` is
-  required. If the column is absent, this route filter is not applicable.
-- Both loci require minor-state frequency `>= 0.05` by default.
-- All four joint cells require at least one observation by default.
-
-Every input pair remains in `ko_variation.tsv`; filtered rows have an explicit
-status and missing p-values. Use `--min-maf` or `--min-cell-count` to change the
-last two thresholds. The graph-count fraction is fixed at 0.05 in this release.
-
-## Outputs
-
-- `ko_variation.tsv`: one row per unordered input pair, input metadata, filter
-  status, joint counts, score statistic, normal/SPA p-values, primary p-value,
-  BH q-value, and Bonferroni flag.
-- `response_models.tsv`: response-null convergence and exact-pattern reuse
-  diagnostics.
-- `run_summary.txt`: short scientific run contract.
-- `execution_metadata.tsv`: timing, memory, runtime, kinship, cache, and
-  checkpoint diagnostics.
-
-`p_primary` is a significance measure, not the magnitude of covariation.
-`primary_method` says whether it came from the normal score approximation or a
-successful SPA calculation. `neglog10_p` is intended for plotting.
-
-## Checkpoint and resume
-
-Checkpointing is automatic. Atomic score-stage shards are written to
-`OUT/.kovar_checkpoint` unless `--checkpoint-dir` is supplied. A resume is
-accepted only when input fingerprints, version, numerical environment, and
-scientific settings match. The checkpoint is removed after final outputs are
-successfully written.
-
-## Interpretation and limitations
-
-A small p-value identifies a phylogeny-adjusted covariation candidate. It does
-not distinguish functional epistasis from physical linkage, co-transfer,
-shared ecological selection, annotation artifacts, or residual population
-structure. The candidate generator also limits discovery: a biologically
-important pair absent from the supplied PAN-GWES/SpydrPick list cannot be
-recovered by KOVAR.
-
-The PQL and SPA implementations remain experimental. Calibration should be
-checked by simulation over the intended sample sizes, frequencies, tree shapes,
-and population structures before confirmatory use.
-
-## Research foundations
-
-- Breslow and Clayton (1993), approximate inference in generalized linear mixed
-  models, motivates the PQL framework.
-- Chen et al. (2016), GMMAT, motivates fitting a logistic mixed-model null once
-  per response and testing predictors with score statistics.
-- Dey et al. (2017), SPAtest, and Zhou et al. (2018), SAIGE, motivate
-  saddlepoint calibration for binary score-test tails.
-- Lees et al. (2018), pyseer, motivates bacterial population-structure-aware
-  association analysis and scalable null-model reuse. KOVAR differs by using a
-  binary logistic mixed model for locus-pair screening.
-
-See `docs/model.md`, `docs/interpretation.md`, and `docs/research_basis.md` for
-more detail.
-
-## Version history
-
-### 0.8.3
-
-- changed primary reporting from two directional rows to one canonical
-  unordered pair;
-- changed the default minimum joint-cell count from 5 to 1;
-- made SPA `auto` the default;
-- applies the PAN-GWES `count >= ceil(0.05*N)` route before GLMM scheduling when
-  a `count` column is available;
-- removed the built-in alternative full-refit/effect-size stage, directional
-  options, GRM fallback, and low-level numerical tuning from the public CLI;
-- reduced checkpointing to the only expensive production stage: score testing;
-  and
-- moved release notes after overview, installation, use, method, and output
-  documentation.
-
-### 0.8.2
-
-Added atomic checkpoint/resume support, detailed execution metadata, and
-response-pattern reuse diagnostics.
-
-### 0.8.1
-
-Added exact identical/complement response-pattern reuse and shared first-PQL
-kinship eigensystem preparation.
-
-### 0.8.0
-
-Introduced the experimental logistic mixed-model score scanner.
+Benchmarks are optional source-checkout programs outside the installed package.
+They do not run during discovery. [Benchmark index](benchmarks/README.md) covers
+PC-count/retention recovery, exact-versus-bounded significance, beta refits and
+eigensolvers. Existing raw benchmark tables/figures are retained separately from
+software source. [Validation scope](docs/validation.md).

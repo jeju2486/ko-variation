@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 import numpy as np
+from scipy import stats
 
 from ko_variation.glmm import (
     _SpectralWorkingModel,
@@ -199,6 +200,81 @@ class NoRelatednessGLMMTests(unittest.TestCase):
 
 
 class GLMMOptimizationTests(unittest.TestCase):
+    def test_block_score_matches_dense_precision_oracle(self) -> None:
+        # Independent dense algebra checks heterogeneous weights, covariates,
+        # zero random-effect variance and a highly structured covariance.
+        kinship, weights, _, C = self._working_model()
+        rng = np.random.default_rng(51)
+        predictors = rng.integers(0, 2, size=(weights.size, 11)).astype(float)
+        y = rng.integers(0, 2, size=weights.size).astype(float)
+        mu = rng.uniform(0.1, 0.9, size=weights.size)
+        decomp = _weighted_eigen(kinship, weights)
+        for tau in (0.0, 1e-4, 0.7, 1e4):
+            precision = np.linalg.inv(np.diag(1.0 / weights) + tau * kinship)
+            Sinv_C = precision @ C
+            M_inv = np.linalg.inv(C.T @ Sinv_C)
+            cache = dict(y=y, mu=mu, weights=weights, tau=tau, C=C,
+                         Sinv_C=Sinv_C, M_inv=M_inv, decomp=decomp)
+            P = precision - Sinv_C @ M_inv @ Sinv_C.T
+            expected_variances = np.sum(predictors * (P @ predictors), axis=0)
+            expected_scores = predictors.T @ (y - mu)
+            expected_adjusted = predictors - C @ np.linalg.solve(
+                C.T @ (weights[:, None] * C),
+                C.T @ (weights[:, None] * predictors),
+            )
+            for spa in (False, True):
+                with self.subTest(tau=tau, spa=spa):
+                    actual = score_predictor_block(
+                        predictors, cache, compute_spa_adjustment=spa
+                    )
+                    self.assertTrue(all(r.status == "OK" for r in actual))
+                    np.testing.assert_allclose(
+                        [r.score_variance for r in actual], expected_variances,
+                        rtol=1e-9, atol=1e-12,
+                    )
+                    np.testing.assert_allclose([r.score_u for r in actual], expected_scores)
+                    np.testing.assert_allclose(
+                        [r.p_score for r in actual],
+                        stats.chi2.sf(expected_scores**2 / expected_variances, 1),
+                        rtol=1e-8, atol=1e-14,
+                    )
+                    np.testing.assert_allclose(
+                        [r.beta_score for r in actual], expected_scores / expected_variances,
+                        rtol=1e-9,
+                    )
+                    np.testing.assert_allclose(
+                        [r.se_score for r in actual], 1.0 / np.sqrt(expected_variances),
+                        rtol=1e-9,
+                    )
+                    if spa:
+                        np.testing.assert_allclose(
+                            np.column_stack([r.adjusted_predictor for r in actual]),
+                            expected_adjusted, rtol=1e-10, atol=1e-12,
+                        )
+                    else:
+                        self.assertTrue(all(r.adjusted_predictor is None for r in actual))
+
+    def test_block_score_preserves_invalid_and_singular_statuses(self) -> None:
+        kinship, weights, _, C = self._working_model()
+        decomp = _weighted_eigen(kinship, weights)
+        Sinv_C = decomp.solve(C, 0.7)
+        cache = dict(y=np.arange(weights.size) % 2, mu=np.full(weights.size, 0.5),
+                     weights=weights, tau=0.7, C=C, Sinv_C=Sinv_C,
+                     M_inv=np.linalg.inv(C.T @ Sinv_C), decomp=decomp)
+        invalid = np.zeros(weights.size)
+        invalid[0] = np.nan
+        predictors = np.column_stack((np.ones(weights.size), invalid, C[:, 1],
+                                      np.arange(weights.size) % 2))
+        with mock.patch("ko_variation.glmm.stats.chi2.sf", wraps=stats.chi2.sf) as sf:
+            results = score_predictor_block(predictors, cache)
+        self.assertEqual(sf.call_count, 1)
+        self.assertEqual([r.status for r in results], [
+            "MONOMORPHIC_PREDICTOR", "NONFINITE_PREDICTOR",
+            "SINGULAR_PREDICTOR_AFTER_KINSHIP", "OK",
+        ])
+        self.assertEqual(score_predictor_block(np.empty((weights.size, 0)), cache), [])
+        self.assertEqual(score_predictor(predictors[:, -1], {}).status, "NULL_MODEL_UNAVAILABLE")
+
     @staticmethod
     def _working_model() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         rng = np.random.default_rng(29)

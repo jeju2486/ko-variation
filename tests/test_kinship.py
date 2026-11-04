@@ -11,6 +11,32 @@ from ko_variation.kinship import build_tree_covariance
 
 
 class KinshipTests(unittest.TestCase):
+    def test_intersection_preserves_fasta_order_and_covariance_scale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Path(tmp) / "tree.nwk"
+            tree.write_text("((a:1,b:3):2,extra:7,c:4);", encoding="utf-8")
+            names = ["missing_first", "c", "b", "missing_last", "a"]
+            with self.assertRaisesRegex(ValueError, "missing 2 FASTA samples"):
+                build_tree_covariance(tree, names)
+            actual = build_tree_covariance(tree, names, missing_samples="drop")
+            expected = build_tree_covariance(tree, ["c", "b", "a"])
+        np.testing.assert_array_equal(actual.sample_indices, [1, 2, 4])
+        np.testing.assert_allclose(actual.K, expected.K)
+        self.assertEqual(actual.excluded_samples, ["missing_first", "missing_last"])
+        self.assertEqual(actual.details["n_input_samples"], 5)
+        self.assertEqual(actual.mean_diag_before_norm, 4.0)
+
+    def test_intersection_rejects_insufficient_overlap_and_duplicate_tips(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tree = Path(tmp) / "tree.nwk"
+            tree.write_text("(a:1,b:1);", encoding="utf-8")
+            for names in (["missing"], ["a", "missing"]):
+                with self.assertRaisesRegex(ValueError, "Fewer than two"):
+                    build_tree_covariance(tree, names, missing_samples="drop")
+            tree.write_text("(a:1,a:1,b:1);", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Duplicate tip label"):
+                build_tree_covariance(tree, ["a", "b"], missing_samples="drop")
+
     def test_tree_covariance_matches_root_to_mrca_oracle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tree = Path(tmp) / "tree.nwk"

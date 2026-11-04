@@ -25,6 +25,9 @@ construction, KOVAR version, and null-model convergence. Call results
 "phylogeny-adjusted covariation candidates" unless independent evidence supports
 a mechanistic epistasis claim.
 
-Effect sizes, gene annotation, and LD/distance classes are deferred to the
-planned separate `ko-variation-annotation` workflow so they can be calculated
-after significance and linkage filters are chosen explicitly.
+The separate `ko-variation-annotation` workflow fits alternative logistic mixed
+models only after Bonferroni significance and physical-distance filters, using
+original genotypes/tree. It reports adjusted ORs and approximate PQL Wald CIs,
+plus fit status; it does not calculate raw ORs. It also exports annotated gene
+networks. Effects may be inflated by post-selection bias. Gene-edge significance
+minima are summaries, not gene-level tests. See [downstream.md](downstream.md).

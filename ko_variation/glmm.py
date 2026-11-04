@@ -607,7 +607,11 @@ def score_predictor_block(
     *,
     compute_spa_adjustment: bool = True,
 ) -> list[ScoreResult]:
-    """Score a sample-by-predictor block with shared mixed-model solves."""
+    """Score a block using exact spectral quadratic forms from a fitted null.
+
+    No predictor-specific covariance solve or alternative-model fit is needed.
+    The null cache and the score-test definition remain unchanged.
+    """
     if not cache:
         array = np.asarray(predictors)
         width = 1 if array.ndim == 1 else array.shape[1]
@@ -637,10 +641,21 @@ def score_predictor_block(
     C = np.asarray(cache["C"])
     Sinv_C = np.asarray(cache["Sinv_C"])
     M_inv = np.asarray(cache["M_inv"])
-    Sinv_X = decomp.solve(block, tau)
-    coefficient = M_inv @ (C.T @ Sinv_X)
-    PX = Sinv_X - Sinv_C @ coefficient
-    variances = np.sum(block * PX, axis=0)
+    # For S = W^-1 + tau*K and P = S^-1 - S^-1 C M^-1 C.T S^-1,
+    # diag(X.T P X) equals diag(R.T S^-1 R), R = X - C M^-1 C.T S^-1 X.
+    # Symmetry gives C.T S^-1 X = (S^-1 C).T X from the existing cache.
+    # A weighted sum of squared eigen-coordinates therefore needs only the
+    # forward transform, avoiding both the back-transform and cancellation
+    # in X.T S^-1 X minus the nuisance-covariate correction.
+    coefficient = M_inv @ (Sinv_C.T @ block)
+    weighted_residual = decomp.sqrt_w[:, None] * (block - C @ coefficient)
+    if tau == 0.0:
+        # With S^-1 = W, orthogonality makes even the forward transform redundant.
+        variances = np.sum(weighted_residual * weighted_residual, axis=0)
+    else:
+        rotated = decomp.eigenvectors.T @ weighted_residual
+        inverse_spectrum = 1.0 / (1.0 + tau * decomp.eigenvalues)
+        variances = np.sum(inverse_spectrum[:, None] * rotated * rotated, axis=0)
     residual = y - np.asarray(cache["mu"])
     scores = block.T @ residual
     spa_block: np.ndarray | None = None
@@ -657,16 +672,24 @@ def score_predictor_block(
         )
         spa_block = block - C @ weighted_coefficient
 
+    # Evaluate the survival function once per block instead of once per pair.
+    usable = np.isfinite(variances) & (variances > 1e-12)
+    standard_errors = np.full(variances.size, np.nan)
+    standard_errors[usable] = 1.0 / np.sqrt(variances[usable])
+    z_values = scores * standard_errors
+    p_values = np.full(variances.size, np.nan)
+    p_values[usable] = stats.chi2.sf(z_values[usable] ** 2, 1)
+
     for local, original in enumerate(valid_indices):
         variance = float(variances[local])
-        if not np.isfinite(variance) or variance <= 1e-12:
+        if not usable[local]:
             results[int(original)] = ScoreResult(
                 status="SINGULAR_PREDICTOR_AFTER_KINSHIP"
             )
             continue
         score = float(scores[local])
-        z = float(score / math.sqrt(variance))
-        p = float(stats.chi2.sf(z * z, 1))
+        z = float(z_values[local])
+        p = float(p_values[local])
         if not np.isfinite(p):
             results[int(original)] = ScoreResult(status="BAD_SCORE_PVALUE")
             continue
@@ -676,7 +699,7 @@ def score_predictor_block(
             score_z=z,
             p_score=p,
             beta_score=float(score / variance),
-            se_score=float(1.0 / math.sqrt(variance)),
+            se_score=float(standard_errors[local]),
             status="OK",
             # SPA conditions on independent Bernoulli working means. Its
             # cumulant weights use W-residualization; the mixed-model target

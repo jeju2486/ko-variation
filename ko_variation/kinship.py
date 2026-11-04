@@ -18,6 +18,8 @@ class KinshipResult:
     mean_diag_before_norm: float = float("nan")
     source: str = "unknown"
     details: dict[str, str | int | float] = field(default_factory=dict)
+    sample_indices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    excluded_samples: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -191,6 +193,7 @@ def build_tree_covariance(
     sample_names: list[str],
     dtype: str = "float64",
     missing_length: str = "error",
+    missing_samples: str = "error",
 ) -> KinshipResult:
     """Build root-to-MRCA covariance in FASTA sample order.
 
@@ -198,7 +201,13 @@ def build_tree_covariance(
     ``phylogeny_distance.py --lmm``: an off-diagonal element is the root-to-MRCA
     branch length, and a diagonal element is the root-to-tip length. The matrix
     is normalized to mean diagonal one before GLMM fitting.
+    With missing_samples="drop", sample_indices selects the retained FASTA rows
+    in their original order. Callers must apply it to genotypes before fitting.
     """
+    if missing_samples not in {"error", "drop"}:
+        raise ValueError("missing_samples must be one of: error, drop")
+    if len(set(sample_names)) != len(sample_names):
+        raise ValueError("Duplicate sample names found in FASTA")
     path = Path(tree_path)
     root = _NewickParser(path.read_text(encoding="utf-8").strip()).parse()
     _assign_depths(root, missing_length)
@@ -215,9 +224,24 @@ def build_tree_covariance(
 
     sample_set = set(sample_names)
     missing = [sample for sample in sample_names if sample not in tip_by_name]
-    if missing:
+    if missing and missing_samples == "error":
         raise ValueError(
-            f"Tree is missing {len(missing)} FASTA samples; examples: {missing[:5]}"
+            f"Tree is missing {len(missing)} FASTA samples; examples: {missing[:5]}. "
+            "Supply a tree covering all samples, or explicitly use "
+            "--tree-missing-samples drop to analyze only matched isolates."
+        )
+    sample_indices = np.array(
+        [i for i, sample in enumerate(sample_names) if sample in tip_by_name],
+        dtype=np.int64,
+    )
+    n_input_samples = len(sample_names)
+    if missing_samples == "drop" and len(sample_indices) < 2:
+        raise ValueError("Fewer than two FASTA samples remain after matching tree tips")
+    sample_names = [sample_names[i] for i in sample_indices]
+    if missing:
+        sys.stderr.write(
+            f"[KOVAR] warning: excluding {len(missing)} FASTA samples absent from tree; "
+            f"retained={len(sample_names)}/{n_input_samples}; examples: {missing[:5]}\n"
         )
     extra = [name for name in tip_by_name if name not in sample_set]
     if extra:
@@ -274,5 +298,9 @@ def build_tree_covariance(
         K=K.astype(out_dtype, copy=False),
         mean_diag_before_norm=mean_diag,
         source="tree_mrca_covariance",
-        details={"tree": str(path), "n_tree_tips": len(tips), "n_samples": n},
+        details={"tree": str(path), "n_tree_tips": len(tips), "n_samples": n,
+                 "n_input_samples": n_input_samples, "n_excluded_samples": len(missing),
+                 "tree_missing_samples": missing_samples},
+        sample_indices=sample_indices,
+        excluded_samples=missing,
     )
