@@ -25,7 +25,9 @@ discovery pipeline reports cumulative beta checkpoints and accepts the verified
 earlier PC40 checkpoint after matching inputs, settings and numerical code.
 
 The `benchmarks/` directory contains PC-count recovery and frozen significance
-benchmarks plus beta/eigensolver comparisons. It is excluded from package
+benchmarks, beta/eigensolver comparisons and standalone functional-map/publication
+plotting programs. The plotting workflows reuse exported results without refits.
+This directory is excluded from package
 installation and the main run. Historical reference generation can call an
 independently installed v0.8.3 scanner; its code is not duplicated here.
 

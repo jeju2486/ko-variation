@@ -1,4 +1,4 @@
-# Benchmarks retained for publication
+# Benchmarks and standalone publication figures
 
 These optional programs are outside the installed statistical package. Run from
 the repository root with KOVAR importable. Store results outside this source tree.
@@ -12,6 +12,8 @@ the repository root with KOVAR importable. Store results outside this source tre
 | Full vs warm/score beta | `python benchmarks/beta_benchmark.py` | beta_results.tsv, beta_summary.json, plots |
 | Full-refit eigensolvers | `python benchmarks/beta_eigensolver_benchmark.py` | eigensolver_results.tsv, eigensolver_summary.json, plots |
 | Progress of a discovery run | `python benchmarks/inspect_discovery.py` | read-only snapshots and ETA comparisons |
+| Completed discovery to functional covariation map | `python benchmarks/functional_map.py` | annotated HTML/PNG/SVG, gene tables and unitig-support audit |
+| Publication overview and focal neighbourhoods | `python benchmarks/paper_plots.py` | editable SVG/PNG, component/function summaries and captions |
 
 The PC benchmark was moved from the research modules injected into ko_variation
 into this separate directory. Existing completed PC results can still be plotted
@@ -31,6 +33,11 @@ The beta/eigensolver benchmarks read prepared arrays and a frozen selection.
 Their scripts/outputs and checkpoints are independent of the main search. See
 [beta details](beta_benchmark.md) and [eigensolver details](beta_eigensolver_benchmark.md).
 No benchmark is a default dependency of discovery.
+
+The two standalone map/figure programs reuse saved association and beta results;
+they do not fit statistical models or generate QQ plots. See the
+[functional map and publication guide](../docs/map_and_paper.md). Server wrappers
+remain separate from this public source tree.
 
 For a fresh production significance benchmark, `--source-run DIR` samples a
 frozen random panel from an existing run's prepared **unique patterns**. Add

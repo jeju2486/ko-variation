@@ -86,6 +86,8 @@ pass only `run/results` to `--out`. [Full run/cache instructions](docs/discovery
 | Prepare/resolve annotations | `ko-variation-map-loci` | [annotation](docs/downstream.md) |
 | Select/refit existing tables | `ko-variation-select`, `ko-variation-annotation` | [downstream](docs/downstream.md) |
 | Draw covariation maps | `ko-variation-network` | [networks](docs/functional_map.md) |
+| Build functional maps from discovery exports | `benchmarks/functional_map.py` | [standalone map workflow](docs/map_and_paper.md) |
+| Draw publication overview/focal panels | `benchmarks/paper_plots.py` | [PNG/SVG paper figures](docs/map_and_paper.md#3-generate-publication-pngsvg-figures) |
 | Functional annotation | `ko-variation-prepare-proteins` | [functional map](docs/functional_map.md) |
 | Match AMR phenotypes/determinants | `ko-variation-amr-report` | [AMR report](docs/amr_report.md) |
 | Quantitative MIC comparison | `ko-variation-phenotype` | [phenotype](docs/phenotype.md) |
