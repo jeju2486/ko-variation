@@ -61,6 +61,46 @@ window; it is separate from the **pairwise distal exclusion** of 10,000 bp.
 Ambiguous mappings remain in annotation audit files and are excluded from the
 resolved gene map; they are never assigned arbitrarily to the first gene.
 
+### Recover missing annotation files from Panaroo GFFs
+
+When the original Bakta files were not copied, use `--gff-dir` instead of
+`--bakta`. It requires `SAMPLE.gff` (or `.gff3`) filenames matching Panaroo
+sample columns, with CDS records and an embedded `##FASTA` assembly section:
+
+```bash
+python benchmarks/functional_map.py \
+  --results /project/discovery/results \
+  --unitigs /project/pangwes/graph.unitigs \
+  --panaroo /project/panaroo/gene_presence_absence_roary.csv \
+  --gff-dir /project/panaroo_gff \
+  --run-eggnog --emapper /env/eggnog/bin/emapper.py \
+  --eggnog-data-dir /databases/eggnog \
+  --out /project/plots/functional_map --threads 4
+```
+
+Recovery preserves original CDS IDs, coordinates, attributes and assembly DNA.
+It creates the expected `SAMPLE/SAMPLE.gff3`, `.fna`, `.faa` layout under
+`recovered_annotations/`. Derived proteins are **not** claimed to reproduce the
+original Bakta protein files. No gene calling, Panaroo rerun or KOVAR refit occurs.
+
+For protein derivation, the default genetic code is bacterial table 11
+(`--translation-table` changes this fallback); a CDS's explicit `transl_table`
+or `translation_table` takes precedence. Only unambiguous, single-record,
+zero-phase complete CDSs with valid start/terminal-stop structure are translated.
+Strand orientation and alternative start codons are handled by Biopython's
+[`translate(cds=True)`](https://biopython.org/docs/latest/api/Bio.Seq.html).
+Pseudogenes, partial CDSs, duplicated/multipart IDs, exceptional translations
+and failed complete-CDS checks receive no derived protein. Their original CDS
+records remain available for unitig annotation. This intentionally conservative
+protein subset can leave additional nodes with unassigned function; it does
+not filter statistical network edges.
+
+Each sample has `cds_recovery.tsv.gz`, `recovery_summary.json` and a completed
+cache manifest. The combined `recovered_annotations/recovery_summary.json`
+records counts and input identities. Recovery processes one assembly at a time;
+reruns reuse matching completed samples. Sources are never overwritten. CDS
+coordinates/phase follow the [GFF3 specification](https://github.com/The-Sequence-Ontology/Specifications/blob/master/gff3.md).
+
 ## 2. Run or resume eggNOG only when needed
 
 Instead of `--eggnog`, pass these arguments with the mapping inputs:
@@ -121,6 +161,7 @@ The existing mapping helper also reads the selected locus set when annotating.
 | `selected_distal.tsv` | Certified distal unitig associations and saved effects |
 | `selection_counts.json` | Input/selected pairs, distance and beta-status counts, original significance family |
 | `annotation/` | New resolved mapping/catalogue and ambiguity/status audit when mapping was requested |
+| `recovered_annotations/` | Optional GFF/DNA recovery, derived proteins and per-CDS/sample audit |
 | `genes.nodes.tsv`, `genes.edges.tsv` | Collapsed biological summaries before display enrichment |
 | `gene_pair_support.tsv.gz` | Complete resolved intergene unitig support, including unsuccessful beta statuses |
 | `aggregation_counts.json` | Missing annotation, same-gene exclusion, unitig/gene/edge counts |

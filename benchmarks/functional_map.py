@@ -6,6 +6,7 @@ SQLite; the in-memory object is the collapsed gene network, not all unitig pairs
 from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
+import csv
 import hashlib
 import json
 import math
@@ -15,6 +16,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
@@ -26,6 +29,132 @@ from ko_variation.functional_annotation import prepare_proteins
 from ko_variation.network import discovery_network_input, NODE_COLUMNS, EDGE_COLUMNS
 from ko_variation.network_display import export_gene_network
 from ko_variation.workflow_cache import stage_identity, cache_matches, save_cache, file_signature
+
+
+def recover_sample(source, destination, default_table):
+    """Recover original coordinates/DNA and strictly translatable CDS proteins.
+
+    This is not Bakta reannotation or a byte-identical recovery of its proteins.
+    Uncertain CDSs stay in the GFF for mapping but receive no derived protein.
+    """
+    from Bio import SeqIO, __version__ as biopython_version
+    from Bio.Data import CodonTable
+    source, destination = Path(source), Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    sample = destination.name
+    products = [destination/(sample+suffix) for suffix in ('.gff3','.fna','.faa')]
+    audit, summary = destination/'cds_recovery.tsv.gz', destination/'recovery_summary.json'
+    outputs = products+[audit,summary]
+    identity = stage_identity('embedded_gff_recovery',[source,Path(__file__)],
+                              dict(default_translation_table=default_table,biopython=biopython_version))
+    manifest = destination/'recovery.cache.json'
+    if cache_matches(manifest,identity,outputs):
+        return json.loads(summary.read_text()), True
+    lines, cds = [], []
+    with source.open() as handle:
+        for line in handle:
+            if line.rstrip('\r\n') == '##FASTA':
+                break
+            lines.append(line.rstrip('\r\n')+'\n')
+            if line.startswith('#') or not line.strip(): continue
+            fields = line.rstrip('\r\n').split('\t')
+            if len(fields)!=9:
+                raise ValueError(f'Invalid GFF record in {source}')
+            if fields[2]=='CDS':
+                attrs = {unquote(k):unquote(v) for k,v in
+                         (item.split('=',1) for item in fields[8].split(';') if '=' in item)}
+                cds.append((fields,attrs))
+        else:
+            raise ValueError(f'No embedded ##FASTA section: {source}')
+        sequences = SeqIO.to_dict(SeqIO.parse(handle,'fasta'))
+    if not sequences or not cds:
+        raise ValueError(f'No embedded assembly DNA or CDS records: {source}')
+    identifiers = Counter(a.get('ID','') for _,a in cds)
+    counts, rows = Counter(), []
+    with tempfile.TemporaryDirectory(prefix='recover-',dir=destination) as temporary:
+        scratch = Path(temporary)
+        (scratch/products[0].name).write_text(''.join(lines),newline='\n')
+        SeqIO.write(sequences.values(),scratch/products[1].name,'fasta')
+        with (scratch/products[2].name).open('w') as proteins:
+            for f,a in cds:
+                feature = a.get('ID','')
+                start,end = int(f[3]),int(f[4])
+                if f[0] not in sequences or not 1<=start<=end<=len(sequences[f[0]]):
+                    raise ValueError(f'Invalid CDS coordinates: {source}/{feature}')
+                table = int(a.get('transl_table',a.get('translation_table',default_table)))
+                if table not in CodonTable.unambiguous_dna_by_id:
+                    raise ValueError(f'Unsupported translation table {table}: {source}/{feature}')
+                status, detail, length = 'TRANSLATED','',0
+                flags = lambda names: any(k in a and a[k].lower() not in {'false','0','00','no'} for k in names)
+                if not feature or any(c.isspace() for c in feature): status='MISSING_OR_UNSAFE_ID'
+                elif identifiers[feature]>1: status='MULTIPART_OR_DUPLICATE_ID'
+                elif flags(('pseudo','pseudogene')): status='PSEUDOGENE'
+                elif flags(('partial','start_range','end_range')) or f[7]!='0': status='PARTIAL_OR_NONZERO_PHASE'
+                elif flags(('exception','transl_except','ribosomal_slippage')): status='TRANSLATION_EXCEPTION'
+                elif f[6] not in {'+','-'}: status='UNKNOWN_STRAND'
+                else:
+                    sequence = sequences[f[0]].seq[start-1:end].upper()
+                    if f[6]=='-': sequence = sequence.reverse_complement()
+                    if set(str(sequence))-set('ACGT'):
+                        status='AMBIGUOUS_DNA'
+                    else:
+                        try:
+                            # cds=True checks length, valid start and a single terminal
+                            # stop, handles alternative starts, and removes that stop.
+                            protein = str(sequence.translate(table=table,cds=True))
+                            if not protein: raise ValueError('Empty translated protein')
+                            proteins.write(f'>{feature}\n{protein}\n')
+                            length = len(protein)
+                        except (CodonTable.TranslationError,ValueError) as error:
+                            status,detail = 'INVALID_COMPLETE_CDS',str(error)
+                counts[status] += 1
+                rows.append([feature,f[0],start,end,f[6],f[7],table,status,length,detail])
+        write_gzip(scratch/audit.name,
+                   ['feature','contig','start','end','strand','phase','translation_table','status','aa_length','detail'],rows)
+        record = dict(sample=sample,source=fingerprint_file(source),cds=len(cds),
+                      proteins=counts['TRANSLATED'],status_counts=dict(counts),
+                      default_translation_table=default_table,biopython=biopython_version,
+                      reannotated=False,original_bakta_proteins_recovered=False)
+        atomic_json(scratch/summary.name,record)
+        for output in outputs:
+            os.replace(scratch/output.name,output)
+    save_cache(manifest,identity,outputs)
+    return record, False
+
+
+def recover_inputs(gff_dir, panaroo, out, default_table=11):
+    """One assembly at a time; completed samples survive interrupted reruns."""
+    gff_dir, out = Path(gff_dir).resolve(), Path(out).resolve()
+    if out.is_relative_to(gff_dir) or gff_dir.is_relative_to(out):
+        raise ValueError('Recovered annotation output must be separate from source GFFs')
+    with Path(panaroo).open(encoding='utf-8-sig',newline='') as handle:
+        columns = next(csv.reader(handle))
+    matched = []
+    for sample in columns:
+        if sample in {'.','..'} or '/' in sample or '\\' in sample: continue
+        sources = [gff_dir/(sample+suffix) for suffix in ('.gff','.gff3')]
+        sources = [p for p in sources if p.is_file()]
+        if len(sources)>1:
+            raise ValueError(f'Two GFF sources for {sample}; supply a directory with one per sample')
+        if sources: matched.append((sample,sources[0]))
+    if not matched:
+        raise ValueError(f'No GFF filenames match Panaroo sample columns in {gff_dir}')
+    out.mkdir(parents=True,exist_ok=True)
+    samples = {sample for sample,_ in matched}
+    if any(p.is_dir() and (p/'recovery.cache.json').exists() and p.name not in samples for p in out.iterdir()):
+        raise ValueError('Recovered outputs contain samples no longer in the source GFF cohort; choose a new --out')
+    records, totals = [], Counter()
+    for i,(sample,source) in enumerate(matched,1):
+        if not (out/sample).resolve().is_relative_to(out):
+            raise ValueError(f'Recovered sample output escapes destination: {sample}')
+        record,reused = recover_sample(source,out/sample,default_table)
+        records.append(record)
+        totals.update(record['status_counts'])
+        print(f'[recovery] {i}/{len(matched)}: {sample}; {record["proteins"]}/{record["cds"]} proteins; '
+              f'{"reused" if reused else "derived"}',flush=True)
+    atomic_json(out/'recovery_summary.json',dict(samples=records,status_counts=dict(totals),
+                panaroo=file_signature(panaroo),gff_dir=str(gff_dir),reannotated=False))
+    return out
 
 
 def extract(results, summary, out, distal_bp, chunk_rows):
@@ -267,7 +396,12 @@ def main(argv=None):
     p.add_argument('--fasta', type=Path)
     p.add_argument('--unitigs', type=Path)
     p.add_argument('--panaroo', type=Path)
-    p.add_argument('--bakta', type=Path)
+    annotation_source = p.add_mutually_exclusive_group()
+    annotation_source.add_argument('--bakta', type=Path)
+    annotation_source.add_argument('--gff-dir', type=Path,
+        help='SAMPLE.gff files with embedded ##FASTA; recover missing annotation inputs')
+    p.add_argument('--translation-table', type=int, default=11,
+        help='Fallback genetic code for recovery; explicit CDS transl_table takes precedence [11]')
     p.add_argument('--pyseer-python', default=sys.executable)
     p.add_argument('--nearby-bp', type=int, default=500)
     p.add_argument('--distal-bp', type=int, default=10000)
@@ -294,13 +428,19 @@ def main(argv=None):
     args.out.mkdir(parents=True,exist_ok=True)
     try:
         selected, selection = extract(source, summary, args.out, args.distal_bp, args.chunk_rows)
+        recovery_summary = None
+        if args.gff_dir and (not args.annotation or args.run_eggnog):
+            if not args.panaroo:
+                raise ValueError('GFF recovery requires --panaroo')
+            args.bakta = recover_inputs(args.gff_dir,args.panaroo,args.out/'recovered_annotations',args.translation_table)
+            recovery_summary = str(args.bakta/'recovery_summary.json')
         annotation = args.annotation
         if annotation is None:
             if args.fasta is None:
                 record = json.loads((source.parent/'run_identity.json').read_text())
                 args.fasta = Path(record['settings']['fasta'])
             if not all([args.unitigs,args.panaroo,args.bakta]):
-                raise ValueError('New gene mapping requires --unitigs DNA, --panaroo and --bakta')
+                raise ValueError('New gene mapping requires --unitigs DNA, --panaroo and --bakta or --gff-dir')
             directory = args.out/'annotation'
             result = annotate_main(['--selected',str(selected),'--fasta',str(args.fasta),
                 '--unitigs',str(args.unitigs),'--panaroo',str(args.panaroo),'--bakta',str(args.bakta),
@@ -326,6 +466,8 @@ def main(argv=None):
                      annotation_status_counts=dict(annotation_status),
                      source=fingerprint_file(source),summary=fingerprint_file(summary),
                      annotation=fingerprint_file(annotation),
+                     annotation_input_mode='recovered_gff' if recovery_summary else 'existing_bakta_or_mapping',
+                     recovery_summary=recovery_summary,
                      functional_annotation=str(eggnog.resolve()) if eggnog else None,
                      refitted=False, outputs={k:str(v.resolve()) for k,v in paths.items()})
         atomic_json(args.out/'map_audit.json',audit)

@@ -10,12 +10,74 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from benchmarks.functional_map import main as map_main,function_inputs
+from benchmarks.functional_map import main as map_main,function_inputs,recover_inputs,recover_sample
 from benchmarks.paper_plots import main as paper_main
 from ko_variation.network import discovery_network_input,build_gene_network
 
 
 class MapPaperTests(unittest.TestCase):
+    def test_embedded_gff_recovery_keeps_ids_coordinates_and_audits_translation(self):
+        from Bio import SeqIO
+        from Bio.Seq import Seq
+        from ko_variation.annotation_inputs import prepare_inputs
+        from ko_variation.functional_annotation import prepare_proteins
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root/'gff'
+            source.mkdir()
+            features = [
+                ('plus','GTGAAATAA','+','0',''),
+                ('minus',str(Seq('ATGGGGTAG').reverse_complement()),'-','0',''),
+                ('nostop','ATGAAAACC','+','0',''),
+                ('partial','ATGAAATAA','+','1',''),
+                ('pseudo','ATGAAATAA','+','0',';pseudo=true'),
+                ('ambiguous','ATGNNNTAA','+','0',''),
+                ('duplicate','ATGAAATAA','+','0',''),
+                ('duplicate','ATGAAATAA','+','0',''),
+                ('exception','ATGAAATAA','+','0',';transl_except=example'),
+                ('code4','ATGTGATAA','+','0',';transl_table=4')]
+            dna, lines = '', ['##gff-version 3\n']
+            for feature,sequence,strand,phase,attributes in features:
+                start = len(dna)+1
+                dna += sequence
+                lines.append(f'ctg\tfixture\tCDS\t{start}\t{len(dna)}\t.\t{strand}\t{phase}\tID={feature}{attributes}\n')
+                dna += 'CCC'
+            original = ''.join(lines)+'##FASTA\n>ctg\n'+dna+'\n'
+            gff = source/'s1.gff'
+            gff.write_text(original)
+            panaroo = root/'genes.csv'
+            panaroo.write_text('Gene,Non-unique Gene name,s1\nA,geneA,plus\nB,geneB,minus\n')
+            out = root/'recovered'
+            self.assertEqual(recover_inputs(source,panaroo,out),out)
+            with (out/'s1/s1.faa').open() as handle:
+                proteins = {r.id:str(r.seq) for r in SeqIO.parse(handle,'fasta')}
+            self.assertEqual(proteins,{'plus':'MK','minus':'MG','code4':'MW'})
+            self.assertEqual((out/'s1/s1.gff3').read_text(),''.join(lines))
+            with (out/'s1/s1.fna').open() as handle:
+                self.assertEqual(str(next(SeqIO.parse(handle,'fasta')).seq),dna)
+            audit = pd.read_csv(out/'s1/cds_recovery.tsv.gz',sep='\t')
+            self.assertEqual(audit.status.value_counts()['MULTIPART_OR_DUPLICATE_ID'],2)
+            self.assertIn('INVALID_COMPLETE_CDS',set(audit.status))
+            stamp = (out/'s1/s1.faa').stat().st_mtime_ns
+            recover_inputs(source,panaroo,out)
+            self.assertEqual((out/'s1/s1.faa').stat().st_mtime_ns,stamp)
+            self.assertEqual(gff.read_text(),original)
+            # Original CDS IDs join both the existing mapper and protein selector.
+            selected, fasta, unitigs = root/'selected.tsv',root/'samples.fasta',root/'unitigs'
+            selected.write_text('u\tv\n0\t1\n')
+            fasta.write_text('>s1\nAC\n')
+            unitigs.write_text('0 GTGAAA\n1 ATGGGG\n')
+            detail = prepare_inputs(selected,fasta,unitigs,panaroo,out,root/'work')
+            self.assertEqual(detail['reference_count'],1)
+            effects = root/'effects.tsv'
+            effects.write_text('u_gene\tv_gene\nA\tB\n')
+            summary = prepare_proteins(effects,panaroo,out,root/'functional')
+            self.assertEqual(summary['representative_proteins'],2)
+            bad = source/'no_fasta.gff'
+            bad.write_text('##gff-version 3\n')
+            with self.assertRaisesRegex(ValueError,'No embedded'):
+                recover_sample(bad,root/'bad',11)
+
     def test_empty_network_and_eggnog_incomplete_run_resume(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
