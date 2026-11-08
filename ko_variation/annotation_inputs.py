@@ -5,7 +5,9 @@ import argparse
 from contextlib import closing
 import csv
 import json
+import os
 from pathlib import Path
+import random
 import re
 import shutil
 import sqlite3
@@ -17,6 +19,62 @@ import pandas as pd
 
 from .locus_annotation import annotate_work, create_geometry, qualify_reference
 from .workflow_cache import cache_matches, save_cache, stage_identity
+
+
+def annotation_environment(python, smoke_test=False):
+    """Use one environment for Pyseer and its native mapping executables.
+
+    Probe all dependencies before preparing hundreds of reference assemblies.
+    The optional tiny mapping exercises actual BWA/BEDOPS/BEDTools and Pyseer;
+    it does not use the biological data or alter any cached annotation stage.
+    """
+    executable = shutil.which(str(python))
+    if not executable:
+        raise ValueError(f'Annotation Python not found: {python}')
+    executable = str(Path(executable).absolute())
+    environment = dict(os.environ)
+    environment['PATH'] = str(Path(executable).parent)+os.pathsep+environment.get('PATH','')
+    environment.pop('PYTHONPATH',None)
+    tools = {name:shutil.which(name,path=environment['PATH']) for name in ('bwa','bedtools','gff2bed')}
+    errors = [f'Missing executable: {name}' for name,path in tools.items() if path is None]
+    code = ('import json,sys; import pyseer.kmer_mapping.annotate_hits; import pyseer,pybedtools; '
+            'print(json.dumps(dict(python=sys.executable,pyseer=getattr(pyseer,"__version__","unknown"),'
+            'pybedtools=getattr(pybedtools,"__version__","unknown"))))')
+    probe = subprocess.run([executable,'-c',code],env=environment,capture_output=True,text=True,timeout=60)
+    packages = {}
+    if probe.returncode:
+        errors.append('Pyseer annotation import failed: '+probe.stderr.strip()[-3000:])
+    else:
+        packages = json.loads(probe.stdout.strip().splitlines()[-1])
+    if errors:
+        raise ValueError('Annotation environment incomplete ('+executable+'):\n  '+
+                         '\n  '.join(errors)+'\nInstall pyseer, bwa, bedtools and bedops in the annotation environment.')
+    report = dict(python=executable,packages=packages,executables=tools,smoke_test='NOT_RUN')
+    if smoke_test:
+        with tempfile.TemporaryDirectory(prefix='kovar-mapping-check-') as temporary:
+            work = Path(temporary).resolve()
+            if any(c.isspace() for c in str(work)):
+                raise ValueError('Mapping smoke test needs a TMPDIR without whitespace (Pyseer reference-file constraint)')
+            rng = random.Random(73)
+            dna = ''.join(rng.choice('ACGT') for _ in range(500))
+            query = dna[100:161]
+            fasta,gff,queries,references,hits = [work/name for name in
+                ('reference.fna','reference.gff','queries.tsv','references.tsv','hits.tsv')]
+            fasta.write_text('>smoke\n'+dna+'\n')
+            gff.write_text('##gff-version 3\nsmoke\tcheck\tCDS\t1\t500\t.\t+\t0\tID=smoke_cds;gene=smoke_gene\n')
+            queries.write_text('sequence\tlocus\n'+query+'\t0\n')
+            references.write_text(f'{fasta}\t{gff}\tdraft\n')
+            run = subprocess.run([executable,'-m','pyseer.kmer_mapping.annotate_hits',
+                str(queries),str(references),str(hits),'--tmp-prefix',str(work)],
+                cwd=work,env=environment,capture_output=True,text=True,timeout=120)
+            if run.returncode or not hits.is_file():
+                raise ValueError('Real-tool mapping smoke test failed:\n'+run.stderr[-6000:])
+            rows = [line.split('\t') for line in hits.read_text().splitlines()]
+            if (len(rows)!=1 or len(rows[0])!=3 or rows[0][:2]!=[query,'0'] or
+                    'smoke:101-161;' not in rows[0][2] or 'smoke_gene' not in rows[0][2]):
+                raise ValueError('Mapping smoke test produced unexpected coordinates/annotation: '+hits.read_text()[:2000])
+        report['smoke_test'] = 'PASSED'
+    return environment,report
 
 
 def prepare_inputs(selected, fasta, unitigs, panaroo, bakta, work):
@@ -147,28 +205,42 @@ def main(argv=None):
         if args.resume and cache_matches(manifest, identity, outputs):
             print(f"[locus annotation] reusing completed annotation: {outputs[0]}", flush=True)
             return 0
+        # Native executables must come from the selected Pyseer environment,
+        # and missing dependencies must fail before reference preparation.
+        annotation_env, environment_report = None, dict(mapping_required=False)
+        if len(pd.read_csv(args.selected,sep='\t',usecols=['u','v'],nrows=1)):
+            annotation_env, environment_report = annotation_environment(args.pyseer_python)
+            print('[locus annotation] environment:',json.dumps(environment_report),flush=True)
         # Separate scratch cwd avoids Pyseer's fixed temporary-file collisions.
         with tempfile.TemporaryDirectory(prefix="work-", dir=args.out) as folder:
             work = Path(folder)
             details = prepare_inputs(args.selected, args.fasta, args.unitigs, args.panaroo, args.bakta, work)
             if details["selected_loci"]:
-                for executable in ("bwa", "bedtools", "gff2bed"):
-                    if shutil.which(executable) is None:
-                        raise ValueError(f"Missing annotation dependency on PATH: {executable}")
                 print("[locus annotation] mapping exact unitig sequences with Pyseer", flush=True)
+                print('[locus annotation] Pyseer log:',args.out/'pyseer.log',flush=True)
                 with (args.out / "pyseer.log").open("w") as log:
-                    subprocess.run([args.pyseer_python, "-m", "pyseer.kmer_mapping.annotate_hits",
+                    subprocess.run([environment_report['python'], "-m", "pyseer.kmer_mapping.annotate_hits",
                         str(work / "queries.tsv"), str(work / "references.txt"),
                         str(work / "pyseer_hits.tsv"), "--tmp-prefix", str(work)],
-                        cwd=work, stdout=log, stderr=subprocess.STDOUT, check=True)
+                        cwd=work, env=annotation_env, stdout=log, stderr=subprocess.STDOUT, check=True)
             else:
                 (work / "pyseer_hits.tsv").touch()
             annotate_work(work, outputs[0], args.nearby_bp)
+            summary = json.loads((work/'annotation_summary.json').read_text())
+            summary['annotation_environment'] = environment_report
+            (work/'annotation_summary.json').write_text(json.dumps(summary,indent=2))
             for name in ("annotation_status.tsv", "gene_catalog.tsv", "annotation_summary.json"):
                 shutil.copyfile(work / name, args.out / name)
         save_cache(manifest, identity, outputs)
-    except (ValueError, OSError, sqlite3.Error, subprocess.CalledProcessError) as exc:
+    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
         sys.stderr.write(f"Locus annotation error: {exc}\n")
+        log = args.out/'pyseer.log'
+        if isinstance(exc,subprocess.CalledProcessError) and log.is_file():
+            with log.open('rb') as handle:
+                handle.seek(0,2)
+                handle.seek(max(0,handle.tell()-65536))
+                tail = handle.read().decode('utf-8',errors='replace').splitlines()[-40:]
+            sys.stderr.write(f'Last Pyseer log lines ({log}):\n'+'\n'.join(tail)+'\n')
         return 2
     return 0
 

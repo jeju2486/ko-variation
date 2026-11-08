@@ -16,7 +16,11 @@ python -m pip install -e '.[network]'
 
 For **new unitig-to-gene annotation**, the existing mapping helper additionally
 requires Pyseer, BWA, bedtools and BEDOPS (`gff2bed`). Set `--pyseer-python` if
-Pyseer is installed in another environment; external tools must be on PATH.
+Pyseer is installed in another environment. Its Python's executable directory
+is prepended to the mapping subprocess PATH, and inherited PYTHONPATH is removed;
+the same environment supplies Pyseer and its native tools. All dependencies are
+checked together before reference preparation. Existing completed annotation
+can still be reused without running Pyseer again.
 Supply original DNA unitigs, a sample-ID binary FASTA, the Panaroo membership
 table and Bakta `SAMPLE/SAMPLE.gff3` and `SAMPLE.fna` files. Do not map binary
 A/C strings as if they were unitig DNA. See [annotation details](downstream.md).
@@ -25,6 +29,57 @@ For **new functional assignment**, provide matching Bakta `SAMPLE/SAMPLE.faa`
 proteins, eggNOG-mapper and its compatible local database. The mapper/database
 are installed separately. The workflow does not download databases. Existing
 gene mapping and eggNOG results can be supplied instead of rerunning those tools.
+
+For a separate, reproducible mapping environment:
+
+```bash
+conda create -y -p /project/envs/pyseer \
+  -c conda-forge -c bioconda \
+  python=3.9 pyseer=1.4.2 bwa bedtools bedops
+```
+
+Pass `--pyseer-python /project/envs/pyseer/bin/python` to the workflow. Keeping
+this separate avoids Pyseer's pinned NumPy/SciPy requirements changing KOVAR's
+runtime. `gff2bed` is supplied by **BEDOPS**, a separate package from BEDTools.
+See [Pyseer installation](https://pyseer.readthedocs.io/en/master/installation.html)
+and the [Bioconda recipe](https://github.com/bioconda/bioconda-recipes/blob/master/recipes/pyseer/meta.yaml).
+
+To check that environment, optionally including a real 61-bp exact-match mapping:
+
+```bash
+python -c 'import json; from ko_variation.annotation_inputs import annotation_environment; print(json.dumps(annotation_environment("/project/envs/pyseer/bin/python", smoke_test=True)[1], indent=2))'
+```
+
+The smoke test runs actual Pyseer, BWA, `gff2bed` and BEDTools on a temporary
+synthetic reference, checks the reported coordinates and gene name, then removes
+only its temporary files. It does not fit KOVAR or modify biological inputs.
+Successful production annotation records the interpreter, package versions and
+native executable paths in `annotation/annotation_summary.json`.
+
+The portable runner adds a combined preflight for mapping, eggNOG/DIAMOND,
+eggNOG v2 database-file availability and plotting libraries:
+
+```bash
+ROOT=/project RUN_NAME=local CHECK_ONLY=1 SMOKE_TEST=1 \
+PYSEER_PYTHON=/project/envs/pyseer/bin/python \
+EGGNOG_EXEC=/env/eggnog/bin/emapper.py EGGNOG_DATA_DIR=/databases/eggnog \
+bash benchmarks/run_functional_map.sh saureus
+```
+
+`ROOT` has no machine-specific default. The conventional discovery input is
+`ROOT/kovar_output/SPECIES/RUN_NAME/discovery/results`; override `RESULTS` for
+another layout. `MAP_OUT`, `PANAROO`, `BAKTA`, `GFF_DIR`, `UNITIGS` and `FASTA`
+override inputs/outputs. The runner prefers original Bakta inputs, then retained
+Panaroo GFFs, under the species's upstream output. It selects an existing
+`ROOT/pyseer_annotation_env/bin/python` unless `PYSEER_PYTHON` overrides it.
+No environments or databases are installed implicitly.
+
+`CHECK_ONLY=1` stops after the report; remove it to run the map. `SMOKE_TEST=1`
+additionally exercises real native mapping and PNG/SVG export on tiny temporary
+fixtures; ordinary runs perform dependency checks only. The combined report is
+written to `MAP_OUT/map_environment.json`. Checks confirm executable/import/file
+availability and the synthetic mapping/export contracts; they do not validate
+the full eggNOG database contents or run DIAMOND annotation against it.
 
 ## 1. Functional network from existing annotation
 
