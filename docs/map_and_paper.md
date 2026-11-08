@@ -60,19 +60,31 @@ The portable runner adds a combined preflight for mapping, eggNOG/DIAMOND,
 eggNOG v2 database-file availability and plotting libraries:
 
 ```bash
-ROOT=/project RUN_NAME=local CHECK_ONLY=1 SMOKE_TEST=1 \
+ROOT=/project CHECK_ONLY=1 SMOKE_TEST=1 \
 PYSEER_PYTHON=/project/envs/pyseer/bin/python \
 EGGNOG_EXEC=/env/eggnog/bin/emapper.py EGGNOG_DATA_DIR=/databases/eggnog \
 bash benchmarks/run_functional_map.sh saureus
 ```
 
 `ROOT` has no machine-specific default. The conventional discovery input is
-`ROOT/kovar_output/SPECIES/RUN_NAME/discovery/results`; override `RESULTS` for
-another layout. `MAP_OUT`, `PANAROO`, `BAKTA`, `GFF_DIR`, `UNITIGS` and `FASTA`
+`ROOT/kovar_output/SPECIES/discovery/results`; override `RESULTS` for another
+layout. `RUN_NAME` is optional: an explicit label inserts that subdirectory
+between `SPECIES` and `discovery`/`plots`. The machine that ran discovery is not
+used to select input paths. `MAP_OUT`, `PANAROO`, `BAKTA`, `GFF_DIR`, `UNITIGS` and `FASTA`
 override inputs/outputs. The runner prefers original Bakta inputs, then retained
 Panaroo GFFs, under the species's upstream output. It selects an existing
 `ROOT/pyseer_annotation_env/bin/python` unless `PYSEER_PYTHON` overrides it.
 No environments or databases are installed implicitly.
+
+For a copied run, the runner finds a unique `*sample_ids.fasta` or
+`*sample_ids.fa` in `discovery/prepared_inputs/` (also `results/prepared_inputs/`).
+It passes that local file explicitly, so an old absolute path in
+`run_identity.json` does not need to be rewritten. Multiple candidates require
+`FASTA=/exact/path`; no candidate leaves the original run-identity lookup in
+place. `RESULTS` accepts the discovery parent, results directory or association
+file, as does the Python helper. An explicit `FASTA` always takes precedence.
+The generated figures default to `ROOT/kovar_output/SPECIES/plots/functional_map`;
+use a distinct `MAP_OUT` when plotting different discovery datasets separately.
 
 `CHECK_ONLY=1` stops after the report; remove it to run the map. `SMOKE_TEST=1`
 additionally exercises real native mapping and PNG/SVG export on tiny temporary

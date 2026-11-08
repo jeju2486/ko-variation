@@ -5,7 +5,8 @@ SPECIES="${1:-saureus}"
 case "$SPECIES" in saureus|neisseria|klebsiella) ;; *) echo 'Species: saureus, neisseria, klebsiella' >&2; exit 2;; esac
 ROOT="${ROOT:?Set ROOT to the project directory containing the upstream outputs}"
 REPO="${REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)}"
-RUN_NAME="${RUN_NAME:-local}"
+# Run names are optional labels, never an inferred execution hostname.
+RUN_NAME="${RUN_NAME:-}"
 KOVAR_PYTHON="$(command -v -- "${KOVAR_PYTHON:-python}" || true)"
 [[ -n "$KOVAR_PYTHON" ]] || { echo 'Activate your Python environment or set KOVAR_PYTHON' >&2; exit 1; }
 # Keep Pyseer's older numerical dependencies separate from the KOVAR runtime.
@@ -15,8 +16,32 @@ fi
 PYSEER_PYTHON="${PYSEER_PYTHON:-$KOVAR_PYTHON}"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-RESULTS="${RESULTS:-$ROOT/kovar_output/$SPECIES/$RUN_NAME/discovery/results}"
-MAP_OUT="${MAP_OUT:-$ROOT/kovar_output/$SPECIES/$RUN_NAME/plots/functional_map}"
+SPECIES_OUT="$ROOT/kovar_output/$SPECIES${RUN_NAME:+/$RUN_NAME}"
+RESULTS="${RESULTS:-$SPECIES_OUT/discovery/results}"
+MAP_OUT="${MAP_OUT:-$SPECIES_OUT/plots/functional_map}"
+# A copied run can retain an inaccessible ARC FASTA path in its provenance.
+# Use its adjacent local sample-ID FASTA, without editing that provenance.
+if [[ -z "${ANNOTATION:-}" && -z "${FASTA:-}" ]]; then
+  source_directory="${RESULTS%/}"
+  if [[ -f "$source_directory" ]]; then
+    source_directory="$(dirname -- "$source_directory")"
+  elif [[ -d "$source_directory/results" ]]; then
+    source_directory="$source_directory/results"
+  fi
+  fasta_candidates=()
+  for directory in "$source_directory/../prepared_inputs" "$source_directory/prepared_inputs"; do
+    for candidate in "$directory/"*sample_ids.fasta "$directory/"*sample_ids.fa; do
+      [[ -f "$candidate" ]] && fasta_candidates+=("$candidate")
+    done
+  done
+  if (( ${#fasta_candidates[@]} == 1 )); then
+    FASTA="${fasta_candidates[0]}"
+  elif (( ${#fasta_candidates[@]} > 1 )); then
+    echo 'Multiple local sample-ID FASTAs found; set FASTA to the correct file explicitly.' >&2
+    printf '%s\n' "${fasta_candidates[@]}" >&2
+    exit 1
+  fi
+fi
 # Prefer original Bakta outputs. Retained Panaroo GFFs with embedded DNA can
 # recover missing inputs without rerunning Bakta or changing CDS IDs.
 if [[ -n "${BAKTA:-}" && -n "${GFF_DIR:-}" ]]; then
@@ -39,6 +64,7 @@ if [[ -z "${PANAROO:-}" ]]; then
 fi
 echo "Species: $SPECIES; results: $RESULTS; map output: $MAP_OUT"
 echo "Panaroo: ${PANAROO:-not found}; Bakta: ${BAKTA:-not used}; recovery GFFs: ${GFF_DIR:-not used}"
+echo "Sample-ID FASTA: ${FASTA:-from discovery run identity}"
 # Report missing source paths instead of silently dropping required arguments.
 # Existing annotation plus existing functions (or SKIP_FUNCTION) needs neither.
 if [[ -z "${ANNOTATION:-}" || ( -z "${EGGNOG_ANNOTATIONS:-}" && "${SKIP_FUNCTION:-0}" != 1 ) ]]; then
