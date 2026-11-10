@@ -3,17 +3,44 @@ import csv
 import json
 from pathlib import Path
 import random
+import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from benchmarks.diagnose_amr_targets import main, identify, identify_all
+from benchmarks import diagnose_amr_targets as diagnostic
+from benchmarks.diagnose_amr_targets import main, identify, identify_all, original_reuse, response_null
 from ko_variation.discovery import main as discover
 from ko_variation.discovery_store import digest
 
 
 class TargetDiagnosisTests(unittest.TestCase):
+    def test_require_original_ignores_library_versions_but_not_fitting_model(self):
+        from ko_variation.null_identity import null_source_hash
+        identity = dict(numpy='different',scipy='different',null_model_source_sha256=null_source_hash())
+        self.assertFalse(original_reuse(identity,'auto')['enabled'])
+        reuse = original_reuse(identity,'require')
+        self.assertTrue(reuse['enabled'])
+        self.assertFalse(reuse['library_versions_match'])
+        identity['null_model_source_sha256'] = 'different fitting model'
+        with self.assertRaisesRegex(ValueError,'null-fitting code differs'):
+            original_reuse(identity,'require')
+
+    def test_required_missing_original_never_fits_a_replacement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db = sqlite3.connect(':memory:')
+            db.executescript('CREATE TABLE null_aliases(pid,canonical); CREATE TABLE null_inventory(pid,source); '
+                             'CREATE TABLE external_nulls(pid,path);')
+            state = dict(work=root,out=root,source=db,response=None,reuse={'enabled':True,'policy':'require'})
+            with patch.dict(diagnostic._WORKER,state,clear=True), patch.object(diagnostic,'fit_null_glmm') as fit:
+                with self.assertRaisesRegex(ValueError,'no refit performed'):
+                    response_null(5)
+                fit.assert_not_called()
+            db.close()
+
     def test_resistance_meca_is_not_the_adaptor(self):
         self.assertIsNone(identify('mecA', 'adaptor protein MecA'))
         self.assertEqual(identify('mecA', 'PBP2a family peptidoglycan transpeptidase MecA'), 'mecA')
@@ -80,6 +107,30 @@ class TargetDiagnosisTests(unittest.TestCase):
             self.assertEqual((root/'diagnosis/pair_comparison.tsv').read_bytes(),checkpoint)
             self.assertTrue(all(p.exists() and digest(p)==sha for p,sha in before.items()))
             self.assertEqual(json.loads((root/'diagnosis/summary.json').read_text())['samples'],80)
+            # Simulate the preceding helper after it fitted diagnostic nulls.
+            # An upgrade must retain mapping and beta while replacing scores.
+            manifest = root/'diagnosis/diagnosis_identity.json'
+            old_identity = json.loads(manifest.read_text())
+            old_identity.pop('original_nulls')
+            old_identity['script_sha256'] = '32713cfea041024439ba915315416df6ba9369f7942c63643ee072f752756391'
+            manifest.write_text(json.dumps(old_identity))
+            with sqlite3.connect(root/'diagnosis/diagnosis.sqlite') as db:
+                for u,v,raw in db.execute('SELECT u,v,result FROM fits').fetchall():
+                    result = json.loads(raw); result['null_origin']='fresh_diagnostic_fit'
+                    db.execute('UPDATE fits SET result=? WHERE u=? AND v=?',(json.dumps(result),u,v))
+            db.close()
+            for metadata in (root/'diagnosis/null_models').glob('*/*.json'):
+                record = json.loads(metadata.read_text()); record['origin']='fresh_diagnostic_fit'
+                metadata.write_text(json.dumps(record))
+            mapping_hash = digest(root/'diagnosis/target_unitigs.tsv')
+            main(args+['--original-nulls','require'])
+            with (root/'diagnosis/pair_comparison.tsv').open() as stream:
+                required_pairs = list(csv.DictReader(stream,delimiter='\t'))
+            self.assertTrue(all(r['null_origin']=='original_null_cache' for r in required_pairs))
+            self.assertTrue(all(r['beta_reused_on_null_policy_change']=='True' for r in required_pairs))
+            self.assertEqual([r['beta'] for r in required_pairs],[r['beta'] for r in pairs])
+            self.assertEqual(digest(root/'diagnosis/target_unitigs.tsv'),mapping_hash)
+            self.assertTrue(all(p.exists() and digest(p)==sha for p,sha in before.items()))
 
 
 if __name__=='__main__':

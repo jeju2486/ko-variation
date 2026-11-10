@@ -69,9 +69,37 @@ not claim an unmeasured pair is distal.
 ## Reuse and outputs
 
 Compatible original nulls are loaded read-only; missing nulls are fitted in the
-diagnostic output. If the fitting-source fingerprint or NumPy/SciPy versions
-differ, original null reuse is disabled and fresh diagnostic nulls are fitted.
-This is reported because numerical differences can then affect comparisons.
+diagnostic output by default (`--original-nulls auto`). If the fitting-source
+fingerprint or NumPy/SciPy versions differ, this default disables original
+null reuse and explicitly states the refit reason.
+
+To require original fitted nulls despite **library version differences**, add:
+
+```bash
+--original-nulls require
+```
+
+The fitting-code fingerprint, frozen cohort, covariance, file checksums,
+known cache format, response vector and array shapes/finite values must still
+match. This is not an override for a different scientific model. Library
+differences are logged and retained in `summary.json`. Numerical roundoff may
+differ; byte-identical test results across library/BLAS versions are not promised.
+The cache stores numerical arrays in NumPy's portable NPY/NPZ format; its file
+format versioning is independent of NumPy package versioning (see
+[NumPy format documentation](https://numpy.org/doc/stable/reference/generated/numpy.lib.format.html)).
+Missing original nulls stop with the attempted cache paths; they are never
+silently replaced by a new fit in this mode. A recorded original fit failure
+remains a failed null rather than triggering refitting. Original-derived
+diagnostic cache copies can be reused; fresh diagnostic copies are ignored.
+
+Stop the active diagnostic before upgrading/restarting it. The preceding
+released helper's checkpoint is migrated in place when all scientific inputs,
+environment and mapping settings match. The same output can switch between
+`auto` and `require`. Region/sequence mapping checkpoints stay intact. On
+switching to `require`, only completed scores that used fresh diagnostic nulls
+are recalculated; their independent beta fits are retained. New, uncompleted
+pairs still need their alternative beta fits. The previous diagnostic identity
+is saved as `diagnosis_identity.before_null_policy.json`.
 Each response has a single worker owner and BLAS uses one thread per worker.
 `--threads` controls simultaneous numerical workers; unitig discovery is one
 streaming pass with bounded checkpoint batches. Reference preparation,

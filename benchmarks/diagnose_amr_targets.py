@@ -38,6 +38,8 @@ from ko_variation.null_identity import null_source_hash
 TARGETS = ('mecA', 'graR', 'sen', 'tetM', 'tetK')
 COMPARISONS = (('mecA', 'graR'), ('mecA', 'sen'))
 _WORKER = {}
+PRE_REUSE_POLICY_HASHES = {'32713cfea041024439ba915315416df6ba9369f7942c63643ee072f752756391',
+                         'da44d07dda016adf80e83f66fbcf8a3760d1c1d7cb8ed0e0655bde78027e85e3'}
 
 
 def stamp(path):
@@ -326,14 +328,25 @@ def locus_report(args, db, source, info):
     return rows, coding
 
 
-def initialize_fits(work, info, out, allow_original):
+def original_reuse(identity, policy):
+    versions = {key:dict(original=identity.get(key), current=value) for key,value in
+                (('numpy',np.__version__),('scipy',scipy.__version__))}
+    same_model = identity.get('null_model_source_sha256') == null_source_hash()
+    same_versions = all(v['original']==v['current'] for v in versions.values())
+    if policy=='require' and not same_model:
+        raise ValueError('Original-null reuse refused: null-fitting code differs; library-only override cannot bypass this')
+    return dict(policy=policy, enabled=same_model and (same_versions or policy=='require'),
+                fitting_code_matches=same_model, library_versions_match=same_versions, versions=versions)
+
+
+def initialize_fits(work, info, out, reuse):
     threadpool_limits(limits=1)
     _WORKER.clear()
     _WORKER.update(work=Path(work), info=info, out=Path(out), source=read_only(Path(work)/'work.sqlite'),
         packed=open_patterns(work, info), K=np.load(Path(work)/'K.npy', mmap_mode='r'),
         eigen=KinshipEigensystem(np.load(Path(work)/'K_values.npy', mmap_mode='r'),
             np.load(Path(work)/'K_vectors.npy', mmap_mode='r'), info['shared_covariance']),
-        allow_original=allow_original, response=None)
+        reuse=reuse, response=None)
 
 
 def vector(pid):
@@ -347,10 +360,13 @@ def response_null(response):
     local = folder/f'null_{response:09d}.json'
     cache, record, origin = None, None, 'fresh_diagnostic_fit'
     verify = lambda p, sha: None if digest(p)==sha else (_ for _ in ()).throw(ValueError(f'Corrupt null cache: {p}'))
-    if local.is_file():
-        record = json.loads(local.read_text()); origin = record.get('origin', 'diagnostic_checkpoint')
+    local_record = json.loads(local.read_text()) if local.is_file() else None
+    required = s['reuse']['policy']=='require'
+    save_local = False
+    if local_record and (not required or local_record.get('origin')=='original_null_cache'):
+        record = local_record; origin = record.get('origin', 'diagnostic_checkpoint')
         if record['status']=='OK': cache = discovery_nulls.load(record, local, s['eigen'], verify)
-    elif s['allow_original']:
+    elif s['reuse']['enabled']:
         row = s['source'].execute('SELECT canonical FROM null_aliases WHERE pid=?', (response,)).fetchone()
         canonical = row[0] if row else response
         candidates = [s['work']/'null_models'/f'{canonical//1000:06d}'/f'null_{canonical:09d}.json']
@@ -359,27 +375,45 @@ def response_null(response):
         old = next((p for p in candidates if p.is_file()), None)
         if old:
             record = json.loads(old.read_text()); origin = 'original_null_cache'
+            if record.get('format')!=2:
+                raise ValueError(f'Unsupported original null cache format for response {response}: {old}')
             if record['status']=='OK':
                 cache = discovery_nulls.load(record, old, s['eigen'], verify)
                 if not np.array_equal(cache['y'], vector(canonical)):
                     raise ValueError('Cached null response differs from frozen pattern')
                 if response != canonical: cache = dict(cache, y=vector(response), mu=1-cache['mu'])
+            save_local = True
+        elif required:
+            raise ValueError(f'Original null cache not found for response {response} (canonical {canonical}); '
+                             f'no refit performed. Searched: {[str(p) for p in candidates]}')
     if record is None:
-        print(f'[AMR diagnosis worker] fitting missing null {response}', flush=True)
+        reason = ('original cache not found' if s['reuse']['enabled'] else
+                  'reuse disabled: null-fitting code differs' if not s['reuse']['fitting_code_matches'] else
+                  'reuse disabled: NumPy/SciPy versions differ')
+        print(f'[AMR diagnosis worker] fitting diagnostic null {response}; {reason}', flush=True)
         fit, cache = fit_null_glmm(response, vector(response), s['K'], kinship_eigensystem=s['eigen'])
         record = dict(status=fit.status, iterations=fit.iterations)
         if fit.status!='OK': cache = None
-    if cache is not None: discovery_nulls.complete(cache, s['K'], s['eigen'])
-    if not local.is_file():
+        save_local = True
+    if cache is not None:
+        n = s['info']['n']
+        expected_shapes = dict(y=(n,),mu=(n,),weights=(n,),C=(n,1),Sinv_C=(n,1),M_inv=(1,1))
+        if any(cache[k].shape!=shape or not np.isfinite(cache[k]).all() for k,shape in expected_shapes.items()):
+            raise ValueError(f'Invalid cached null arrays for response {response}')
+        if not np.array_equal(cache['y'],vector(response)) or np.any(cache['weights']<=0) or \
+                not np.isfinite(cache['tau']) or cache['tau']<0 or np.any(cache['mu']<0) or np.any(cache['mu']>1):
+            raise ValueError(f'Cached null does not match the response/valid probabilities for pattern {response}')
+        discovery_nulls.complete(cache, s['K'], s['eigen'])
+    if save_local:
         discovery_nulls.save(folder, response, cache, dict(record, origin=origin), s['K'], s['eigen'],
-                             compact=False, rank=s['info']['n'])
+                             compact=False, rank=s['info']['n'], previous_record=local_record)
     value = (cache, record['status'], origin)
     s['response'], s['cached'] = response, value
     return value
 
 
 def calculate_pair(job):
-    u, v = job
+    u, v, previous = job
     x, y = vector(u), vector(v)
     n11 = int(x@y); n10 = int(x.sum())-n11; n01 = int(y.sum())-n11
     n00 = len(x)-n11-n10-n01
@@ -393,7 +427,10 @@ def calculate_pair(job):
         score = score_predictor_block(x[:,None], cache, compute_spa_adjustment=False)[0]
         result['score_status'] = score.status
         if score.status=='OK' and np.isfinite(score.p_score): result['p_exact'] = float(score.p_score)
-    if result['min_cell'] > 0:
+    if previous is not None:
+        result.update({k:previous.get(k) for k in ('beta','beta_se','beta_status')})
+        result['beta_reused_on_null_policy_change'] = True
+    elif result['min_cell'] > 0:
         fit, alternative = fit_logistic_mixed(y, _WORKER['K'], covariates=x[:,None], kinship_eigensystem=_WORKER['eigen'])
         result['beta_status'] = fit.status
         if fit.status=='OK' and fit.converged:
@@ -417,18 +454,27 @@ def compare(args, db, source, info, identity, rows, patterns):
     if len(pairs)>args.max_pairs:
         raise ValueError(f'{len(pairs):,} pattern pairs exceed --max-pairs {args.max_pairs:,}; '
                          'inspect target_unitigs.tsv before explicitly increasing the cap')
-    environment = dict(numpy=np.__version__, scipy=scipy.__version__, null_model_source_sha256=null_source_hash())
-    allow_original = all(identity.get(k)==v for k,v in environment.items())
-    log(args.out, f'{len(pairs):,} distinct target pattern pairs; original null reuse compatible={allow_original}')
-    pending = [p for p in sorted(pairs,key=lambda p:(p[1],p[0]))
-               if not db.execute('SELECT 1 FROM fits WHERE u=? AND v=?',p).fetchone()]
+    reuse = original_reuse(identity,args.original_nulls)
+    log(args.out, f'{len(pairs):,} distinct target pattern pairs; original null reuse enabled={reuse["enabled"]}; '
+                 f'policy={reuse["policy"]}; fitting code matches={reuse["fitting_code_matches"]}; '
+                 f'library versions match={reuse["library_versions_match"]}')
+    if not reuse['library_versions_match']: log(args.out,'library version differences: '+json.dumps(reuse['versions']))
+    pending = []
+    for u,v in sorted(pairs,key=lambda p:(p[1],p[0])):
+        row = db.execute('SELECT result FROM fits WHERE u=? AND v=?',(u,v)).fetchone()
+        previous = json.loads(row[0]) if row else None
+        if previous is None or (u!=v and args.original_nulls=='require' and previous.get('null_origin')!='original_null_cache'):
+            pending.append((u,v,previous))
+    if any(p[2] is not None for p in pending):
+        log(args.out,'recalculating scores from original nulls; completed independent beta fits are retained')
     if pending:
-        with TargetPool(args.threads, initialize_fits, (str(args.work),info,str(args.out),allow_original)) as pool:
-            for result in bounded_map(pool, calculate_pair, pending, args.threads, ordered=False):
+        with TargetPool(args.threads, initialize_fits, (str(args.work),info,str(args.out),reuse)) as pool:
+            for completed,result in enumerate(bounded_map(pool, calculate_pair, pending, args.threads, ordered=False),1):
                 with db: db.execute('INSERT OR REPLACE INTO fits VALUES (?,?,?)',
                     (result['predictor_pattern'],result['response_pattern'],json.dumps(result,allow_nan=False)))
                 saved = db.execute('SELECT count(*) FROM fits').fetchone()[0]
-                if saved % 10 == 0 or saved==len(pairs): log(args.out, f'target fits saved: {saved:,}/{len(pairs):,}')
+                if completed % 10 == 0 or completed==len(pending):
+                    log(args.out, f'target fits saved: {saved:,}/{len(pairs):,}; jobs this invocation: {completed:,}/{len(pending):,}')
     old_min = int(identity['settings'].get('min_cell_count',20))
     new_min = max(10, math.ceil(.02*info['n']))
     summary_file = args.results/'run_summary.json'
@@ -456,7 +502,7 @@ def compare(args, db, source, info, identity, rows, patterns):
     fields = ['target_pairs','predictor_pattern','response_pattern','n00','n10','n01','n11','min_cell',
         'original_min_cell','new_min_cell','eligible_original','eligible_new','old_query_status','old_final',
         'old_p_exact','old_p_lower','old_p_upper','p_exact','score_status','exact_p_within_old_bounds','p_difference',
-        'old_beta','old_beta_status','beta','beta_se','beta_status','beta_difference','null_origin',
+        'old_beta','old_beta_status','beta','beta_se','beta_status','beta_difference','null_origin','beta_reused_on_null_policy_change',
         'bonferroni_tests','p_cutoff','significant_p_only','significant_and_eligible_new']
     table(args.out/'pair_comparison.tsv',output,fields)
     by_target = defaultdict(list)
@@ -477,7 +523,7 @@ def compare(args, db, source, info, identity, rows, patterns):
     return dict(samples=info['n'],original_min_cell=old_min,new_min_cell=new_min,pattern_pairs=len(pairs),
         significant_and_eligible_new=sum(r['significant_and_eligible_new'] for r in output),
         original_query_statuses={s:sum(r['old_query_status']==s for r in output) for s in {r['old_query_status'] for r in output}},
-        bonferroni_tests=family,p_cutoff=cutoff,original_null_reuse_compatible=allow_original,
+        bonferroni_tests=family,p_cutoff=cutoff,original_null_reuse_compatible=reuse['enabled'],original_null_reuse=reuse,
         interpretation='Targeted unitig diagnostic, not gene-level significance or evidence of epistasis. '
         'Unqueried pairs are not labelled nonsignificant. Full matches at target references do not establish '
         'genome-wide mapping uniqueness. Unknown distances are not presumed distal.')
@@ -499,6 +545,8 @@ def main(argv=None):
     p.add_argument('--seed-k',type=int,default=31)
     p.add_argument('--include-nearby',action='store_true',help='Also test bounded-nearby candidates; default tests coding hits only')
     p.add_argument('--max-pairs',type=int,default=10000)
+    p.add_argument('--original-nulls',choices=['auto','require'],default='auto',
+                   help='require: reuse original nulls across library versions when fitting code matches; never refit missing nulls')
     args = p.parse_args(argv)
     if min(args.threads,args.seed_k,args.max_pairs)<1 or args.nearby_bp<0:
         p.error('Positive threads/seed/max-pairs and nonnegative nearby-bp required')
@@ -506,6 +554,7 @@ def main(argv=None):
     if args.out==args.results or args.out.is_relative_to(args.results):
         p.error('Diagnostic output must be outside the discovery results directory')
     identity = json.loads((args.results/'run_identity.json').read_text())
+    original_reuse(identity,args.original_nulls)
     candidates = [args.work] if args.work else [args.results/'.kovar_work',Path(identity.get('work_directory','/not-found'))]
     args.work = next((w.resolve() for w in candidates if w and (w/'prepared.json').is_file() and (w/'work.sqlite').is_file()),None)
     if args.work is None: p.error('Frozen .kovar_work required; provide --work if stored elsewhere')
@@ -513,6 +562,9 @@ def main(argv=None):
         p.error('Diagnostic output must be outside the source work directory')
     info = json.loads((args.work/'prepared.json').read_text())
     source = read_only(args.work/'work.sqlite')
+    work_identity = json.loads((args.work/'run_identity.json').read_text())
+    if any(work_identity.get(k)!=identity.get(k) for k in ('inputs','null_model_source_sha256')):
+        raise ValueError('Source work directory belongs to a different input cohort or null-fitting model')
     refs, missing = references(args,info)
     # Verify unitig numbering against the distance stage, and FASTA against the
     # frozen cohort input. These checks prevent scoring a different sequence pool.
@@ -533,10 +585,17 @@ def main(argv=None):
     state = dict(source_identity=identity,prepared=info,unitigs=stamp(args.unitigs),fasta=stamp(args.fasta),
         panaroo=stamp(args.panaroo),references={s:[stamp(x) for x in paths if x] for s,paths in refs.items()},
         nearby_bp=args.nearby_bp,seed_k=args.seed_k,include_nearby=args.include_nearby,
-        script_sha256=digest(Path(__file__)),null_source_sha256=null_source_hash(),numpy=np.__version__,scipy=scipy.__version__)
+        script_sha256=digest(Path(__file__)),null_source_sha256=null_source_hash(),numpy=np.__version__,scipy=scipy.__version__,
+        original_nulls=args.original_nulls)
     manifest = args.out/'diagnosis_identity.json'
     if manifest.exists() and json.loads(manifest.read_text())!=state:
-        raise ValueError('Diagnostic inputs/settings changed; choose a separate diagnostic output')
+        previous = json.loads(manifest.read_text())
+        ignored = {'script_sha256','original_nulls'}
+        if previous.get('script_sha256') not in PRE_REUSE_POLICY_HASHES | {state['script_sha256']} or \
+                {k:v for k,v in previous.items() if k not in ignored}!={k:v for k,v in state.items() if k not in ignored}:
+            raise ValueError('Diagnostic inputs/settings changed; choose a separate diagnostic output')
+        backup = manifest.with_name('diagnosis_identity.before_null_policy.json')
+        if not backup.exists(): atomic_json(backup,previous)
     atomic_json(manifest,state)
     db = sqlite3.connect(args.out/'diagnosis.sqlite')
     db.execute('PRAGMA journal_mode=WAL'); db.execute('PRAGMA synchronous=FULL')
