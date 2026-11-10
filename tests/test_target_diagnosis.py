@@ -1,0 +1,86 @@
+"""Small end-to-end target audit: exact geometry, fitting and source preservation."""
+import csv
+import json
+from pathlib import Path
+import random
+import tempfile
+import unittest
+
+import numpy as np
+
+from benchmarks.diagnose_amr_targets import main, identify, identify_all
+from ko_variation.discovery import main as discover
+from ko_variation.discovery_store import digest
+
+
+class TargetDiagnosisTests(unittest.TestCase):
+    def test_resistance_meca_is_not_the_adaptor(self):
+        self.assertIsNone(identify('mecA', 'adaptor protein MecA'))
+        self.assertEqual(identify('mecA', 'PBP2a family peptidoglycan transpeptidase MecA'), 'mecA')
+        self.assertEqual(identify('group_25;tet(M)', 'ribosomal protection protein'), 'tetM')
+        self.assertEqual(identify_all('mecA;graR','PBP2a transpeptidase;response regulator'), {'mecA','graR'})
+
+    def test_full_pool_mapping_score_and_checkpoint_do_not_change_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            rng = random.Random(740)
+            slots = [''.join(rng.choice('ACGT') for _ in range(180)) for _ in range(4)]
+            a = np.array([0]*45+[1]*35, dtype='u1')
+            b = np.array([0]*35+[1]*10+[0]*10+[1]*25, dtype='u1')
+            c = np.roll(b, 7)
+            t = np.array([1]*4+[0]*76, dtype='u1')
+            matrix = np.column_stack((a,a,b,c,t))
+            fasta, tree, unitigs = root/'sample_ids.fasta', root/'tree.nwk', root/'unitigs'
+            fasta.write_text(''.join(f'>s{i}\n'+''.join('C' if x else 'A' for x in row)+'\n' for i,row in enumerate(matrix)))
+            tree.write_text('('+','.join(f's{i}:1' for i in range(80))+');')
+            reverse = slots[2].translate(str.maketrans('ACGT','TGCA'))[::-1]
+            unitigs.write_text('\n'.join(f'{i} {s}' for i,s in enumerate(
+                [slots[0][40:101],slots[0][40:101],slots[1][40:101],reverse,slots[3][40:101]]))+'\n')
+            source = root/'source'
+            discover(['--fasta',str(fasta),'--tree',str(tree),'--unitigs',str(unitigs),'--out',str(source),
+                '--min-cell-count','20','--screen-p','0.05','--prefit-nulls','all','--coarse-screen','none','--search','exhaustive',
+                '--threads','1','--memory-gb','1'])
+            gffs = root/'gffs'; gffs.mkdir()
+            targets = ['mecA','graR','sen','tet(M)']
+            products = ['PBP2a family peptidoglycan transpeptidase MecA','response regulator GraR',
+                        'staphylococcal enterotoxin N','tetracycline ribosomal protection protein']
+            with (root/'panaroo.csv').open('w',newline='') as stream:
+                writer=csv.writer(stream)
+                writer.writerow(['Gene','Non-unique Gene name','Annotation']+[f's{i}' for i in range(80)])
+                for j, (target,product) in enumerate(zip(targets,products)):
+                    states = [a,b,c,t][j]
+                    writer.writerow([target,target,product]+[f'cds{j}' if states[i] else '' for i in range(80)])
+            for i in range(80):
+                dna = ''.join(slot if states[i] else 'N'*180 for slot,states in zip(slots,[a,b,c,t]))
+                lines = ['##gff-version 3\n']
+                for j, states in enumerate([a,b,c,t]):
+                    if states[i]:
+                        lines.append(f'ctg\tfixture\tCDS\t{j*180+31}\t{j*180+150}\t.\t+\t0\t'
+                                     f'ID=cds{j};gene={targets[j]};product={products[j]}\n')
+                (gffs/f's{i}.gff').write_text(''.join(lines)+'##FASTA\n>ctg\n'+dna+'\n')
+            before = {p:digest(p) for p in source.rglob('*') if p.is_file() and '-shm' not in p.name}
+            args = ['--results',str(source),'--fasta',str(fasta),'--unitigs',str(unitigs),
+                '--panaroo',str(root/'panaroo.csv'),'--gff-dir',str(gffs),'--map-dir',str(root/'map'),
+                '--out',str(root/'diagnosis'),'--nearby-bp','5','--threads','2']
+            main(args)
+            with (root/'diagnosis/target_unitigs.tsv').open() as stream:
+                loci = list(csv.DictReader(stream,delimiter='\t'))
+            self.assertEqual({int(r['unitig']) for r in loci if r['target']=='mecA'}, {0,1})
+            self.assertTrue(any(r['target']=='sen' and r['unitig']=='3' for r in loci))
+            with (root/'diagnosis/pair_comparison.tsv').open() as stream:
+                pairs = list(csv.DictReader(stream,delimiter='\t'))
+            self.assertEqual(len(pairs),2)
+            gra = next(r for r in pairs if 'graR' in r['target_pairs'])
+            self.assertEqual((gra['eligible_original'],gra['eligible_new']),('0','1'))
+            self.assertTrue(gra['p_exact'])
+            self.assertEqual(gra['beta_status'],'OK')
+            self.assertEqual(gra['null_origin'],'original_null_cache')
+            checkpoint = (root/'diagnosis/pair_comparison.tsv').read_bytes()
+            main(args)
+            self.assertEqual((root/'diagnosis/pair_comparison.tsv').read_bytes(),checkpoint)
+            self.assertTrue(all(p.exists() and digest(p)==sha for p,sha in before.items()))
+            self.assertEqual(json.loads((root/'diagnosis/summary.json').read_text())['samples'],80)
+
+
+if __name__=='__main__':
+    unittest.main()

@@ -72,6 +72,10 @@ The same `--resume` command skips committed beta fits. Its beta-stage log and
 statuses and new fits in the current invocation. There is no separate beta
 restart command. See [beta checkpoints](docs/discovery.md#beta-checkpoints).
 
+For missing S. aureus AMR targets, the separate [target diagnosis](docs/target_diagnosis.md)
+searches the original unitig pool and compares direct mecA–graR/mecA–sen score
+tests and beta fits against the saved run. It does not modify discovery results.
+
 The first discovery output must be empty. For a wrapper that prepares inputs
 itself, use sibling directories `run/prepared_inputs` and `run/results`, and
 pass only `run/results` to `--out`. [Full run/cache instructions](docs/discovery.md).
