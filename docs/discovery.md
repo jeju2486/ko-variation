@@ -257,8 +257,15 @@ All significant candidates are retained:
 
 Distance means **minimum shortest-path distance across connected single-genome
 graphs**, not a reference chromosome coordinate. Unknown/disconnected pairs are
-not presumed distal. The cutoff can be set with `--distal-bp` before the first
-distance stage, then is frozen. Beta is an alternative phylogenetic logistic
+not presumed distal. Set the cutoff with `--distal-bp` (default 10,000).
+A cutoff-only change on `--resume` reclassifies saved distances in place;
+association decisions, null models and existing beta fits are retained. Only
+newly eligible pattern pairs without a saved beta attempt are fitted. Increasing
+the cutoff hides local betas from exports without deleting their saved fits.
+Pending distance batches continue normally and unknown distances stay unknown.
+The threshold history is recorded in `run_summary.json`; current exports are
+replaced on completion. Preserve an earlier map separately if needed.
+Beta is an alternative phylogenetic logistic
 mixed-model coefficient, fitted once per selected distal pattern pair and
 reported only on distal original-unitig rows. Separation, nonconvergence,
 clipped weights and invalid variance remain explicit effect statuses.
@@ -320,7 +327,8 @@ Input contents, fitting implementation, numerical environment and scientific
 settings are checked. CPU count, memory budget and numerical batch size may be
 adjusted on resume; they are execution settings.
 Changing scientific settings requires a new output. Distances/beta can be added
-later, but changed distance inputs/cutoffs cannot overwrite earlier results.
+later. A changed `--distal-bp` alone is supported on resume; changing graph inputs,
+the distance executable or k-mer length still requires a new output.
 
 ### Resume a released v0.9.0, v0.9.1 or v0.9.2 run
 

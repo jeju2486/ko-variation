@@ -15,6 +15,65 @@ from ko_variation.null_identity import migrate_identity
 
 
 class BetaCheckpointTests(unittest.TestCase):
+    def test_cutoff_resume_reuses_distances_decisions_and_saved_betas(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary, paths, unitigs = root/'distance_tool', root/'graph.paths', root/'unitigs'
+            binary.write_text('fixture')
+            paths.write_text(str(binary)+'\n')
+            unitigs.write_text('0 ACGT\n')
+            args = SimpleNamespace(unitig_distance=str(binary), paths=paths, unitigs=unitigs,
+                                   edges=None, kmer_length=61, distal_bp=10000,
+                                   threads=2, no_beta=True, out=root, distance_batch_size=5000)
+            db = connect(root/'work.sqlite')
+            schema(db)
+            rows = [(10,20,0,1,20000,1,'DISTAL'), (11,20,0,1,5000,1,'LOCAL'),
+                    (20,30,1,2,3001,1,'LOCAL'), (30,40,2,3,3000,1,'LOCAL'),
+                    (40,50,3,4,None,0,'UNKNOWN')]
+            with db:
+                set_meta(db,'distance_expanded',True)
+                db.executemany('INSERT INTO distance VALUES (?,?,?,?,?,?,?)',rows)
+                db.execute('INSERT INTO beta VALUES (0,1,2.5,"OK")')
+                db.execute('INSERT INTO decisions VALUES (0,1,1,1,42,42,0.00001,"EXACT")')
+            decisions = db.execute('SELECT * FROM decisions').fetchall()
+            calls = []
+
+            def beta(job):
+                calls.append(tuple(job))
+                return *job, 1.25, 'OK'
+
+            help_result = subprocess.CompletedProcess([],0,stdout='',stderr='')
+            with ThreadPoolExecutor(max_workers=2) as pool, \
+                 patch('ko_variation.discovery.shutil.which',return_value=str(binary)), \
+                 patch('ko_variation.discovery.subprocess.run',return_value=help_result) as run, \
+                 patch('ko_variation.discovery.kernels.beta',side_effect=beta):
+                distance_and_beta(db,root,pool,args)
+                args.distal_bp, args.no_beta = 3000, False
+                distance_and_beta(db,root,pool,args)
+                self.assertEqual(calls,[(1,2)])
+                self.assertEqual(db.execute('SELECT status FROM distance ORDER BY u,v').fetchall(),
+                                 [('DISTAL',),('DISTAL',),('DISTAL',),('LOCAL',),('UNKNOWN',)])
+                saved = db.execute('SELECT * FROM beta ORDER BY u,v').fetchall()
+                self.assertEqual(saved,[(0,1,2.5,'OK'),(1,2,1.25,'OK')])
+                args.distal_bp = 25000
+                distance_and_beta(db,root,pool,args)
+                args.distal_bp = 3000
+                distance_and_beta(db,root,pool,args)
+                self.assertEqual(calls,[(1,2)])
+                self.assertEqual(db.execute('SELECT * FROM beta ORDER BY u,v').fetchall(),saved)
+                self.assertEqual(db.execute('SELECT * FROM decisions').fetchall(),decisions)
+                self.assertEqual(db.execute('SELECT u,v,pu,pv,distance,connected FROM distance ORDER BY u,v').fetchall(),
+                                 [row[:6] for row in rows])
+                # All invocations only inspect --help; no graph distances repeat.
+                self.assertTrue(all(call.kwargs.get('capture_output') for call in run.call_args_list))
+                history = json.loads(db.execute("SELECT value FROM meta WHERE key='distance_threshold_history'").fetchone()[0])
+                self.assertEqual([entry['distal_bp'] for entry in history],[3000,25000,3000])
+                self.assertEqual(history[0]['reclassified_unitig_pairs'],2)
+                binary.write_text('changed distance executable')
+                with self.assertRaisesRegex(ValueError,'Distance inputs changed'):
+                    distance_and_beta(db,root,pool,args)
+            db.close()
+
     def test_interruption_keeps_saved_fits_and_resume_reports_cumulative_count(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -95,6 +154,12 @@ class BetaCheckpointTests(unittest.TestCase):
             manifest.write_text(json.dumps(previous))
             self.assertTrue(migrate_identity(previous, expected, manifest))
             self.assertEqual(json.loads(manifest.read_text()), expected)
+            # Immediately preceding release is accepted with numerical code unchanged.
+            prior_cutoff = copy.deepcopy(expected)
+            prior_cutoff['code'].update({
+                'discovery.py':'03a470f36404bfad4521d5934d17c59b79dedeed16b2fccb0e525f934aa58a37',
+                'null_identity.py':'d655a839c4d94928b2f1d8e476686192474a63fcf164e5b131a4bb037a581440'})
+            self.assertTrue(migrate_identity(prior_cutoff,expected,manifest))
             self.assertTrue((root/'run_identity.v092.pc-screen-1.json').is_file())
             changed = copy.deepcopy(previous)
             changed['settings']['min_maf'] = .1

@@ -95,15 +95,21 @@ def migrate_identity(previous, expected, manifest):
     release = {"0.9.0":V090_CODE, "0.9.1":V091_CODE, "0.9.2":V092_CODE}.get(previous.get("version"))
     release={'prefit-compact-1':PREFIT1_CODE,'prefit-compact-2':PREFIT2_CODE,'streamlined-1':STREAMLINED_CODE}.get(
         previous.get('execution_revision'),release)
-    # The released PC40 checkpoint predates cumulative beta progress. Only
-    # orchestration/reporting changed; all numerical sources must still match.
+    # Released PC40 checkpoints predate beta progress and cutoff-only resume.
+    # Only orchestration/reporting changed; numerical sources must still match.
     if previous.get('version') == expected.get('version') == '0.9.2' and \
             previous.get('execution_revision') == expected.get('execution_revision') == 'pc-screen-1':
         release = {name:{value} for name,value in expected['code'].items()}
         release.update({
-            'discovery.py': {'ed0f27ddee6a7b90a45d6002ffbe147a0787a7cef01520d78304bc25fae3b78e',
+            'discovery.py': {expected['code']['discovery.py'],
+                             '88ef005276abe3db60b23ebe0261032a3e3b95d4a334e0b28ac610c796234ad8',
+                             '03a470f36404bfad4521d5934d17c59b79dedeed16b2fccb0e525f934aa58a37',
+                             'ed0f27ddee6a7b90a45d6002ffbe147a0787a7cef01520d78304bc25fae3b78e',
                              '863b895d1abb375162f2a11548aa52b3e50ccc6443f23ac6c7a3785a7bd1399c'},
-            'null_identity.py': {'dc344fa33bad4180ce81f4cd7e21f2cd900c789af2c558906bc2155cc4471133',
+            'null_identity.py': {expected['code']['null_identity.py'],
+                                '7ca4e02966075c327217e2c1fff67303296b4f1f0b7717f4d507f096f0e178cb',
+                                'd655a839c4d94928b2f1d8e476686192474a63fcf164e5b131a4bb037a581440',
+                                'dc344fa33bad4180ce81f4cd7e21f2cd900c789af2c558906bc2155cc4471133',
                                 '1090804280e62d96dfe71caaf311c416806da96eb40d8b25e1560fd82f5aa91c'},
         })
     if release is None or set(previous.get("code",{})) != set(release):

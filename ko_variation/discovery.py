@@ -631,10 +631,28 @@ def distance_and_beta(db, work, pool, args):
                 graph["path_graphs"].append([str(path),digest(path)])
     graph.update(binary=digest(binary),k=args.kmer_length,distal_bp=args.distal_bp)
     old = get_meta(db,"distance_identity")
-    if old is not None and old != graph:
-        raise ValueError("Distance inputs/settings changed; use a new output")
+    reclassify = old is not None and old != graph
+    if reclassify and ({k:v for k,v in old.items() if k!='distal_bp'} !=
+                       {k:v for k,v in graph.items() if k!='distal_bp'}):
+        raise ValueError("Distance inputs changed; use a new output")
     with db:
+        if reclassify:
+            # The cutoff selects beta eligibility, not the association test or
+            # physical distance. Keep pending/unknown rows and all saved fits.
+            changed = db.execute("""UPDATE distance SET status=CASE
+                WHEN distance>? THEN 'DISTAL' ELSE 'LOCAL' END
+                WHERE status IN ('LOCAL','DISTAL') AND status!=CASE
+                WHEN distance>? THEN 'DISTAL' ELSE 'LOCAL' END""",
+                (args.distal_bp,args.distal_bp)).rowcount
+            history = get_meta(db,'distance_threshold_history',[])
+            history.append(dict(previous_bp=old['distal_bp'],distal_bp=args.distal_bp,
+                                reclassified_unitig_pairs=changed))
+            set_meta(db,'distance_threshold_history',history)
         set_meta(db,"distance_identity",graph)
+    if reclassify:
+        print(f"[KOVAR] distance cutoff: {old['distal_bp']:,} -> {args.distal_bp:,} bp; "
+              f"reclassified {changed:,} saved unitig pairs; distances, association tests "
+              "and saved beta fits retained",flush=True)
     if not get_meta(db,"distance_expanded"):
         with db:
             db.execute("INSERT OR IGNORE INTO distance(u,v,pu,pv) "
@@ -797,6 +815,7 @@ def export(db, info, work, args, total_seconds):
     summary['memory_budget']=getattr(args,'_memory_info',None)
     summary['execution_plan']=getattr(args,'_plan',None)
     summary['coarse_screen']=get_meta(db,'coarse_screen_summary')
+    summary['distance_threshold_history']=get_meta(db,'distance_threshold_history',[])
     summary['reused_prepared_from']=get_meta(db,'reused_prepared_from')
     atomic_json(args.out/"run_summary.json",summary)
 

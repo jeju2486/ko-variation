@@ -62,6 +62,11 @@ must match. `--threads` is the total CPU budget. Memory follows the allocation;
 `--memory-gb` optionally caps it. `--tmp-dir` must persist across jobs.
 Borrowed null directories must remain accessible until retained runs finish.
 
+Changing only `--distal-bp` on resume reuses association decisions and graph
+distances. Saved pairs are reclassified and only missing, newly eligible beta
+fits are calculated. The updated exports replace the earlier distance-filtered
+results; graph inputs and the numerical model must still match.
+
 The same `--resume` command skips committed beta fits. Its beta-stage log and
 `beta_progress.json` report cumulative saved/remaining pattern pairs, OK/non-OK
 statuses and new fits in the current invocation. There is no separate beta
