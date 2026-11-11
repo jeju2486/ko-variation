@@ -82,7 +82,8 @@ class SccmecPyseerTests(unittest.TestCase):
                             source_sha256='fixture', error='')
             with patch.object(script.shutil, 'which', return_value=str(root/'bin/sccmec')), \
                     patch.object(script.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'mock-typing-v1', '')), \
-                    patch.object(script, 'classify', side_effect=calls):
+                    patch.object(script, 'classify', side_effect=calls), \
+                    patch.object(Path, 'is_relative_to', side_effect=AttributeError('Python 3.8'), create=True):
                 script.main(args)
                 main_hash = script.common.digest(out/'SCCmec/associations.tsv')
                 with patch('pyseer.lmm.initialise_lmm', side_effect=AssertionError('Unexpected refit')):

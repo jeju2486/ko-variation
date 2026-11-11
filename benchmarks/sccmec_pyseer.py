@@ -142,7 +142,8 @@ def frozen_inputs(args):
         raise ValueError('Set --work to the original .kovar_work containing patterns.bin and K.npy')
     args.work = args.work.resolve()
     for path in (args.diagnosis, args.work):
-        if args.out == path or args.out.is_relative_to(path) or path.is_relative_to(args.out):
+        # Paths are resolved above; parents membership also works on Python 3.8.
+        if args.out == path or args.out in path.parents or path in args.out.parents:
             raise ValueError('--out must be separate from the source diagnostic and work directories')
     for name in ('patterns.bin', 'K.npy'):
         if common.digest(args.work/name) != info['products'][name]:

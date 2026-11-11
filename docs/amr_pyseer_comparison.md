@@ -10,8 +10,8 @@ use the [SCCmec fixed-response workflow](sccmec_pyseer.md).
 ## Run
 
 Use a Python environment containing pyseer, NumPy, pandas, SciPy and pyseer's
-dependencies. KOVAR does not need to be installed in that environment. Run the
-program directly from a source checkout:
+dependencies (Python 3.8 or newer). KOVAR does not need to be installed in that
+environment. Run the program directly from a source checkout:
 
 ```bash
 python /path/to/ko-variation/benchmarks/diagnose_amr_pyseer.py \

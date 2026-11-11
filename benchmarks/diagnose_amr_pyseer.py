@@ -95,7 +95,8 @@ def prepare(args, environment):
         raise ValueError('Provide --work /path/to/the/original/.kovar_work (patterns.bin and K.npy required)')
     args.work = args.work.resolve()
     for path in (args.diagnosis, args.work):
-        if args.out == path or args.out.is_relative_to(path) or path.is_relative_to(args.out):
+        # Paths are resolved above; parents membership also works on Python 3.8.
+        if args.out == path or args.out in path.parents or path in args.out.parents:
             raise ValueError('--out must be separate from the source diagnosis and work directories')
     # These are the only full frozen-product reads. No decisions/beta DB is needed.
     for name in ('patterns.bin', 'K.npy'):

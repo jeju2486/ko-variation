@@ -8,6 +8,10 @@ KOVAR mixed models, annotations or source SQLite tables are recalculated/read.
 
 ## Environment and inputs
 
+The standalone workflow supports Python 3.8 or newer and does not import the
+installed KOVAR package. It can therefore use the Python version selected by
+Conda for pyseer/SCCmec independently of KOVAR's package requirements.
+
 A single Conda environment is the simplest arrangement:
 
 ```bash

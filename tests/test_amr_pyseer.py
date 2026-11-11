@@ -45,7 +45,8 @@ class PyseerDiagnosisTests(unittest.TestCase):
             out = root/'comparison'
             args = ['--diagnosis', str(diag), '--work', str(work), '--out', str(out), '--threads', '2']
             original_hashes = {p: script.digest(p) for d in (work, diag) for p in d.iterdir()}
-            script.main(args)
+            with patch.object(Path, 'is_relative_to', side_effect=AttributeError('Python 3.8'), create=True):
+                script.main(args)
             rows = script.read_table(out/'pyseer_comparison.tsv')
             self.assertEqual(len(rows), 3)
             phenotype = pd.Series(matrix[2].astype(float), index=[f's{i}' for i in range(80)])
