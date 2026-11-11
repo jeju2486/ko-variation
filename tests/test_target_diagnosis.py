@@ -1,11 +1,13 @@
 """Small end-to-end target audit: exact geometry, fitting and source preservation."""
 import csv
+import gzip
 import json
 from pathlib import Path
 import random
 import sqlite3
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -17,6 +19,26 @@ from ko_variation.discovery_store import digest
 
 
 class TargetDiagnosisTests(unittest.TestCase):
+    def test_unreadable_baseline_uses_only_positive_export_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            identity = dict(inputs={'fasta':'frozen'},settings={'alpha':.05},null_model_source_sha256='same-model')
+            (root/'run_identity.json').write_text(json.dumps(identity))
+            fields = ['u','v','predictor_pattern','response_pattern','significance','p_exact','p_lower','p_upper',
+                      'beta','beta_status','min_distance','connected_genomes','distance_status']
+            with gzip.open(root/'associations.tsv.gz','wt',newline='') as stream:
+                writer = csv.DictWriter(stream,fields,delimiter='\t'); writer.writeheader()
+                writer.writerow(dict(zip(fields,[10,20,0,1,'SIGNIFICANT',1e-12,1e-12,1e-12,2.5,'OK',15000,30,'DISTAL'])))
+            class Broken:
+                def execute(self,*args): raise sqlite3.DatabaseError('database disk image is malformed')
+            old,distances,status = diagnostic.historical_comparison(SimpleNamespace(results=root,out=root,include_nearby=False),
+                Broken(),{(0,1),(0,2)},[{'unitig':10},{'unitig':20}],identity)
+            self.assertEqual(status['mode'],'significant_export')
+            self.assertEqual(old[0,1]['status'],'SIGNIFICANT_FROM_EXPORT')
+            self.assertEqual(old[0,1]['beta'],2.5)
+            self.assertNotIn((0,2),old)
+            self.assertEqual(distances[10,20],(15000,30,'DISTAL'))
+
     def test_require_original_ignores_library_versions_but_not_fitting_model(self):
         from ko_variation.null_identity import null_source_hash
         identity = dict(numpy='different',scipy='different',null_model_source_sha256=null_source_hash())
@@ -106,7 +128,7 @@ class TargetDiagnosisTests(unittest.TestCase):
             main(args)
             self.assertEqual((root/'diagnosis/pair_comparison.tsv').read_bytes(),checkpoint)
             self.assertTrue(all(p.exists() and digest(p)==sha for p,sha in before.items()))
-            self.assertEqual(json.loads((root/'diagnosis/summary.json').read_text())['samples'],80)
+
             # Simulate the preceding helper after it fitted diagnostic nulls.
             # An upgrade must retain mapping and beta while replacing scores.
             manifest = root/'diagnosis/diagnosis_identity.json'
@@ -131,6 +153,20 @@ class TargetDiagnosisTests(unittest.TestCase):
             self.assertEqual([r['beta'] for r in required_pairs],[r['beta'] for r in pairs])
             self.assertEqual(digest(root/'diagnosis/target_unitigs.tsv'),mapping_hash)
             self.assertTrue(all(p.exists() and digest(p)==sha for p,sha in before.items()))
+
+            # The user finished every fit but the source decisions DB failed.
+            # A fully unreadable source checkpoint must not lose saved results.
+            (source/'.kovar_work/work.sqlite').write_bytes(b'deliberately malformed original checkpoint')
+            main(['--results',str(source),'--out',str(root/'diagnosis'),'--report-only'])
+            with (root/'diagnosis/pair_comparison.tsv').open() as stream:
+                recovered = list(csv.DictReader(stream,delimiter='\t'))
+            self.assertEqual(len(recovered),2)
+            self.assertTrue(all(r['old_query_status']=='UNAVAILABLE_NOT_IN_SIGNIFICANT_EXPORT' for r in recovered))
+            self.assertTrue(all(r['old_comparison_source']=='UNAVAILABLE' for r in recovered))
+            self.assertEqual([r['beta'] for r in recovered],[r['beta'] for r in pairs])
+            self.assertEqual([r['p_exact'] for r in recovered],[r['p_exact'] for r in pairs])
+            self.assertTrue(json.loads((root/'diagnosis/summary.json').read_text())['report_only'])
+            self.assertEqual(json.loads((root/'diagnosis/summary.json').read_text())['samples'],80)
 
 
 if __name__=='__main__':

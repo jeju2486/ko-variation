@@ -39,7 +39,9 @@ TARGETS = ('mecA', 'graR', 'sen', 'tetM', 'tetK')
 COMPARISONS = (('mecA', 'graR'), ('mecA', 'sen'))
 _WORKER = {}
 PRE_REUSE_POLICY_HASHES = {'32713cfea041024439ba915315416df6ba9369f7942c63643ee072f752756391',
-                         'da44d07dda016adf80e83f66fbcf8a3760d1c1d7cb8ed0e0655bde78027e85e3'}
+                         'da44d07dda016adf80e83f66fbcf8a3760d1c1d7cb8ed0e0655bde78027e85e3',
+                         'c9d289ff3db52df7f743b1a652faa05937f070e2441df12022300aec4d226c64',
+                         '07c5b79effdc787e92c253adbf90679be2ab92fcc734a4012c2800a721852383'}
 
 
 def stamp(path):
@@ -447,6 +449,86 @@ class TargetPool(ResponsePool):
         return self.executors[job[1] % self.workers].submit(function, job)
 
 
+def unitig_pair_rows(rows, include_nearby):
+    by_target = defaultdict(list)
+    for r in rows:
+        if r['pattern'] is not None and not r['n_matching_references_binary_absent'] and (
+                r['annotation_class']=='coding' or include_nearby):
+            by_target[r['target']].append(r)
+    for a,b in COMPARISONS:
+        for x,y in itertools.product(by_target[a],by_target[b]):
+            yield dict(target_a=a,target_b=b,unitig_a=x['unitig'],unitig_b=y['unitig'],
+                pattern_a=x['pattern'],pattern_b=y['pattern'],class_a=x['annotation_class'],class_b=y['annotation_class'],
+                clusters_a=x['clusters'],clusters_b=y['clusters'])
+
+
+def historical_comparison(args, source, pairs, rows, identity):
+    """All-or-nothing baseline DB reads; unreadable negatives stay unknown.
+
+    The exported table contains significant pairs only. Absence from that table
+    is never evidence of no query, no beta attempt or nonsignificance.
+    """
+    old, distances, errors = {}, {}, []
+    try:
+        current = json.loads((args.results/'run_identity.json').read_text())
+        if any(current.get(k)!=identity.get(k) for k in ('inputs','settings','null_model_source_sha256')):
+            raise ValueError('Original comparison inputs/settings differ from the frozen diagnostic')
+    except (OSError,ValueError) as error:
+        log(args.out,'WARNING: original comparison provenance unavailable: '+str(error))
+        return old,distances,dict(mode='unavailable',errors=[str(error)])
+    try:
+        if source is None: raise sqlite3.DatabaseError('Original checkpoint unavailable')
+        for u,v in pairs:
+            row = source.execute('SELECT status,final,p,t_low,t_high FROM decisions WHERE u=? AND v=?',(u,v)).fetchone()
+            beta = source.execute('SELECT value,status FROM beta WHERE u=? AND v=?',(u,v)).fetchone()
+            old[u,v] = dict(status=row[0] if row else 'SHARED_EXACT_PATTERN' if u==v else 'NOT_QUERIED',
+                final=row[1] if row else None,p=row[2] if row else None,
+                lower=float(scipy.stats.chi2.sf(row[4],1)) if row and row[4] is not None else None,
+                upper=float(scipy.stats.chi2.sf(row[3],1)) if row and row[3] is not None else None,
+                beta=beta[0] if beta else None,beta_status=beta[1] if beta else 'NOT_FITTED',source='ORIGINAL_SQLITE')
+        for r in unitig_pair_rows(rows,args.include_nearby):
+            key = tuple(sorted((r['unitig_a'],r['unitig_b'])))
+            if key not in distances:
+                row = source.execute('SELECT distance,connected,status FROM distance WHERE u=? AND v=?',key).fetchone()
+                if row: distances[key] = row
+        return old,distances,dict(mode='original_sqlite',errors=[])
+    except sqlite3.DatabaseError as error:
+        errors.append(str(error))
+        old.clear(); distances.clear()
+        log(args.out,'WARNING: original checkpoint comparison unreadable: '+str(error)+
+                    '; trying exported significant associations; no source repair attempted')
+    exported = args.results/'associations.tsv.gz'
+    wanted = set(pairs)
+    loci = {int(r['unitig']) for r in rows}
+    number = lambda text: float(text) if text and math.isfinite(float(text)) else None
+    try:
+        with gzip.open(exported,'rt',encoding='utf-8-sig',newline='') as stream:
+            reader = csv.DictReader(stream,delimiter='\t')
+            required = {'u','v','predictor_pattern','response_pattern','significance','p_exact','p_lower',
+                        'p_upper','beta','beta_status','min_distance','connected_genomes','distance_status'}
+            if not required.issubset(reader.fieldnames or []): raise ValueError('Original export schema incomplete')
+            for r in reader:
+                key = tuple(sorted((int(r['predictor_pattern']),int(r['response_pattern']))))
+                if key not in wanted or r['significance']!='SIGNIFICANT': continue
+                old.setdefault(key,dict(status='SIGNIFICANT_FROM_EXPORT',final=1,p=number(r['p_exact']),
+                    lower=number(r['p_lower']),upper=number(r['p_upper']),beta=None,
+                    beta_status=r['beta_status'],source='SIGNIFICANT_EXPORT'))
+                if number(r['beta']) is not None:
+                    old[key].update(beta=number(r['beta']),beta_status=r['beta_status'])
+                a,b = int(r['u']),int(r['v'])
+                if a in loci and b in loci:
+                    distances[tuple(sorted((a,b)))] = (number(r['min_distance']),
+                        int(r['connected_genomes']) if r['connected_genomes'] else None,r['distance_status'])
+        log(args.out,f'export fallback matched {len(old):,}/{len(wanted):,} target pattern pairs; '
+                    'other historical comparisons are unavailable, not nonsignificant')
+        mode = 'significant_export'
+    except (OSError,EOFError,ValueError,csv.Error) as error:
+        errors.append(f'{exported}: {error}')
+        old.clear(); distances.clear(); mode='unavailable'
+        log(args.out,'WARNING: original export comparison unavailable: '+str(error))
+    return old,distances,dict(mode=mode,errors=errors,export=str(exported))
+
+
 def compare(args, db, source, info, identity, rows, patterns):
     pairs = defaultdict(set)
     for a,b in COMPARISONS:
@@ -475,70 +557,117 @@ def compare(args, db, source, info, identity, rows, patterns):
                 saved = db.execute('SELECT count(*) FROM fits').fetchone()[0]
                 if completed % 10 == 0 or completed==len(pending):
                     log(args.out, f'target fits saved: {saved:,}/{len(pairs):,}; jobs this invocation: {completed:,}/{len(pending):,}')
+    return render_reports(args,db,source,info,identity,rows,pairs,reuse)
+
+
+def render_reports(args, db, source, info, identity, rows, pairs, reuse):
     old_min = int(identity['settings'].get('min_cell_count',20))
     new_min = max(10, math.ceil(.02*info['n']))
-    summary_file = args.results/'run_summary.json'
-    summary = json.loads(summary_file.read_text())
-    family = int(summary['bonferroni_tests']); cutoff = float(summary['alpha'])/family
+    family = int(identity['settings'].get('bonferroni_tests') or math.comb(info['patterns'],2))
+    cutoff = float(identity['settings']['alpha'])/family
+    baseline,distances,comparison = historical_comparison(args,source,pairs,rows,identity)
     output = []
     for (u,v), labels in sorted(pairs.items()):
-        r = json.loads(db.execute('SELECT result FROM fits WHERE u=? AND v=?',(u,v)).fetchone()[0])
-        old = source.execute('SELECT status,final,p,t_low,t_high FROM decisions WHERE u=? AND v=?',(u,v)).fetchone()
-        beta = source.execute('SELECT value,status FROM beta WHERE u=? AND v=?',(u,v)).fetchone()
-        lo = float(scipy.stats.chi2.sf(old[4],1)) if old and old[4] is not None else None
-        hi = float(scipy.stats.chi2.sf(old[3],1)) if old and old[3] is not None else None
+        saved = db.execute('SELECT result FROM fits WHERE u=? AND v=?',(u,v)).fetchone()
+        if saved is None: raise ValueError(f'Diagnostic fit {u},{v} is not saved; report-only never calculates missing fits')
+        r = json.loads(saved[0])
+        old = baseline.get((u,v),dict(status='SHARED_EXACT_PATTERN' if u==v else
+            'UNAVAILABLE_NOT_IN_SIGNIFICANT_EXPORT' if comparison['mode']=='significant_export' else
+            'UNAVAILABLE_ORIGINAL_COMPARISON',final=None,p=None,lower=None,upper=None,beta=None,
+            beta_status='UNAVAILABLE_ORIGINAL_COMPARISON',source='UNAVAILABLE'))
+        lo,hi = old['lower'],old['upper']
         r.update(target_pairs=';'.join(sorted(labels)), original_min_cell=old_min, new_min_cell=new_min,
             eligible_original=int(u!=v and r['min_cell']>=old_min), eligible_new=int(u!=v and r['min_cell']>=new_min),
-            old_query_status=old[0] if old else 'SHARED_EXACT_PATTERN' if u==v else 'NOT_QUERIED',
-            old_final=old[1] if old else None, old_p_exact=old[2] if old else None,
-            old_p_lower=lo, old_p_upper=hi, old_beta=beta[0] if beta else None,
-            old_beta_status=beta[1] if beta else 'NOT_FITTED', bonferroni_tests=family, p_cutoff=cutoff,
+            old_query_status=old['status'],old_comparison_source=old['source'],
+            old_final=old['final'],old_p_exact=old['p'],old_p_lower=lo,old_p_upper=hi,old_beta=old['beta'],
+            old_beta_status=old['beta_status'], bonferroni_tests=family, p_cutoff=cutoff,
             significant_p_only=int(r['p_exact'] is not None and r['p_exact']<=cutoff),
             significant_and_eligible_new=int(u!=v and r['min_cell']>=new_min and r['p_exact'] is not None and r['p_exact']<=cutoff),
-            beta_difference=r['beta']-beta[0] if beta and beta[0] is not None and r['beta'] is not None else None,
-            p_difference=r['p_exact']-old[2] if old and old[2] is not None and r['p_exact'] is not None else None,
+            beta_difference=r['beta']-old['beta'] if old['beta'] is not None and r['beta'] is not None else None,
+            p_difference=r['p_exact']-old['p'] if old['p'] is not None and r['p_exact'] is not None else None,
             exact_p_within_old_bounds=int(lo*(1-1e-7) <= r['p_exact'] <= hi*(1+1e-7)) if lo is not None and hi is not None and r['p_exact'] is not None else None)
         output.append(r)
     fields = ['target_pairs','predictor_pattern','response_pattern','n00','n10','n01','n11','min_cell',
-        'original_min_cell','new_min_cell','eligible_original','eligible_new','old_query_status','old_final',
+        'original_min_cell','new_min_cell','eligible_original','eligible_new','old_query_status','old_comparison_source','old_final',
         'old_p_exact','old_p_lower','old_p_upper','p_exact','score_status','exact_p_within_old_bounds','p_difference',
         'old_beta','old_beta_status','beta','beta_se','beta_status','beta_difference','null_origin','beta_reused_on_null_policy_change',
         'bonferroni_tests','p_cutoff','significant_p_only','significant_and_eligible_new']
     table(args.out/'pair_comparison.tsv',output,fields)
-    by_target = defaultdict(list)
-    for r in rows:
-        if r['pattern'] is not None and not r['n_matching_references_binary_absent'] and (
-                r['annotation_class']=='coding' or args.include_nearby): by_target[r['target']].append(r)
     def evidence():
-        for a,b in COMPARISONS:
-            for x,y in itertools.product(by_target[a],by_target[b]):
-                u,v = sorted((x['unitig'],y['unitig']))
-                old = source.execute('SELECT distance,connected,status FROM distance WHERE u=? AND v=?',(u,v)).fetchone()
-                yield dict(target_a=a,target_b=b,unitig_a=x['unitig'],unitig_b=y['unitig'],
-                    pattern_a=x['pattern'],pattern_b=y['pattern'],class_a=x['annotation_class'],class_b=y['annotation_class'],
-                    clusters_a=x['clusters'],clusters_b=y['clusters'],distance=old[0] if old else None,
-                    connected_genomes=old[1] if old else None,distance_status=old[2] if old else 'NOT_CALCULATED')
+        for r in unitig_pair_rows(rows,args.include_nearby):
+            old = distances.get(tuple(sorted((r['unitig_a'],r['unitig_b']))))
+            yield dict(r,distance=old[0] if old else None,connected_genomes=old[1] if old else None,
+                distance_status=old[2] if old else 'NOT_CALCULATED' if comparison['mode']=='original_sqlite'
+                else 'UNKNOWN_ORIGINAL_COMPARISON_UNAVAILABLE')
     table(args.out/'unitig_pair_evidence.tsv.gz',evidence(),['target_a','target_b','unitig_a','unitig_b',
         'pattern_a','pattern_b','class_a','class_b','clusters_a','clusters_b','distance','connected_genomes','distance_status'])
     return dict(samples=info['n'],original_min_cell=old_min,new_min_cell=new_min,pattern_pairs=len(pairs),
         significant_and_eligible_new=sum(r['significant_and_eligible_new'] for r in output),
         original_query_statuses={s:sum(r['old_query_status']==s for r in output) for s in {r['old_query_status'] for r in output}},
         bonferroni_tests=family,p_cutoff=cutoff,original_null_reuse_compatible=reuse['enabled'],original_null_reuse=reuse,
+        historical_comparison=comparison,
+        null_origin_counts={origin:sum(r['null_origin']==origin for r in output) for origin in {r['null_origin'] for r in output}},
         interpretation='Targeted unitig diagnostic, not gene-level significance or evidence of epistasis. '
         'Unqueried pairs are not labelled nonsignificant. Full matches at target references do not establish '
         'genome-wide mapping uniqueness. Unknown distances are not presumed distal.')
+
+
+def report_saved(args):
+    """Export committed fits even if the original SQLite checkpoint is corrupt."""
+    state = json.loads((args.out/'diagnosis_identity.json').read_text())
+    info,identity = state['prepared'],state['source_identity']
+    args.include_nearby = state['include_nearby']
+    lock = sqlite3.connect(args.out/'coordinator.lock.sqlite',timeout=0)
+    source = db = None
+    try:
+        lock.execute('BEGIN EXCLUSIVE')
+        db = read_only(args.out/'diagnosis.sqlite')
+        with (args.out/'target_unitigs.tsv').open(encoding='utf-8-sig') as stream:
+            rows = list(csv.DictReader(stream,delimiter='\t'))
+        patterns = defaultdict(set)
+        for r in rows:
+            r['unitig'] = int(r['unitig'])
+            r['pattern'] = int(r['pattern']) if r['pattern'] else None
+            r['n_matching_references_binary_absent'] = int(r['n_matching_references_binary_absent']) if r['n_matching_references_binary_absent'] else None
+            if r['pattern'] is not None and not r['n_matching_references_binary_absent'] and (
+                    r['annotation_class']=='coding' or args.include_nearby): patterns[r['target']].add(r['pattern'])
+        pairs = defaultdict(set)
+        for a,b in COMPARISONS:
+            for u,v in itertools.product(patterns[a],patterns[b]): pairs[tuple(sorted((u,v)))].add(a+'--'+b)
+        # Validate every requested saved result BEFORE replacing any report.
+        for u,v in pairs:
+            row = db.execute('SELECT result FROM fits WHERE u=? AND v=?',(u,v)).fetchone()
+            if row is None: raise ValueError(f'Fit {u},{v} is not saved; report-only cannot calculate it')
+            json.loads(row[0])
+        candidates = [args.work] if args.work else [args.results/'.kovar_work',Path(identity.get('work_directory','/not-found'))]
+        args.work = next((p.resolve() for p in candidates if p and (p/'work.sqlite').is_file()),None)
+        try:
+            if args.work: source = read_only(args.work/'work.sqlite')
+        except sqlite3.DatabaseError as error:
+            log(args.out,'WARNING: cannot open original checkpoint: '+str(error))
+        log(args.out,f'report-only: {len(pairs):,} saved target fits; no mapping, null fitting or beta fitting')
+        reuse = dict(policy=state.get('original_nulls','auto'),enabled=None,
+                     saved_fit_environment={k:state[k] for k in ('numpy','scipy','null_source_sha256')})
+        summary = render_reports(args,db,source,info,identity,rows,pairs,reuse)
+        summary.update(report_only=True,source_results=str(args.results),source_work=str(args.work),source_modified=False)
+        atomic_json(args.out/'summary.json',summary)
+        log(args.out,'reports recovered: '+str(args.out/'pair_comparison.tsv'))
+    finally:
+        if db: db.close()
+        if source: source.close()
+        lock.close()
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--results',type=Path,required=True)
     p.add_argument('--work',type=Path)
-    p.add_argument('--fasta',type=Path,required=True)
-    p.add_argument('--unitigs',type=Path,required=True)
-    p.add_argument('--panaroo',type=Path,required=True)
+    p.add_argument('--fasta',type=Path)
+    p.add_argument('--unitigs',type=Path)
+    p.add_argument('--panaroo',type=Path)
     p.add_argument('--gff-dir',type=Path)
     p.add_argument('--bakta',type=Path)
-    p.add_argument('--map-dir',type=Path,required=True)
+    p.add_argument('--map-dir',type=Path)
     p.add_argument('--out',type=Path,required=True)
     p.add_argument('--threads',type=int,default=4)
     p.add_argument('--nearby-bp',type=int,default=500)
@@ -547,7 +676,13 @@ def main(argv=None):
     p.add_argument('--max-pairs',type=int,default=10000)
     p.add_argument('--original-nulls',choices=['auto','require'],default='auto',
                    help='require: reuse original nulls across library versions when fitting code matches; never refit missing nulls')
+    p.add_argument('--report-only',action='store_true',help='Export saved diagnostic fits only; tolerate unreadable original comparisons, never fit')
     args = p.parse_args(argv)
+    args.results,args.out = args.results.resolve(),args.out.resolve()
+    if args.report_only:
+        return report_saved(args)
+    if not all((args.fasta,args.unitigs,args.panaroo,args.map_dir)):
+        p.error('--fasta, --unitigs, --panaroo and --map-dir required unless --report-only')
     if min(args.threads,args.seed_k,args.max_pairs)<1 or args.nearby_bp<0:
         p.error('Positive threads/seed/max-pairs and nonnegative nearby-bp required')
     args.results,args.out = args.results.resolve(),args.out.resolve()

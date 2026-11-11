@@ -122,6 +122,33 @@ Outputs are:
 - `summary.json`, `progress.log`, `diagnosis.sqlite`, `diagnosis_identity.json`
   and diagnostic `null_models/`: interpretation, progress and resume state.
 
+### Recover reports after the original checkpoint becomes unreadable
+
+If all target fits were saved before a historical-comparison error, regenerate
+the reports from the existing diagnostic output:
+
+```bash
+python benchmarks/diagnose_amr_targets.py \
+  --results /path/to/discovery/results \
+  --out /path/to/diagnostics/amr_targets --report-only
+```
+
+The host runner also accepts `--report-only` after the species name. This mode
+reads the saved diagnostic identity, target mapping and committed fits. It does
+not remap sequences, load genotype arrays or fit null/alternative models. It
+stops if any required diagnostic fit is missing. Keep `diagnosis.sqlite`,
+`diagnosis_identity.json` and `target_unitigs.tsv` together.
+
+Reports normally compare against the original checkpoint read-only. If any
+targeted SQLite read fails, all partial checkpoint comparisons are discarded;
+the helper streams `associations.tsv.gz` instead. Exported significant pairs
+retain their recorded values and distances. A pair absent from this export is
+labelled **unavailable**, never unqueried or nonsignificant. Missing distances
+remain unknown. `old_comparison_source` and `summary.json` record the source
+and read errors. Missing or incompatible original provenance disables historical
+comparison while preserving the saved diagnostic results. This fallback does
+not repair the original checkpoint or establish that its other data are intact.
+
 The original all-pattern Bonferroni family stays fixed. Do not correct only for
 these two chosen gene comparisons or select a favourable unitig post hoc and
 call it a gene-level result. If the cell-count gate is later changed in a full
