@@ -153,3 +153,7 @@ The original all-pattern Bonferroni family stays fixed. Do not correct only for
 these two chosen gene comparisons or select a favourable unitig post hoc and
 call it a gene-level result. If the cell-count gate is later changed in a full
 search, keep that search separate while reusing compatible preparation/nulls.
+
+To compare the same frozen vectors with pyseer's linear mixed model, use the
+[matched pyseer comparison](amr_pyseer_comparison.md). It reuses this diagnostic's
+saved scores and does not access the original decisions database.

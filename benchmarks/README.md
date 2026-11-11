@@ -12,6 +12,7 @@ the repository root with KOVAR importable. Store results outside this source tre
 | Full vs warm/score beta | `python benchmarks/beta_benchmark.py` | beta_results.tsv, beta_summary.json, plots |
 | Full-refit eigensolvers | `python benchmarks/beta_eigensolver_benchmark.py` | eigensolver_results.tsv, eigensolver_summary.json, plots |
 | Progress of a discovery run | `python benchmarks/inspect_discovery.py` | read-only snapshots and ETA comparisons |
+| Matched AMR target pairs: pyseer LMM versus saved KOVAR scores | `python benchmarks/diagnose_amr_pyseer.py` | [comparison, thresholds and resume](../docs/amr_pyseer_comparison.md) |
 | Completed discovery to functional covariation map | `python benchmarks/functional_map.py` | annotated HTML/PNG/SVG, gene tables and unitig-support audit |
 | Check mapping/eggNOG/plot environment and run the map | `ROOT=/project bash benchmarks/run_functional_map.sh SPECIES` | map_environment.json; CHECK_ONLY/SMOKE_TEST controls |
 | Publication overview and focal neighbourhoods | `python benchmarks/paper_plots.py` | editable SVG/PNG, component/function summaries and captions |
