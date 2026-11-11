@@ -4,6 +4,9 @@ This diagnostic asks whether pyseer's linear mixed model detects associations
 among the **same binary vectors** used in the completed KOVAR AMR diagnosis.
 It does not recreate GOLD-GWAS's 806-isolate SCCmec-carriage analysis.
 
+To test an assembly-level SCCmec carriage response against graR/sen predictors,
+use the [SCCmec fixed-response workflow](sccmec_pyseer.md).
+
 ## Run
 
 Use a Python environment containing pyseer, NumPy, pandas, SciPy and pyseer's
