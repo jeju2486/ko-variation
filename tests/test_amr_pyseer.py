@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from benchmarks import diagnose_amr_pyseer as script
+from benchmarks import amr_checks as script
 
 
 class PyseerDiagnosisTests(unittest.TestCase):
@@ -46,7 +46,7 @@ class PyseerDiagnosisTests(unittest.TestCase):
             args = ['--diagnosis', str(diag), '--work', str(work), '--out', str(out), '--threads', '2']
             original_hashes = {p: script.digest(p) for d in (work, diag) for p in d.iterdir()}
             with patch.object(Path, 'is_relative_to', side_effect=AttributeError('Python 3.8'), create=True):
-                script.main(args)
+                script.run_pyseer(args)
             rows = script.read_table(out/'pyseer_comparison.tsv')
             self.assertEqual(len(rows), 3)
             phenotype = pd.Series(matrix[2].astype(float), index=[f's{i}' for i in range(80)])
@@ -58,7 +58,7 @@ class PyseerDiagnosisTests(unittest.TestCase):
             self.assertTrue(all(r['lmm_status'] == 'OK' for r in rows))
             checkpoint = script.digest(out/'pyseer_comparison.tsv')
             with patch.object(script, 'fit_response', side_effect=AssertionError('Unexpected refit')):
-                script.main(args)
+                script.run_pyseer(args)
             self.assertEqual(script.digest(out/'pyseer_comparison.tsv'), checkpoint)
             self.assertEqual(json.loads((out/'summary.json').read_text())['resumed_response_models'], 2)
             self.assertTrue(all(script.digest(p) == sha for p, sha in original_hashes.items()))
@@ -71,7 +71,7 @@ class PyseerDiagnosisTests(unittest.TestCase):
             rows[0]['n11'] = int(rows[0]['n11']) + 1
             script.table(diag/'pair_comparison.tsv', rows, list(rows[0]))
             with self.assertRaisesRegex(ValueError, 'do not reproduce the saved cells'):
-                script.main(['--diagnosis', str(diag), '--work', str(work), '--out', str(root/'output')])
+                script.run_pyseer(['--diagnosis', str(diag), '--work', str(work), '--out', str(root/'output')])
 
 
 if __name__ == '__main__':

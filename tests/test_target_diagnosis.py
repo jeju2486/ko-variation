@@ -12,8 +12,9 @@ from unittest.mock import patch
 
 import numpy as np
 
-from benchmarks import diagnose_amr_targets as diagnostic
-from benchmarks.diagnose_amr_targets import main, identify, identify_all, original_reuse, response_null
+from benchmarks import amr_checks as diagnostic
+diagnostic.load_kovar()
+from benchmarks.amr_checks import run_kovar as main, identify, identify_all, original_reuse, response_null
 from ko_variation.discovery import main as discover
 from ko_variation.discovery_store import digest
 
@@ -57,7 +58,7 @@ class TargetDiagnosisTests(unittest.TestCase):
             db.executescript('CREATE TABLE null_aliases(pid,canonical); CREATE TABLE null_inventory(pid,source); '
                              'CREATE TABLE external_nulls(pid,path);')
             state = dict(work=root,out=root,source=db,response=None,reuse={'enabled':True,'policy':'require'})
-            with patch.dict(diagnostic._WORKER,state,clear=True), patch.object(diagnostic,'fit_null_glmm') as fit:
+            with patch.dict(diagnostic._KOVAR_WORKER,state,clear=True), patch.object(diagnostic,'fit_null_glmm') as fit:
                 with self.assertRaisesRegex(ValueError,'no refit performed'):
                     response_null(5)
                 fit.assert_not_called()
@@ -125,8 +126,17 @@ class TargetDiagnosisTests(unittest.TestCase):
             self.assertEqual(gra['beta_status'],'OK')
             self.assertEqual(gra['null_origin'],'original_null_cache')
             checkpoint = (root/'diagnosis/pair_comparison.tsv').read_bytes()
-            main(args)
+            # A pure script consolidation must preserve the old identity bytes:
+            # the downstream pyseer checkpoint hashes this exact manifest.
+            manifest = root/'diagnosis/diagnosis_identity.json'
+            legacy = json.loads(manifest.read_text())
+            legacy['script_sha256'] = '485d44a0616e1518d9d6233d09ba2db32a33c7a3672f039a175cb6109cbe5e14'
+            manifest.write_text(json.dumps(legacy, indent=2))
+            manifest_bytes = manifest.read_bytes()
+            with patch.object(diagnostic,'calculate_pair',side_effect=AssertionError('Unexpected refit')):
+                main(args)
             self.assertEqual((root/'diagnosis/pair_comparison.tsv').read_bytes(),checkpoint)
+            self.assertEqual(manifest.read_bytes(),manifest_bytes)
             self.assertTrue(all(p.exists() and digest(p)==sha for p,sha in before.items()))
 
             # Simulate the preceding helper after it fitted diagnostic nulls.

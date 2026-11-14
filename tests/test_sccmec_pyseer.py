@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from benchmarks import sccmec_pyseer as script
+from benchmarks import amr_checks as script
 
 
 class SccmecPyseerTests(unittest.TestCase):
@@ -27,16 +27,16 @@ class SccmecPyseerTests(unittest.TestCase):
             root = Path(temp)
             gff = root/'sample.gff'
             gff.write_text('##gff-version 3\n##FASTA\n>ctg\nACGTTGCA\n')
-            original = script.common.digest(gff)
+            original = script.digest(gff)
             job = (0, 'sample', gff, 'embedded_gff_fasta', root/'output', 'sccmec', {})
             def run(command, **kwargs):
                 source = Path(command[command.index('--input')+1])
                 self.assertEqual(source.read_text(), '>ctg\nACGTTGCA\n')
                 folder = Path(command[command.index('--outdir')+1])
-                script.common.table(folder/'isolate.tsv',
+                script.table(folder/'isolate.tsv',
                     [dict(sample='isolate', mecA='+', type='IV', subtype='IVa', regions='IVa', targets='mecA,ccrA2')],
                     ['sample', 'mecA', 'type', 'subtype', 'regions', 'targets'])
-                script.common.table(folder/'isolate.targets.details.tsv', [{'targets': 'mecA,ccrA2'}], ['targets'])
+                script.table(folder/'isolate.targets.details.tsv', [{'targets': 'mecA,ccrA2'}], ['targets'])
                 return subprocess.CompletedProcess(command, 0)
             with patch.object(script.subprocess, 'run', side_effect=run) as process:
                 first = script.classify(job)
@@ -45,7 +45,7 @@ class SccmecPyseerTests(unittest.TestCase):
             self.assertEqual(first['SCCmec_present'], 1)
             self.assertTrue(second['reused'])
             self.assertFalse((root/'output/isolates/000000/embedded_input.fna').exists())
-            self.assertEqual(script.common.digest(gff), original)
+            self.assertEqual(script.digest(gff), original)
 
     def test_fixed_response_sample_subsetting_actual_lmm_and_resume(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -63,14 +63,14 @@ class SccmecPyseerTests(unittest.TestCase):
             for sample in samples:
                 (assemblies/(sample+'.fna')).write_text('>ctg\nACGTTGCA\n')
             info = dict(n=40, samples=samples, patterns=3, packed_width=5,
-                        products={k: script.common.digest(work/k) for k in ('patterns.bin', 'K.npy')})
-            script.common.atomic_json(diag/'diagnosis_identity.json',
+                        products={k: script.digest(work/k) for k in ('patterns.bin', 'K.npy')})
+            script.atomic_json(diag/'diagnosis_identity.json',
                 dict(prepared=info, source_identity=dict(settings={'alpha': .05}, work_directory=str(work))))
             rows = [dict(target=t, pattern=i, unitig=i, annotation_class='coding',
                          n_matching_references_binary_absent=0, clusters=t)
                     for i, t in enumerate(('mecA', 'graR', 'sen'))]
-            script.common.table(diag/'target_unitigs.tsv', rows, list(rows[0]))
-            original = {p: script.common.digest(p) for d in (work, diag, assemblies) for p in d.iterdir()}
+            script.table(diag/'target_unitigs.tsv', rows, list(rows[0]))
+            original = {p: script.digest(p) for d in (work, diag, assemblies) for p in d.iterdir()}
             out = root/'result'
             args = ['--diagnosis', str(diag), '--work', str(work), '--assemblies', str(assemblies),
                     '--out', str(out), '--threads', '2']
@@ -84,16 +84,16 @@ class SccmecPyseerTests(unittest.TestCase):
                     patch.object(script.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'mock-typing-v1', '')), \
                     patch.object(script, 'classify', side_effect=calls), \
                     patch.object(Path, 'is_relative_to', side_effect=AttributeError('Python 3.8'), create=True):
-                script.main(args)
-                main_hash = script.common.digest(out/'SCCmec/associations.tsv')
+                script.run_sccmec(args)
+                main_hash = script.digest(out/'SCCmec/associations.tsv')
                 with patch('pyseer.lmm.initialise_lmm', side_effect=AssertionError('Unexpected refit')):
-                    script.main(args)
-            self.assertEqual(script.common.digest(out/'SCCmec/associations.tsv'), main_hash)
+                    script.run_sccmec(args)
+            self.assertEqual(script.digest(out/'SCCmec/associations.tsv'), main_hash)
             summary = json.loads((out/'summary.json').read_text())
             primary, sensitivity = summary['phenotypes']
             self.assertEqual((primary['n'], primary['positive'], primary['negative'], primary['excluded']), (38, 19, 19, 2))
             self.assertEqual((sensitivity['n'], sensitivity['positive']), (40, 20))
-            results = script.common.read_table(out/'SCCmec/associations.tsv')
+            results = script.read_table(out/'SCCmec/associations.tsv')
             self.assertEqual({r['response'] for r in results}, {'SCCmec'})
             self.assertEqual({r['targets'] for r in results}, {'graR', 'sen'})
             self.assertTrue(all(r['status'] == 'OK' for r in results))
@@ -103,7 +103,7 @@ class SccmecPyseerTests(unittest.TestCase):
             actual = pd.read_csv(out/'SCCmec/covariance.tsv', sep='\t', index_col=0)
             self.assertEqual(list(actual.index), [samples[i] for i in kept])
             np.testing.assert_allclose(actual.to_numpy(), K[np.ix_(kept, kept)])
-            self.assertTrue(all(script.common.digest(p) == sha for p, sha in original.items()))
+            self.assertTrue(all(script.digest(p) == sha for p, sha in original.items()))
 
 
 if __name__ == '__main__':
