@@ -7,6 +7,7 @@ sccmec:  optionally compare assembly-level carriage with the saved patterns.
 
 Numerical models, response orientation and output schemas are unchanged.
 Each command can run in its own Python environment and reuses its saved output.
+Standalone inputs are prepared locally; --results optionally compares an older run.
 Source discovery results are read-only. See docs/amr_checks.md.
 """
 from __future__ import annotations
@@ -23,6 +24,7 @@ import json
 import math
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import re
 import shutil
 import sqlite3
@@ -97,6 +99,7 @@ TARGETS = ('mecA', 'graR', 'sen', 'tetM', 'tetK')
 COMPARISONS = (('mecA', 'graR'), ('mecA', 'sen'))
 _KOVAR_WORKER = {}
 PRE_REUSE_POLICY_HASHES = {'485d44a0616e1518d9d6233d09ba2db32a33c7a3672f039a175cb6109cbe5e14',
+                         'd488342eb7aa7a21329561ebe9d1faf0ea7da6951399b858c2707bcbf3dcaee4',
                          '32713cfea041024439ba915315416df6ba9369f7942c63643ee072f752756391',
                          'da44d07dda016adf80e83f66fbcf8a3760d1c1d7cb8ed0e0655bde78027e85e3',
                          'c9d289ff3db52df7f743b1a652faa05937f070e2441df12022300aec4d226c64',
@@ -189,16 +192,17 @@ def prepare_regions(args, db, info, refs):
     if get(db, 'regions_complete'):
         return
     members = defaultdict(lambda: defaultdict(list))
-    with args.panaroo.open(encoding='utf-8-sig', newline='') as stream:
-        reader = csv.DictReader(stream)
-        if not {'Gene', 'Annotation'}.issubset(reader.fieldnames or []):
-            raise ValueError('Use Panaroo gene_presence_absence_roary.csv with Gene and Annotation columns')
-        for row in reader:
-            targets = identify_all(row['Gene']+';'+row.get('Non-unique Gene name', ''), row['Annotation'])
-            if targets:
-                for sample in refs:
-                    for feature in filter(None, re.split(r';|\t', row.get(sample, ''))):
-                        members[sample][feature].extend((target, row['Gene']) for target in targets)
+    if args.panaroo:
+        with args.panaroo.open(encoding='utf-8-sig', newline='') as stream:
+            reader = csv.DictReader(stream)
+            if not {'Gene', 'Annotation'}.issubset(reader.fieldnames or []):
+                raise ValueError('Use Panaroo gene_presence_absence_roary.csv with Gene and Annotation columns')
+            for row in reader:
+                targets = identify_all(row['Gene']+';'+row.get('Non-unique Gene name', ''), row['Annotation'])
+                if targets:
+                    for sample in refs:
+                        for feature in filter(None, re.split(r';|\t', row.get(sample, ''))):
+                            members[sample][feature].extend((target, row['Gene']) for target in targets)
     done = set(get(db, 'reference_samples_done', []))
     for index, (sample, (gff, fasta)) in enumerate(refs.items(), 1):
         if sample in done:
@@ -323,15 +327,15 @@ def locus_report(args, db, source, info):
         record['clusters'].add(cluster); record['samples'].add(sample)
         record['coding'] |= coding; record['nearby'] |= not coding
     old_status = {}
-    status_file = args.map_dir/'annotation/annotation_status.tsv'
-    if status_file.is_file():
+    status_file = args.map_dir/'annotation/annotation_status.tsv' if args.map_dir else None
+    if status_file and status_file.is_file():
         with status_file.open(encoding='utf-8-sig') as stream:
             for row in csv.DictReader(stream, delimiter='\t'):
                 uid = int(row['locus'])
                 if uid in hits: old_status[uid] = row
     map_genes = set()
-    nodes = args.map_dir/'map.nodes.tsv'
-    if nodes.is_file():
+    nodes = args.map_dir/'map.nodes.tsv' if args.map_dir else None
+    if nodes and nodes.is_file():
         with nodes.open(encoding='utf-8-sig') as stream:
             map_genes = {row['gene'] for row in csv.DictReader(stream, delimiter='\t')}
     rows, coding = [], defaultdict(set)
@@ -356,9 +360,9 @@ def locus_report(args, db, source, info):
                 n_matching_references_binary_absent=disagreements,
                 n_target_names_for_unitig=len(targets), match='FULL_LENGTH_EXACT_IN_TARGET_REFERENCE',
                 uniqueness='NOT_A_GENOME_WIDE_UNIQUENESS_TEST',
-                original_annotation_status=status.get('status', 'NOT_IN_SELECTED_ANNOTATION'),
+                original_annotation_status=status.get('status', 'NOT_IN_SELECTED_ANNOTATION' if args.map_dir else 'NOT_CHECKED_NO_MAP'),
                 original_annotation_gene=status.get('gene', ''),
-                any_cluster_in_map=int(bool(evidence['clusters'] & map_genes))))
+                any_cluster_in_map=int(bool(evidence['clusters'] & map_genes)) if args.map_dir else None))
     table(args.out/'target_unitigs.tsv', rows, ['target','unitig','pattern','n_present','n_samples','maf','original_locus_status',
         'passes_original_locus_filter','annotation_class','clusters','n_matching_references','n_matching_references_binary_absent',
         'n_target_names_for_unitig','match','uniqueness','original_annotation_status',
@@ -384,9 +388,13 @@ def original_reuse(identity, policy):
                 (('numpy',np.__version__),('scipy',scipy.__version__))}
     same_model = identity.get('null_model_source_sha256') == null_source_hash()
     same_versions = all(v['original']==v['current'] for v in versions.values())
+    standalone = identity.get('kind') == 'standalone'
+    if standalone and policy == 'require':
+        raise ValueError('Standalone input has no original nulls; omit --original-nulls require')
     if policy=='require' and not same_model:
         raise ValueError('Original-null reuse refused: null-fitting code differs; library-only override cannot bypass this')
-    return dict(policy=policy, enabled=same_model and (same_versions or policy=='require'),
+    return dict(policy=policy, enabled=not standalone and same_model and (same_versions or policy=='require'),
+                standalone=standalone,
                 fitting_code_matches=same_model, library_versions_match=same_versions, versions=versions)
 
 
@@ -439,7 +447,8 @@ def response_null(response):
             raise ValueError(f'Original null cache not found for response {response} (canonical {canonical}); '
                              f'no refit performed. Searched: {[str(p) for p in candidates]}')
     if record is None:
-        reason = ('original cache not found' if s['reuse']['enabled'] else
+        reason = ('standalone input: no original null model' if s['reuse'].get('standalone') else
+                  'original cache not found' if s['reuse']['enabled'] else
                   'reuse disabled: null-fitting code differs' if not s['reuse']['fitting_code_matches'] else
                   'reuse disabled: NumPy/SciPy versions differ')
         print(f'[AMR diagnosis worker] fitting diagnostic null {response}; {reason}', flush=True)
@@ -513,6 +522,10 @@ def historical_comparison(args, source, pairs, rows, identity):
     is never evidence of no query, no beta attempt or nonsignificance.
     """
     old, distances, errors = {}, {}, []
+    if identity.get('kind') == 'standalone':
+        return old, distances, dict(mode='standalone', errors=[], reason='No historical discovery run supplied')
+    if args.results is None:
+        return old, distances, dict(mode='unavailable', errors=['No --results supplied for historical comparison'])
     try:
         current = json.loads((args.results/'run_identity.json').read_text())
         if any(current.get(k)!=identity.get(k) for k in ('inputs','settings','null_model_source_sha256')):
@@ -617,8 +630,9 @@ def render_reports(args, db, source, info, identity, rows, pairs, reuse):
         r = json.loads(saved[0])
         old = baseline.get((u,v),dict(status='SHARED_EXACT_PATTERN' if u==v else
             'UNAVAILABLE_NOT_IN_SIGNIFICANT_EXPORT' if comparison['mode']=='significant_export' else
+            'NOT_APPLICABLE_STANDALONE' if comparison['mode']=='standalone' else
             'UNAVAILABLE_ORIGINAL_COMPARISON',final=None,p=None,lower=None,upper=None,beta=None,
-            beta_status='UNAVAILABLE_ORIGINAL_COMPARISON',source='UNAVAILABLE'))
+            beta_status='NOT_APPLICABLE_STANDALONE' if comparison['mode']=='standalone' else 'UNAVAILABLE_ORIGINAL_COMPARISON',source='UNAVAILABLE'))
         lo,hi = old['lower'],old['upper']
         r.update(target_pairs=';'.join(sorted(labels)), original_min_cell=old_min, new_min_cell=new_min,
             eligible_original=int(u!=v and r['min_cell']>=old_min), eligible_new=int(u!=v and r['min_cell']>=new_min),
@@ -641,7 +655,7 @@ def render_reports(args, db, source, info, identity, rows, pairs, reuse):
         for r in unitig_pair_rows(rows,args.include_nearby):
             old = distances.get(tuple(sorted((r['unitig_a'],r['unitig_b']))))
             yield dict(r,distance=old[0] if old else None,connected_genomes=old[1] if old else None,
-                distance_status=old[2] if old else 'NOT_CALCULATED' if comparison['mode']=='original_sqlite'
+                distance_status=old[2] if old else 'NOT_CALCULATED' if comparison['mode'] in ('original_sqlite','standalone')
                 else 'UNKNOWN_ORIGINAL_COMPARISON_UNAVAILABLE')
     table(args.out/'unitig_pair_evidence.tsv.gz',evidence(),['target_a','target_b','unitig_a','unitig_b',
         'pattern_a','pattern_b','class_a','class_b','clusters_a','clusters_b','distance','connected_genomes','distance_status'])
@@ -683,7 +697,8 @@ def report_saved(args):
             row = db.execute('SELECT result FROM fits WHERE u=? AND v=?',(u,v)).fetchone()
             if row is None: raise ValueError(f'Fit {u},{v} is not saved; report-only cannot calculate it')
             json.loads(row[0])
-        candidates = [args.work] if args.work else [args.results/'.kovar_work',Path(identity.get('work_directory','/not-found'))]
+        candidates = [args.work] if args.work else ([args.results/'.kovar_work'] if args.results else []) + [
+            args.out/'.inputs', Path(identity.get('work_directory','/not-found'))]
         args.work = next((p.resolve() for p in candidates if p and (p/'work.sqlite').is_file()),None)
         try:
             if args.work: source = read_only(args.work/'work.sqlite')
@@ -693,7 +708,8 @@ def report_saved(args):
         reuse = dict(policy=state.get('original_nulls','auto'),enabled=None,
                      saved_fit_environment={k:state[k] for k in ('numpy','scipy','null_source_sha256')})
         summary = render_reports(args,db,source,info,identity,rows,pairs,reuse)
-        summary.update(report_only=True,source_results=str(args.results),source_work=str(args.work),source_modified=False)
+        summary.update(report_only=True,source_results=str(args.results) if args.results else None,
+                       source_work=str(args.work),source_modified=False)
         atomic_json(args.out/'summary.json',summary)
         log_kovar(args.out,'reports recovered: '+str(args.out/'pair_comparison.tsv'))
     finally:
@@ -702,12 +718,163 @@ def report_saved(args):
         lock.close()
 
 
+def standalone_inputs(args, work):
+    """Recover row IDs without changing a single unitig column; root a local tree."""
+    from Bio import Phylo
+    names = []
+    with args.fasta.open() as stream:
+        for line in stream:
+            if line.startswith('>'):
+                names.append(line[1:].split()[0])
+    if args.sample_ids:
+        names = [line.strip() for line in args.sample_ids.read_text().splitlines() if line.strip()]
+    elif args.assemblies_list:
+        if not (args.gfa and args.cuttlefish_json):
+            raise ValueError('--assemblies-list needs --gfa and --cuttlefish-json to verify original row order')
+        assemblies = [line.strip() for line in args.assemblies_list.read_text().splitlines() if line.strip()]
+        recorded = json.loads(args.cuttlefish_json.read_text())['parameters info']['input']
+        if isinstance(recorded, str):
+            recorded = [x.strip() for x in recorded.split(',')]
+        if recorded != assemblies:
+            raise ValueError('Cuttlefish JSON input order differs from assemblies_list.txt')
+        names = [re.sub(r'\.(?:fasta|fna|fas|fa)(?:\.gz)?$', '', Path(x).name, flags=re.I) for x in assemblies]
+        references, seen = [], set()
+        with args.gfa.open() as stream:
+            for line in stream:
+                if line.startswith('P\t'):
+                    match = re.search(r'Reference:(\d+)_Sequence:', line.split('\t', 2)[1])
+                    if not match:
+                        raise ValueError('Unexpected GFA path name; provide an explicit --sample-ids row list')
+                    reference = int(match.group(1))
+                    if reference not in seen:
+                        references.append(reference); seen.add(reference)
+        if references not in (list(range(len(names))), list(range(1, len(names)+1))):
+            raise ValueError('GFA references do not follow contiguous input order; provide --sample-ids')
+    if not names or len(names) != len(set(names)) or any(not x or any(c.isspace() for c in x) for x in names):
+        raise ValueError('FASTA has repeated/non-sample headers. Supply --sample-ids in FASTA row order, '
+                         'or --assemblies-list, --gfa and --cuttlefish-json')
+    fasta = work/'sample_ids.fasta'
+    index = 0
+    temporary = fasta.with_suffix('.partial')
+    with args.fasta.open() as source, temporary.open('w') as output:
+        for line in source:
+            if line.startswith('>'):
+                if index >= len(names):
+                    raise ValueError('More FASTA records than supplied sample IDs')
+                output.write('>'+names[index]+'\n'); index += 1
+            else:
+                output.write(line)
+    if index != len(names):
+        raise ValueError('FASTA record count differs from sample ID count')
+    temporary.replace(fasta)
+    excluded = {x.strip() for x in args.exclude_samples.read_text().splitlines() if x.strip()} if args.exclude_samples else set()
+    if excluded-set(names):
+        raise ValueError('Excluded sample IDs are absent from the FASTA')
+    tree = Phylo.read(args.tree, 'newick')
+    tips = [tip.name for tip in tree.get_terminals()]
+    if None in tips or len(tips) != len(set(tips)):
+        raise ValueError('Tree tips must have unique sample IDs')
+    desired = set(names)-excluded
+    missing = desired-set(tips)
+    if missing and args.tree_missing_samples == 'error':
+        raise ValueError(f'{len(missing)} FASTA samples absent from tree; examples: {sorted(missing)[:5]}')
+    keep = desired & set(tips)
+    if len(keep) < 4:
+        raise ValueError('At least four matched samples are required')
+    for tip in list(tree.get_terminals()):
+        if tip.name not in keep:
+            tree.prune(tip)
+    if args.tree_rooting == 'midpoint':
+        tree.root_at_midpoint()
+    rooted = work/'analysis.treefile'
+    temporary = rooted.with_suffix('.partial')
+    Phylo.write(tree, temporary, 'newick', format_branch_length='%0.15g')
+    temporary.replace(rooted)
+    table(work/'sample_mapping.tsv',
+          (dict(row=i, sample=s, retained=int(s in keep)) for i, s in enumerate(names)), ['row', 'sample', 'retained'])
+    return fasta, rooted
+
+
+def prepare_standalone(args):
+    """Build this check's own patterns/K; never launch a whole-pangenome search."""
+    from ko_variation.discovery_store import connect, prepare
+    from ko_variation import discovery_store, kinship
+    if args.work:
+        raise ValueError('--work imports existing inputs; omit it for a standalone run')
+    work = args.out/'.inputs'
+    work.mkdir(parents=True, exist_ok=True)
+    configuration = dict(inputs={name: digest(getattr(args, name)) for name in
+        ('fasta', 'unitigs', 'tree', 'sample_ids', 'assemblies_list', 'gfa', 'cuttlefish_json', 'exclude_samples')
+        if getattr(args, name)}, min_maf=args.min_maf, tree_rooting=args.tree_rooting,
+        tree_missing_samples=args.tree_missing_samples, alpha=args.alpha, min_cell_count=args.min_cell_count,
+        bonferroni_tests=args.bonferroni_tests, numpy=np.__version__, scipy=scipy.__version__,
+        null_model_source_sha256=null_source_hash(),
+        preparation_sources={m.__name__: digest(Path(m.__file__)) for m in (discovery_store, kinship)})
+    lock = sqlite3.connect(work/'preparation.lock.sqlite', timeout=0)
+    db = None
+    try:
+        lock.execute('BEGIN EXCLUSIVE')
+        manifest = work/'standalone_identity.json'
+        if manifest.exists() and json.loads(manifest.read_text()) != configuration:
+            raise ValueError('Standalone inputs/model/settings changed; choose another --out')
+        if not manifest.exists():
+            atomic_json(manifest, configuration)
+        files = work/'input_files.json'
+        if files.exists():
+            products = json.loads(files.read_text())
+            if any(digest(work/name) != sha for name, sha in products.items()):
+                raise ValueError('Prepared standalone FASTA/tree/sample mapping changed')
+            fasta, tree = work/'sample_ids.fasta', work/'analysis.treefile'
+        else:
+            fasta, tree = standalone_inputs(args, work)
+            atomic_json(files, {p.name: digest(p) for p in (fasta, tree, work/'sample_mapping.tsv')})
+        prep = SimpleNamespace(fasta=fasta, tree=tree, unitigs=args.unitigs, exclude_samples=args.exclude_samples,
+            min_maf=args.min_maf, tree_missing_samples=args.tree_missing_samples,
+            memory_gb=args.memory_gb, threads=args.threads)
+        db = connect(work/'work.sqlite')
+        db.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+        info = prepare(prep, db, work)
+        family = math.comb(info['patterns'], 2)
+        if args.bonferroni_tests is not None:
+            if args.bonferroni_tests < family:
+                raise ValueError('--bonferroni-tests cannot be smaller than all retained pattern pairs')
+            family = args.bonferroni_tests
+        identity = dict(kind='standalone', work_directory=str(work.resolve()),
+            inputs=dict(fasta=digest(fasta), tree=digest(tree), unitigs=digest(args.unitigs)),
+            settings=dict(alpha=args.alpha, min_maf=args.min_maf, min_cell_count=args.min_cell_count,
+                          bonferroni_tests=family),
+            numpy=np.__version__, scipy=scipy.__version__, null_model_source_sha256=null_source_hash())
+        if not (work/'run_identity.json').exists():
+            atomic_json(work/'run_identity.json', identity)
+        args.fasta = fasta
+        args.work = work.resolve()
+        log_kovar(args.out, f'standalone inputs: {info["n"]:,} samples; {info["patterns"]:,} unique patterns; '
+                  f'Bonferroni family={family:,}; nulls fitted only for requested target tests')
+        return info, identity
+    finally:
+        if db is not None: db.close()
+        lock.close()
+
+
 def run_kovar(argv=None):
-    p = argparse.ArgumentParser(prog="amr_checks.py kovar", description="Audit and score the existing KOVAR target pairs.")
-    p.add_argument('--results',type=Path,required=True)
+    p = argparse.ArgumentParser(prog="amr_checks.py kovar", description="Assign target unitigs and run KOVAR from upstream files, or compare an existing run.")
+    p.add_argument('--results',type=Path,help='Optional older discovery run; omit for standalone inputs')
     p.add_argument('--work',type=Path)
     p.add_argument('--fasta',type=Path)
     p.add_argument('--unitigs',type=Path)
+    p.add_argument('--tree',type=Path,help='Required for standalone phylogenetic adjustment')
+    p.add_argument('--sample-ids',type=Path,help='One sample ID per FASTA row, in original row order')
+    p.add_argument('--assemblies-list',type=Path,help='Original Cuttlefish input list; verify with GFA/JSON')
+    p.add_argument('--gfa',type=Path)
+    p.add_argument('--cuttlefish-json',type=Path)
+    p.add_argument('--tree-rooting',choices=['midpoint','as-is'],default='midpoint')
+    p.add_argument('--tree-missing-samples',choices=['error','drop'],default='error')
+    p.add_argument('--exclude-samples',type=Path)
+    p.add_argument('--min-maf',type=float,default=.05)
+    p.add_argument('--min-cell-count',type=int,default=20,help='Baseline cell gate; the 2%%/10 gate is also reported')
+    p.add_argument('--alpha',type=float,default=.05)
+    p.add_argument('--bonferroni-tests',type=int)
+    p.add_argument('--memory-gb',type=float)
     p.add_argument('--panaroo',type=Path)
     p.add_argument('--gff-dir',type=Path)
     p.add_argument('--bakta',type=Path)
@@ -723,24 +890,31 @@ def run_kovar(argv=None):
     p.add_argument('--report-only',action='store_true',help='Export saved diagnostic fits only; tolerate unreadable original comparisons, never fit')
     args = p.parse_args(argv)
     load_kovar()
-    args.results,args.out = args.results.resolve(),args.out.resolve()
+    args.out = args.out.resolve()
+    if args.results: args.results = args.results.resolve()
     if args.report_only:
         return report_saved(args)
-    if not all((args.fasta,args.unitigs,args.panaroo,args.map_dir)):
-        p.error('--fasta, --unitigs, --panaroo and --map-dir required unless --report-only')
+    if not all((args.fasta,args.unitigs)) or not (args.gff_dir or args.bakta):
+        p.error('--fasta, --unitigs and --gff-dir or --bakta required unless --report-only')
     if min(args.threads,args.seed_k,args.max_pairs)<1 or args.nearby_bp<0:
         p.error('Positive threads/seed/max-pairs and nonnegative nearby-bp required')
-    args.results,args.out = args.results.resolve(),args.out.resolve()
-    if args.out==args.results or args.results in args.out.parents:
+    if not 0 <= args.min_maf <= .5 or not 0 < args.alpha < 1 or args.min_cell_count < 0:
+        p.error('MAF must be in [0,.5], alpha in (0,1), and cell count nonnegative')
+    if args.results and (args.out==args.results or args.results in args.out.parents):
         p.error('Diagnostic output must be outside the discovery results directory')
-    identity = json.loads((args.results/'run_identity.json').read_text())
+    if args.results:
+        identity = json.loads((args.results/'run_identity.json').read_text())
+        candidates = [args.work] if args.work else [args.results/'.kovar_work',Path(identity.get('work_directory','/not-found'))]
+        args.work = next((w.resolve() for w in candidates if w and (w/'prepared.json').is_file() and (w/'work.sqlite').is_file()),None)
+        if args.work is None: p.error('Frozen .kovar_work required; provide --work if stored elsewhere')
+        info = json.loads((args.work/'prepared.json').read_text())
+    else:
+        if not args.tree: p.error('--tree is required for standalone input')
+        if args.original_nulls == 'require': p.error('Standalone input has no original nulls; use the default auto policy')
+        info, identity = prepare_standalone(args)
     original_reuse(identity,args.original_nulls)
-    candidates = [args.work] if args.work else [args.results/'.kovar_work',Path(identity.get('work_directory','/not-found'))]
-    args.work = next((w.resolve() for w in candidates if w and (w/'prepared.json').is_file() and (w/'work.sqlite').is_file()),None)
-    if args.work is None: p.error('Frozen .kovar_work required; provide --work if stored elsewhere')
     if args.out==args.work or args.work in args.out.parents:
         p.error('Diagnostic output must be outside the source work directory')
-    info = json.loads((args.work/'prepared.json').read_text())
     source = read_only(args.work/'work.sqlite')
     work_identity = json.loads((args.work/'run_identity.json').read_text())
     if any(work_identity.get(k)!=identity.get(k) for k in ('inputs','null_model_source_sha256')):
@@ -763,7 +937,7 @@ def run_kovar(argv=None):
         lock.close()
         raise ValueError('Another diagnostic coordinator is using this output') from error
     state = dict(source_identity=identity,prepared=info,unitigs=stamp(args.unitigs),fasta=stamp(args.fasta),
-        panaroo=stamp(args.panaroo),references={s:[stamp(x) for x in paths if x] for s,paths in refs.items()},
+        panaroo=stamp(args.panaroo) if args.panaroo else None,references={s:[stamp(x) for x in paths if x] for s,paths in refs.items()},
         nearby_bp=args.nearby_bp,seed_k=args.seed_k,include_nearby=args.include_nearby,
         script_sha256=digest(Path(__file__)),null_source_sha256=null_source_hash(),numpy=np.__version__,scipy=scipy.__version__,
         original_nulls=args.original_nulls)
@@ -799,7 +973,7 @@ def run_kovar(argv=None):
         rows, patterns = locus_report(args,db,source,info)
         summary = compare(args,db,source,info,identity,rows,patterns)
         summary.update(missing_reference_samples=missing,scanned_unitigs=get(db,'scan_count'),
-                       source_results=str(args.results),source_work=str(args.work),source_modified=False)
+                       source_results=str(args.results) if args.results else None,source_work=str(args.work),source_modified=False)
         atomic_json(args.out/'summary.json',summary)
         log_kovar(args.out,'complete: '+str(args.out/'pair_comparison.tsv'))
     finally:
@@ -835,6 +1009,14 @@ def pyseer_environment():
                 fastlmm_source_sha256=digest(inspect.getfile(pyseer.fastlmm.lmm_cov)))
 
 
+def find_pattern_work(diagnosis, source):
+    candidates = [diagnosis/'.inputs', Path(source.get('work_directory', '/not-found'))]
+    if source.get('kind') != 'standalone':
+        candidates = [diagnosis.parent.parent/'discovery/results/.kovar_work',
+                      diagnosis.parent.parent/'discovery/.kovar_work'] + candidates
+    return next((p for p in candidates if (p/'patterns.bin').is_file() and (p/'K.npy').is_file()), None)
+
+
 def prepare_pyseer(args, environment):
     diagnosis = json.loads((args.diagnosis/'diagnosis_identity.json').read_text())
     info, source = diagnosis['prepared'], diagnosis['source_identity']
@@ -842,10 +1024,7 @@ def prepare_pyseer(args, environment):
     if not rows:
         raise ValueError('pair_comparison.tsv has no saved diagnostic tests')
     if args.work is None:
-        candidates = [args.diagnosis.parent.parent/'discovery/results/.kovar_work',
-                      args.diagnosis.parent.parent/'discovery/.kovar_work',
-                      Path(source.get('work_directory', '/not-found'))]
-        args.work = next((p for p in candidates if (p/'patterns.bin').is_file() and (p/'K.npy').is_file()), None)
+        args.work = find_pattern_work(args.diagnosis, source)
     if args.work is None:
         raise ValueError('Provide --work /path/to/the/original/.kovar_work (patterns.bin and K.npy required)')
     args.work = args.work.resolve()
@@ -905,7 +1084,7 @@ def prepare_pyseer(args, environment):
     table(args.out/'sample_order.tsv', ({'row': i, 'sample': s} for i, s in enumerate(info['samples'])), ['row', 'sample'])
     import pandas as pd
     pd.DataFrame(K, index=info['samples'], columns=info['samples']).to_csv(
-        args.out/'covariance.tsv', sep='\t', float_format='%.17g')
+        args.out/'covariance.tsv', sep='\t', float_format='%.17e')
     (args.out/'responses').mkdir(exist_ok=True)
     return rows, identity
 
@@ -1160,9 +1339,7 @@ def frozen_inputs(args):
     state = json.loads((args.diagnosis/'diagnosis_identity.json').read_text())
     info, source = state['prepared'], state['source_identity']
     if not args.work:
-        paths = [args.diagnosis.parent.parent/'discovery/results/.kovar_work',
-                 args.diagnosis.parent.parent/'discovery/.kovar_work', Path(source.get('work_directory', '/not-found'))]
-        args.work = next((p for p in paths if (p/'patterns.bin').is_file() and (p/'K.npy').is_file()), None)
+        args.work = find_pattern_work(args.diagnosis, source)
     if not args.work:
         raise ValueError('Set --work to the original .kovar_work containing patterns.bin and K.npy')
     args.work = args.work.resolve()
@@ -1230,7 +1407,7 @@ def phenotype_fit(name, calls, info, source, evidence, vectors, K, args, call_di
     h2 = None
     if testable:
         covariance = K[np.ix_(indices, indices)]
-        pd.DataFrame(covariance, index=samples, columns=samples).to_csv(folder/'covariance.tsv', sep='\t', float_format='%.17g')
+        pd.DataFrame(covariance, index=samples, columns=samples).to_csv(folder/'covariance.tsv', sep='\t', float_format='%.17e')
         log_pyseer(args.out, f'{name}: fixed response; {n} isolates; {int(y.sum())} positive; {n-int(y.sum())} negative')
         p, model, h2 = initialise_lmm(pd.Series(y, index=samples), pd.DataFrame(), str(folder/'covariance.tsv'))
         if list(p.index) != samples or not np.array_equal(p.to_numpy(), y):
@@ -1380,7 +1557,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     for name, description in (
-            ('kovar', 'Existing target mapping, KOVAR scoring and report recovery'),
+            ('kovar', 'Standalone target mapping and KOVAR scoring, or saved-report recovery'),
             ('pyseer', 'Matched pyseer LMM tests of the saved target patterns'),
             ('sccmec', 'Optional assembly-carriage pyseer tests')):
         sub.add_parser(name, help=description, add_help=False)
