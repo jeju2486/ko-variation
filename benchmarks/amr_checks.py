@@ -101,6 +101,7 @@ _KOVAR_WORKER = {}
 PRE_REUSE_POLICY_HASHES = {'485d44a0616e1518d9d6233d09ba2db32a33c7a3672f039a175cb6109cbe5e14',
                          'd488342eb7aa7a21329561ebe9d1faf0ea7da6951399b858c2707bcbf3dcaee4',
                          '288b7da66b787a5e8e3022a5bafb49f9cbc996579d9545344eda13a93ab59a4b',
+                         '6af4afde97ef885da21cfedb2c8ed6b689356a474e6f33ed2fb98b4490ea53ca',
                          '32713cfea041024439ba915315416df6ba9369f7942c63643ee072f752756391',
                          'da44d07dda016adf80e83f66fbcf8a3760d1c1d7cb8ed0e0655bde78027e85e3',
                          'c9d289ff3db52df7f743b1a652faa05937f070e2441df12022300aec4d226c64',
@@ -152,7 +153,8 @@ def identify(names, product):
 def genome(gff, fasta=None):
     """Read one reference at a time; preserve original CDS IDs/coordinates."""
     features = []
-    with Path(gff).open(encoding='utf-8') as stream:
+    opener = gzip.open if str(gff).endswith('.gz') else open
+    with opener(gff, 'rt', encoding='utf-8') as stream:
         embedded = False
         for line in stream:
             if line.strip() == '##FASTA':
@@ -167,25 +169,42 @@ def genome(gff, fasta=None):
                 features.append((fields[0], int(fields[3])-1, int(fields[4]), fields[6], attrs))
         if fasta is None and not embedded:
             raise ValueError(f'No embedded FASTA in {gff}; provide original/recovered --bakta inputs')
-        dna = {r.id: str(r.seq).upper() for r in SeqIO.parse(fasta if fasta else stream, 'fasta')}
+        if fasta is None:
+            dna = {r.id: str(r.seq).upper() for r in SeqIO.parse(stream, 'fasta')}
+        else:
+            fasta_opener = gzip.open if str(fasta).endswith('.gz') else open
+            with fasta_opener(fasta, 'rt', encoding='utf-8') as sequences:
+                dna = {r.id: str(r.seq).upper() for r in SeqIO.parse(sequences, 'fasta')}
     return features, dna
 
 
 def references(args, info):
+    """Match exact sample stems, including nested/compressed annotation layouts."""
+    extensions = ('.gff3.gz', '.gff.gz', '.gff3', '.gff')
+    gffs = input_index(args.gff_dir, extensions)
+    bakta = input_index(args.bakta, extensions)
     refs, missing = {}, []
     for sample in info['samples']:
-        gffs = [args.gff_dir/(sample+s) for s in ('.gff', '.gff3')] if args.gff_dir else []
-        found = [p for p in gffs if p.is_file()]
+        found = sorted(set(gffs.get(sample, []) or bakta.get(sample, [])))
         if len(found) > 1:
-            raise ValueError(f'Multiple GFFs for {sample}')
+            raise ValueError(f'Multiple GFFs for {sample}; select one annotation directory: {found}')
         if found:
-            refs[sample] = (found[0], None)
-        elif args.bakta and (args.bakta/sample/(sample+'.gff3')).is_file():
-            refs[sample] = (args.bakta/sample/(sample+'.gff3'), args.bakta/sample/(sample+'.fna'))
+            gff = found[0]
+            genomes = [gff.parent/(sample+s) for s in ('.fna','.fna.gz','.fasta','.fasta.gz','.fa','.fa.gz')]
+            genomes = [p for p in genomes if p.is_file()]
+            if len(genomes) > 1:
+                raise ValueError(f'Multiple reference FASTAs for {sample}: {genomes}')
+            refs[sample] = (gff, genomes[0] if genomes else None)
         else:
             missing.append(sample)
     if not refs:
-        raise ValueError('No annotation reference filenames match the frozen discovery cohort')
+        folders = '; '.join(f'{name}={getattr(args,name)}' for name in ('gff_dir','bakta') if getattr(args,name))
+        available = sorted(set(gffs) | set(bakta))
+        raise ValueError(f'No annotation filenames match any of {len(info["samples"]):,} retained samples. '
+            f'Searched recursively: {folders}. Found {sum(map(len,gffs.values()))+sum(map(len,bakta.values())):,} GFF files. '
+            f'Sample IDs (first 5): {info["samples"][:5]}. GFF filename stems (first 5): {available[:5]}. '
+            'Use annotations from the same collection with exact sample-ID filenames; '
+            'a missing directory or different sample naming cannot be repaired by changing the tree filter.')
     return refs, missing
 
 
@@ -843,6 +862,12 @@ def prepare_standalone(args):
         else:
             fasta, tree = standalone_inputs(args, work)
             atomic_json(files, {p.name: digest(p) for p in (fasta, tree, work/'sample_mapping.tsv')})
+        if getattr(args, 'gff_dir', None) or getattr(args, 'bakta', None):
+            retained = [r['sample'] for r in read_table(work/'sample_mapping.tsv') if r['retained']=='1']
+            refs, missing = references(args, dict(samples=retained))
+            args._reference_paths = (refs, missing)
+            log_kovar(args.out, f'annotation preflight: {len(refs):,}/{len(retained):,} retained samples matched; '
+                      f'{len(missing):,} without reference annotations')
         prep = SimpleNamespace(fasta=fasta, tree=tree, unitigs=args.unitigs, exclude_samples=args.exclude_samples,
             min_maf=args.min_maf, tree_missing_samples=args.tree_missing_samples,
             memory_gb=args.memory_gb, threads=args.threads)
@@ -934,7 +959,7 @@ def run_kovar(argv=None):
     work_identity = json.loads((args.work/'run_identity.json').read_text())
     if any(work_identity.get(k)!=identity.get(k) for k in ('inputs','null_model_source_sha256')):
         raise ValueError('Source work directory belongs to a different input cohort or null-fitting model')
-    refs, missing = references(args,info)
+    refs, missing = args._reference_paths if hasattr(args, '_reference_paths') else references(args,info)
     # Verify unitig numbering against the distance stage, and FASTA against the
     # frozen cohort input. These checks prevent scoring a different sequence pool.
     original_distance = source.execute("SELECT value FROM meta WHERE key='distance_identity'").fetchone()

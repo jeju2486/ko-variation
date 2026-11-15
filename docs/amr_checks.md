@@ -41,6 +41,19 @@ Panaroo membership is optional: named/product-annotated GFF CDSs work directly.
 If CDSs lack informative names/products and there is no matching membership CSV,
 the script cannot assign them to a target gene by name alone.
 
+Annotation files are found recursively under `GFF_DIR`/`BAKTA`, including
+`SAMPLE.gff`, `SAMPLE.gff3`, and their `.gz` forms. The filename stem must exactly
+match the recovered sample ID. Reference DNA comes from embedded GFF FASTA or a
+single matching sibling genome FASTA. Duplicate matches cause an explicit error.
+The lookup does not guess relationships between different sample names.
+
+Annotation matching is checked before unique-pattern preparation. A zero-match
+error lists the annotation roots, GFF file count, sample-ID examples and available
+GFF filename stems. Correct `GFF_DIR`/`BAKTA` and repeat the same command/output;
+an annotation-lookup failure does not invalidate already prepared patterns. Once
+annotated target fits have been saved, different annotation inputs require a
+separate diagnostic output, as before.
+
 Raw gfa1_parser FASTA often repeats `contig00001` rather than sample IDs. The
 runner uses the original `assemblies_list.txt`, `saureus_k61.gfa1` and
 `saureus_k61.json` in the PAN-GWES folder to recover row names. It verifies the

@@ -1,4 +1,5 @@
 """Fresh upstream inputs, row identity, target-only fits and checkpoint reuse."""
+import gzip
 import json
 from pathlib import Path
 import random
@@ -13,6 +14,55 @@ from benchmarks import amr_checks as checks
 
 
 class StandaloneChecksTests(unittest.TestCase):
+    def test_reference_lookup_nested_compressed_and_ambiguous_files(self):
+        checks.load_kovar()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            nested = root/'nested'; nested.mkdir()
+            gff = nested/'sample_a.gff3.gz'
+            with gzip.open(gff,'wt') as stream:
+                stream.write('##gff-version 3\nctg\ttest\tCDS\t1\t4\t.\t+\t0\tID=cds1\n##FASTA\n>ctg\nACGT\n')
+            args = SimpleNamespace(gff_dir=root, bakta=None)
+            refs, missing = checks.references(args, dict(samples=['sample_a','missing']))
+            self.assertEqual(missing, ['missing'])
+            features, dna = checks.genome(*refs['sample_a'])
+            self.assertEqual(dna, {'ctg':'ACGT'})
+            self.assertEqual(features[0][1:3], (0,4))
+            with gzip.open(nested/'sample_a.fna.gz','wt') as stream:
+                stream.write('>ctg\nACGT\n')
+            refs, _ = checks.references(args, dict(samples=['sample_a']))
+            self.assertEqual(checks.genome(*refs['sample_a'])[1], {'ctg':'ACGT'})
+            with self.assertRaisesRegex(ValueError, "unmatched.*sample_a"):
+                checks.references(args, dict(samples=['unmatched']))
+            (root/'sample_a.gff').write_text('##gff-version 3\n')
+            with self.assertRaisesRegex(ValueError, 'Multiple GFFs'):
+                checks.references(args, dict(samples=['sample_a']))
+
+    def test_annotation_preflight_precedes_pattern_preparation_and_can_retry(self):
+        checks.load_kovar()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fasta, tree, unitigs = (root/n for n in ('samples.fasta','tree.nwk','dna.unitigs'))
+            fasta.write_text(''.join(f'>s{i}\n{row}\n' for i,row in enumerate(('AA','AC','CA','CC'))))
+            tree.write_text('(s0:1,s1:1,s2:1,s3:1);')
+            unitigs.write_text('0 ACGT\n1 CAGT\n')
+            gffs = root/'gffs'; gffs.mkdir()
+            args = SimpleNamespace(fasta=fasta, tree=tree, unitigs=unitigs, sample_ids=None,
+                assemblies_list=None, gfa=None, cuttlefish_json=None, exclude_samples=None,
+                tree_rooting='as-is', tree_missing_samples='error', work=None, out=root/'checks',
+                min_maf=.05, alpha=.05, min_cell_count=20, bonferroni_tests=None, memory_gb=1, threads=1,
+                gff_dir=gffs, bakta=None)
+            with patch('ko_variation.discovery_store.prepare',side_effect=AssertionError('Unexpected expensive preparation')):
+                with self.assertRaisesRegex(ValueError, 'Found 0 GFF files'):
+                    checks.prepare_standalone(args)
+            mapping_hash = checks.digest(args.out/'.inputs/sample_mapping.tsv')
+            self.assertFalse((args.out/'.inputs/patterns.bin').exists())
+            for i in range(4):
+                (gffs/f's{i}.gff').write_text('##gff-version 3\n##FASTA\n>ctg\nACGT\n')
+            info, _ = checks.prepare_standalone(args)
+            self.assertEqual(info['n'], 4)
+            self.assertEqual(checks.digest(args.work/'sample_mapping.tsv'), mapping_hash)
+
     def test_pruned_tree_retry_drops_only_unmatched_rows_and_protects_completed_inputs(self):
         checks.load_kovar()
         with tempfile.TemporaryDirectory() as temporary:
