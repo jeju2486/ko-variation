@@ -68,6 +68,19 @@ The standalone sequence is:
 This does not run the genome-wide hierarchy/PC search, fit every locus null,
 calculate new physical distances, or require a previous covariation map.
 
+For a tree that intentionally omits isolates still present in the raw FASTA:
+
+```bash
+TREE_MISSING_SAMPLES=drop bash ko-variation/benchmarks/run_amr_checks.sh saureus
+```
+
+The script retains samples shared by FASTA and tree, preserving FASTA row order
+and every original unitig column. Exclusions are recorded in
+`amr_targets/.inputs/sample_mapping.tsv` (`retained=0`) and `prepared.json`.
+Original files are unchanged. A failed initial sample check can be retried with
+`drop` in the same output before any input preparation is committed. Once inputs
+or fits exist, a changed cohort/policy requires a separate output directory.
+
 For existing results, select just the check needed:
 
 ```bash

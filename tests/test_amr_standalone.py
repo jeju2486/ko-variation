@@ -13,6 +13,34 @@ from benchmarks import amr_checks as checks
 
 
 class StandaloneChecksTests(unittest.TestCase):
+    def test_pruned_tree_retry_drops_only_unmatched_rows_and_protects_completed_inputs(self):
+        checks.load_kovar()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fasta, tree, unitigs = (root/n for n in ('samples.fasta','pruned.treefile','dna.unitigs'))
+            fasta.write_text(''.join(f'>s{i}\n{row}\n' for i,row in enumerate(('AAA','CAA','ACA','CCA','CCC'))))
+            tree.write_text('(s0:1,s1:1,s2:1,s3:1);')
+            unitigs.write_text('0 ACGT\n1 CAGT\n2 GACT\n')
+            original_fasta = checks.digest(fasta)
+            args = SimpleNamespace(fasta=fasta, tree=tree, unitigs=unitigs, sample_ids=None,
+                assemblies_list=None, gfa=None, cuttlefish_json=None, exclude_samples=None,
+                tree_rooting='as-is', tree_missing_samples='error', work=None, out=root/'checks',
+                min_maf=.05, alpha=.05, min_cell_count=20, bonferroni_tests=None, memory_gb=1, threads=1)
+            with self.assertRaisesRegex(ValueError, 'TREE_MISSING_SAMPLES=drop'):
+                checks.prepare_standalone(args)
+            args.tree_missing_samples = 'drop'
+            info, _ = checks.prepare_standalone(args)
+            self.assertEqual(info['samples'], ['s0','s1','s2','s3'])
+            self.assertEqual(info['excluded'], ['s4'])
+            self.assertEqual(info['loci'], 3)  # Preserve original unitig numbering.
+            mapping = checks.read_table(args.work/'sample_mapping.tsv')
+            self.assertEqual(mapping[-1], {'row':'4','sample':'s4','retained':'0'})
+            self.assertEqual(checks.digest(fasta), original_fasta)
+            args.fasta, args.work = fasta, None
+            args.tree_missing_samples = 'error'
+            with self.assertRaisesRegex(ValueError, 'settings changed'):
+                checks.prepare_standalone(args)
+
     def test_raw_gfa_row_order_is_verified_against_cuttlefish_inputs(self):
         checks.load_kovar()
         with tempfile.TemporaryDirectory() as temporary:

@@ -100,6 +100,7 @@ COMPARISONS = (('mecA', 'graR'), ('mecA', 'sen'))
 _KOVAR_WORKER = {}
 PRE_REUSE_POLICY_HASHES = {'485d44a0616e1518d9d6233d09ba2db32a33c7a3672f039a175cb6109cbe5e14',
                          'd488342eb7aa7a21329561ebe9d1faf0ea7da6951399b858c2707bcbf3dcaee4',
+                         '288b7da66b787a5e8e3022a5bafb49f9cbc996579d9545344eda13a93ab59a4b',
                          '32713cfea041024439ba915315416df6ba9369f7942c63643ee072f752756391',
                          'da44d07dda016adf80e83f66fbcf8a3760d1c1d7cb8ed0e0655bde78027e85e3',
                          'c9d289ff3db52df7f743b1a652faa05937f070e2441df12022300aec4d226c64',
@@ -777,7 +778,9 @@ def standalone_inputs(args, work):
     desired = set(names)-excluded
     missing = desired-set(tips)
     if missing and args.tree_missing_samples == 'error':
-        raise ValueError(f'{len(missing)} FASTA samples absent from tree; examples: {sorted(missing)[:5]}')
+        raise ValueError(f'{len(missing)} FASTA samples absent from tree; examples: {sorted(missing)[:5]}. '
+                         'For an intentionally pruned tree, use --tree-missing-samples drop '
+                         '(Bash runner: TREE_MISSING_SAMPLES=drop).')
     keep = desired & set(tips)
     if len(keep) < 4:
         raise ValueError('At least four matched samples are required')
@@ -815,9 +818,21 @@ def prepare_standalone(args):
     try:
         lock.execute('BEGIN EXCLUSIVE')
         manifest = work/'standalone_identity.json'
-        if manifest.exists() and json.loads(manifest.read_text()) != configuration:
-            raise ValueError('Standalone inputs/model/settings changed; choose another --out')
-        if not manifest.exists():
+        previous = json.loads(manifest.read_text()) if manifest.exists() else None
+        if previous is not None and previous != configuration:
+            changed = {key for key in previous.keys() | configuration.keys()
+                       if previous.get(key) != configuration.get(key)}
+            # A failed sample-name check has no prepared model to invalidate.
+            # Permit only this explicit error->drop retry, never a cohort change
+            # beneath completed inputs, partial pattern preparation or saved fits.
+            retry = changed == {'tree_missing_samples'} and previous['tree_missing_samples'] == 'error' \
+                and configuration['tree_missing_samples'] == 'drop' and not any(p.exists() for p in (
+                    work/'input_files.json', work/'prepared.json', work/'patterns.bin',
+                    args.out/'diagnosis_identity.json', args.out/'diagnosis.sqlite'))
+            if not retry:
+                raise ValueError('Standalone inputs/model/settings changed; choose another --out')
+            log_kovar(args.out, 'retrying failed input matching with tree-missing-samples=drop; no saved fits changed')
+        if previous != configuration:
             atomic_json(manifest, configuration)
         files = work/'input_files.json'
         if files.exists():
