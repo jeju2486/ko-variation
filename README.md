@@ -114,3 +114,6 @@ software source. [Validation scope](docs/validation.md).
 
 See [current project state](PROJECT_STATE.md) for branch responsibilities and
 [tree-null settings](docs/tree_null.md) for accuracy, storage and restart rules.
+
+The minimal public release is now on `main`, tagged `v0.9.4`. This development
+branch deliberately retains supplementary and diagnostic source omitted from main.
