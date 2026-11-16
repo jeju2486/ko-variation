@@ -286,12 +286,22 @@ def finite(value):
     return float(value) if np.isfinite(value) else None
 
 
+def probe_indices(identity,index,population):
+    rng = np.random.default_rng(identity['seed']+index*1009)
+    ids = rng.choice(population,size=identity['probes'],replace=population<identity['probes'])
+    included=identity.get('included_selection')
+    if included and index<included['responses']:
+        old_rng=np.random.default_rng(included['seed']+index*1009)
+        count=included['probes']
+        ids[:count]=old_rng.choice(included['responses'],size=count,replace=included['responses']<count)
+    return ids
+
+
 def fit_job(job):
     index,repeat = job
     s = STATE; identity = s['identity']
     y = np.array(s['patterns'][index],dtype=float)
-    rng = np.random.default_rng(identity['seed']+index*1009)
-    ids = rng.choice(len(s['patterns']),size=identity['probes'],replace=len(s['patterns'])<identity['probes'])
+    ids=probe_indices(identity,index,len(s['patterns']))
     X = np.ascontiguousarray(s['patterns'][ids].T,dtype=float)
     # Identical/complement probes explicitly exercise difficult/high-score cases.
     X[:,0] = y
@@ -310,6 +320,8 @@ def fit_job(job):
         row = dict(index=index,response=identity['responses'][index],repeat=repeat,method=method,
             n=len(y),n_present=int(y.sum()),status=fit.status,iterations=fit.iterations,
             seconds=seconds,tau=finite(fit.tau),intercept=finite(fit.beta[0]),objective=finite(fit.objective),
+            max_eta_change=finite(fit.max_eta_change),weights_clipped=fit.n_weights_clipped,
+            tau_boundary=fit.tau_boundary,message=fit.message,
             weighted_matrix_seconds=timing.get('weighted_eigendecomposition',0),
             profiling_seconds=timing.get('tau_profiling',0),score_seconds=None,
             cache_bytes=None,compact_cache_bytes=None)
@@ -325,7 +337,7 @@ def fit_job(job):
         rows[method] = row
     dense,tree = fits['dense'],fits['tree']
     comparison = dict(index=index,repeat=repeat,status_match=dense.status==tree.status,
-                      jointly_successful=dense.status==tree.status=='OK')
+                      jointly_successful=dense.status==tree.status=='OK',dense_status=dense.status,tree_status=tree.status)
     if comparison['jointly_successful']:
         comparison.update(max_probability_difference=float(np.max(np.abs(dense.fitted_probability-tree.fitted_probability))),
             intercept_abs_difference=abs(float(dense.beta[0]-tree.beta[0])),
@@ -345,9 +357,12 @@ def fit_job(job):
             t0,t1 = U0[both]**2/V0[both],U1[both]**2/V1[both]
             logp0,logp1 = 2*special.log_ndtr(-np.sqrt(t0)),2*special.log_ndtr(-np.sqrt(t1))
             comparison.update(max_log10p_difference=float(np.max(np.abs(logp0-logp1))/math.log(10)),
+                max_statistic_absolute_difference=float(np.max(np.abs(t0-t1))),
+                max_statistic_normalized_difference=float(np.max(np.abs(t0-t1)/np.maximum(1.,np.abs(t0)))),
                 nominal_decision_mismatches=int(np.count_nonzero((t0>=identity['nominal_critical'])!=(t1>=identity['nominal_critical']))),
                 bonferroni_decision_mismatches=int(np.count_nonzero((t0>=identity['critical'])!=(t1>=identity['critical']))),
-                probes_near_bonferroni_boundary=int(np.count_nonzero(np.abs(t0-identity['critical'])<=.1*max(identity['critical'],1))))
+                probes_near_bonferroni_boundary=int(np.count_nonzero(np.abs(t0-identity['critical'])<=.1*max(identity['critical'],1))),
+                probes_very_near_bonferroni_boundary=int(np.count_nonzero(np.abs(t0-identity['critical'])<=1e-4*max(identity['critical'],1))))
         comparison['within_tolerances'] = bool(
             comparison['max_probability_difference']<=identity['probability_tolerance'] and
             comparison['intercept_abs_difference']<=identity['intercept_tolerance'] and
@@ -359,6 +374,43 @@ def fit_job(job):
             not comparison.get('bonferroni_decision_mismatches',0))
     return dict(index=index,repeat=repeat,rows=list(rows.values()),comparison=comparison,
                 worker=dict(pid=os.getpid(),warmup_seconds=s['warmup_seconds'],libraries=s['libraries']))
+
+
+def include_selection(args,selected,K,names,labels,family):
+    """Retain known responses/probes, refitting rather than copying old results."""
+    previous=args.include_from
+    identity=json.loads((previous/'benchmark_identity.json').read_text())
+    old=np.load(previous/'selected.npy',allow_pickle=False)
+    old_K=np.load(previous/'K.npy',allow_pickle=False)
+    products=json.loads((previous/'products.json').read_text())
+    for name in ('selected.npy','K.npy'):
+        if digest(previous/name)!=products[name]:raise ValueError('Included benchmark product changed: '+name)
+    if identity['samples']!=names or not np.array_equal(old_K,K):
+        raise ValueError('--include-from has a different cohort or covariance')
+    paths=(args.tree,)+(tuple(args.work/name for name in ('prepared.json','patterns.bin','K.npy')) if args.work else (args.fasta,))
+    if sorted(identity['inputs'].values())!=sorted(digest(path) for path in paths):
+        raise ValueError('--include-from uses different source inputs')
+    if identity['alpha']!=args.alpha or identity['bonferroni_tests']!=(args.bonferroni_tests or family):
+        raise ValueError('--include-from uses a different alpha or Bonferroni family')
+    if args.probes<identity['probes']:raise ValueError('--probes must retain at least the previous probe count')
+    old_labels=identity['responses']
+    if old.shape!=(len(old_labels),len(names)):raise ValueError('Included response dimensions changed')
+    real=[i for i,label in enumerate(old_labels) if not label.startswith('synthetic:')]
+    target=len(selected)
+    if len(real)>target:raise ValueError('--patterns must retain at least the previous sampled response count')
+    merged=[row.copy() for row in old];merged_labels=list(old_labels)
+    seen={np.packbits(old[i]).tobytes() for i in real}
+    if len(seen)!=len(real):raise ValueError('Included sampled responses are not unique patterns')
+    count=len(real)
+    for y,label in zip(selected,labels):
+        key=np.packbits(y).tobytes()
+        if count<target and key not in seen:
+            merged.append(y);merged_labels.append(label);seen.add(key);count+=1
+    if count<target:raise ValueError('Insufficient additional unique responses in sampled pool')
+    args._included_selection=dict(directory=str(previous),identity_sha256=digest(previous/'benchmark_identity.json'),
+        selected_sha256=products['selected.npy'],responses=len(old),sampled_responses=len(real),
+        probes=identity['probes'],seed=identity['seed'])
+    return np.asarray(merged,dtype='u1'),merged_labels
 
 
 def select_inputs(args):
@@ -411,7 +463,9 @@ def select_inputs(args):
     error = float(np.max(np.abs(K-expected)))
     if error>1e-10:
         raise ValueError(f'Tree covariance differs from prepared K (max abs {error:.3g}); use its original rooted tree')
-    if args.stress_cases:
+    if getattr(args,'include_from',None):
+        selected,labels=include_selection(args,selected,K,names,labels,family)
+    if args.stress_cases and not any(label.startswith('synthetic:') for label in labels):
         n=len(names); rare=np.zeros(n,dtype='u1');rare[rng.choice(n,max(1,int(.01*n)),replace=False)]=1
         clade=np.zeros(n,dtype='u1')
         internal=[i for i in range(len(algebra.tip)) if algebra.tip[i]<0]
@@ -440,9 +494,81 @@ def checkpoint(path,repair=True):
 
 def table(path,rows):
     import csv
-    fields=list(dict.fromkeys(key for row in rows for key in row))
+    fields=list(dict.fromkeys(key for row in rows for key in row)) or ['index','response','repeat','failure_reasons']
     with path.open('w',newline='',encoding='utf-8') as stream:
         writer=csv.DictWriter(stream,fields,delimiter='\t');writer.writeheader();writer.writerows(rows)
+
+
+def accuracy_failures(comparison,limits):
+    """Describe fixed acceptance criteria; sensitivity never changes fitting."""
+    if not comparison['jointly_successful']:
+        if not comparison['status_match']:return ['FIT_STATUS_MISMATCH']
+        return ['BOTH_MONOMORPHIC'] if comparison.get('dense_status')=='MONOMORPHIC_RESPONSE' else ['BOTH_FITS_FAILED']
+    failures=[]
+    for metric,limit in (
+            ('max_probability_difference','probability_tolerance'),
+            ('intercept_abs_difference','intercept_tolerance'),
+            ('objective_relative_difference','objective_tolerance'),
+            ('tau_relative_difference','tau_tolerance'),
+            ('max_variance_relative_difference','variance_tolerance')):
+        value=comparison.get(metric)
+        if value is None:failures.append('MISSING_'+metric)
+        elif value>limits[limit]:failures.append(metric)
+    for metric in ('variance_status_mismatches','nominal_decision_mismatches','bonferroni_decision_mismatches'):
+        if comparison.get(metric,0):failures.append(metric)
+    return failures
+
+
+def accuracy_summary(out,payloads,identity):
+    """Join failures to response labels and report sensitivity without refitting."""
+    limits={key:identity[key] for key in ('probability_tolerance','intercept_tolerance',
+        'objective_tolerance','tau_tolerance','variance_tolerance')}
+    outliers=[];groups={'sampled':[],'synthetic':[]};comparisons=[]
+    for payload in payloads:
+        methods={r['method']:r for r in payload['rows']}
+        c=dict(payload['comparison'],dense_status=methods['dense']['status'],tree_status=methods['tree']['status'])
+        comparisons.append(c)
+        response=methods['dense']['response']
+        category='synthetic' if response.startswith('synthetic:') else 'sampled'
+        groups[category].append(c)
+        failures=accuracy_failures(c,limits)
+        if failures and failures!=['BOTH_MONOMORPHIC']:
+            record=dict(index=c['index'],response=response,response_type=category,repeat=c['repeat'],
+                        failure_reasons=';'.join(failures),**{k:v for k,v in c.items() if k not in ('index','repeat')})
+            for method,row in methods.items():
+                for key in ('status','iterations','tau','intercept','objective','max_eta_change','weights_clipped','tau_boundary','message'):
+                    record[method+'_'+key]=row.get(key)
+            outliers.append(record)
+    table(out/'accuracy_outliers.tsv',outliers)
+    good=[r for r in comparisons if r['jointly_successful']]
+    sensitivity=[]
+    for tolerance in sorted({1e-8,1e-7,2e-7,5e-7,1e-6,limits['probability_tolerance']}):
+        current=dict(limits,probability_tolerance=tolerance)
+        passing=[r for r in good if not accuracy_failures(r,current)]
+        sensitivity.append(dict(probability_tolerance=tolerance,jointly_successful_jobs=len(good),
+            probability_only_pass=sum(r['max_probability_difference']<=tolerance for r in good),
+            all_criteria_pass=len(passing),unique_responses_all_completed_repeats_pass=len({r['index'] for r in good}
+                -{r['index'] for r in comparisons if accuracy_failures(r,current)}),
+            fit_status_mismatches=sum(not r['status_match'] for r in comparisons)))
+    grouped={}
+    for name,cs in groups.items():
+        failed={r['index'] for r in cs if accuracy_failures(r,limits) not in ([],['BOTH_MONOMORPHIC'])}
+        grouped[name]=dict(unique_responses=len({r['index'] for r in cs}),paired_jobs=len(cs),
+            jointly_successful_jobs=sum(r['jointly_successful'] for r in cs),
+            both_methods_failed_responses=len({r['index'] for r in cs if accuracy_failures(r,limits)==['BOTH_FITS_FAILED']}),
+            status_mismatch_responses=len({r['index'] for r in cs if not r['status_match']}),
+            responses_with_accuracy_failure=len(failed))
+    quantiles={}
+    for metric in ('max_probability_difference','intercept_abs_difference','tau_relative_difference',
+            'objective_relative_difference','max_variance_relative_difference','max_log10p_difference',
+            'max_statistic_absolute_difference','max_statistic_normalized_difference'):
+        values=[r[metric] for r in good if r.get(metric) is not None]
+        quantiles[metric]={label:float(np.quantile(values,q)) for label,q in
+            (('median',.5),('p95',.95),('p99',.99),('max',1.))} if values else None
+    return dict(configured_accuracy_tolerances=limits,accuracy_by_response_type=grouped,
+        accuracy_error_quantiles=quantiles,probability_tolerance_sensitivity=sensitivity,
+        accuracy_outlier_jobs=len(outliers),
+        tolerance_note='Sensitivity varies only the probability acceptance threshold; other criteria and all fitted models are unchanged. Status failures never pass by relaxing probability tolerance.')
 
 
 def report(out,payloads):
@@ -452,6 +578,7 @@ def report(out,payloads):
     for method in ('dense','tree'):
         rs=[r for r in rows if r['method']==method];good=[r for r in rs if r['status']=='OK']
         summary[method]=dict(fits=len(rs),statuses=dict(Counter(r['status'] for r in rs)),
+            unique_responses=len({r['index'] for r in rs}),total_fit_worker_seconds=sum(r['seconds'] for r in rs),
             median_fit_seconds=float(np.median([r['seconds'] for r in good])) if good else None,
             median_score_seconds=float(np.median([r['score_seconds'] for r in good])) if good else None,
             median_cache_bytes=float(np.median([r['cache_bytes'] for r in good])) if good else None,
@@ -464,6 +591,8 @@ def report(out,payloads):
         bonferroni_decision_mismatches=sum(r.get('bonferroni_decision_mismatches',0) for r in good),
         jointly_valid_probe_comparisons=sum(r.get('jointly_valid_probes',0) for r in good),
         probes_near_bonferroni_boundary=sum(r.get('probes_near_bonferroni_boundary',0) for r in good),
+        probes_very_near_bonferroni_boundary=sum(r.get('probes_very_near_bonferroni_boundary',0) for r in good)
+            if any('probes_very_near_bonferroni_boundary' in r for r in good) else None,
         max_probability_difference=max((r['max_probability_difference'] for r in good),default=None),
         max_tau_relative_difference=max((r['tau_relative_difference'] for r in good),default=None),
         max_variance_relative_difference=max((r['max_variance_relative_difference'] for r in good),default=None),
@@ -473,6 +602,12 @@ def report(out,payloads):
                'Compact dense size uses rank 128 and zero/shared special cases; global K/eigen/tree and source patterns excluded.',
                'Repeated runs of a pattern are timing repeats, not independent biological observations.',
                'Accuracy conclusions apply to tested patterns/probes only; inspect failures and boundary coverage.'])
+    identity=json.loads((out/'benchmark_identity.json').read_text())
+    summary.update(accuracy_summary(out,payloads,identity))
+    summary.update(retained_previous_responses=(identity.get('included_selection') or {}).get('responses',0),
+                   retained_previous_probes=(identity.get('included_selection') or {}).get('probes',0))
+    summary.update(report_source_sha256=digest(Path(__file__)),
+                   fit_source_sha256=identity['sources'][Path(__file__).name])
     atomic_json(out/'summary.json',summary)
     try:
         import matplotlib
@@ -505,6 +640,7 @@ def main(argv=None):
     p.add_argument('--patterns',type=int,default=50);p.add_argument('--repeats',type=int,default=1)
     p.add_argument('--probes',type=int,default=8);p.add_argument('--threads',type=int,default=4)
     p.add_argument('--seed',type=int,default=42);p.add_argument('--min-maf',type=float,default=.05)
+    p.add_argument('--include-from',type=Path,help='Retain all responses and probe vectors from an earlier benchmark; refit them')
     p.add_argument('--tree-missing-samples',choices=['error','drop'],default='error')
     p.add_argument('--engine',choices=['numba','python'],default='numba')
     p.add_argument('--stress-cases',action='store_true');p.add_argument('--plot-only',action='store_true')
@@ -527,7 +663,8 @@ def main(argv=None):
     if args.engine=='numba' and numba is None:p.error('Install numba: python -m pip install numba; or use --engine python for correctness testing')
     if args.work:args.work=args.work.resolve()
     if args.fasta:args.fasta=args.fasta.resolve()
-    for original in (args.work,args.fasta.parent if args.fasta else None):
+    if args.include_from:args.include_from=args.include_from.resolve()
+    for original in (args.work,args.fasta.parent if args.fasta else None,args.include_from):
         if original and (args.out==original or args.out in original.parents or original in args.out.parents):
             p.error('--out must be separate from source work/FASTA directories')
     args.out.mkdir(parents=True,exist_ok=True)
@@ -543,6 +680,7 @@ def main(argv=None):
             (args.tree,)+(tuple(args.work/name for name in ('prepared.json','patterns.bin','K.npy')) if args.work else (args.fasta,))},
             samples=names,responses=labels,seed=args.seed,repeats=args.repeats,probes=args.probes,
             engine=args.engine,stress_cases=args.stress_cases,alpha=args.alpha,bonferroni_tests=family,
+            included_selection=getattr(args,'_included_selection',None),
             critical=float(stats.chi2.isf(args.alpha/family,1)),nominal_critical=float(stats.chi2.isf(.05,1)),
             probability_tolerance=args.probability_tolerance,tau_tolerance=args.tau_tolerance,variance_tolerance=args.variance_tolerance,
             intercept_tolerance=args.intercept_tolerance,objective_tolerance=args.objective_tolerance,

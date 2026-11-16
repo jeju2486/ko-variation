@@ -110,7 +110,8 @@ match alone is not evidence of numerical agreement.
 
 The output includes `benchmark_identity.json`, frozen selected arrays/tree,
 `checkpoint.jsonl`, `null_results.tsv`, `comparisons.tsv`, `summary.json`,
-`runtime.json`, and editable `tree_null_benchmark.png`/`.svg` plots. No full set
+`accuracy_outliers.tsv`, `runtime.json`, and editable
+`tree_null_benchmark.png`/`.svg` plots. No full set
 of fitted null caches is retained. Complete response/repeat comparisons are
 committed by the coordinator, so a repeated command resumes completed work.
 An interrupted final JSONL line is discarded; uncommitted in-flight jobs repeat.
@@ -136,3 +137,62 @@ small synthetic test success does not validate all real-data cases.
 Run a small first benchmark (50 responses, one repeat), then increase response
 count/repeats if the speed and agreement justify it. This benchmark makes no
 automatic production-backend or cache-format change.
+
+## Larger accuracy check
+
+Keep the same input cohort, tree and default numerical tolerances. Increase to
+1,000 sampled responses, three timing repeats and 32 probes, using a **new output**:
+
+```bash
+python benchmarks/tree_null_benchmark.py \
+  --work /project/kovar_output/saureus/discovery/results/.kovar_work \
+  --tree /project/kovar_output/saureus/discovery/prepared_inputs/saureus_core.rooted.treefile \
+  --include-from /project/benchmarks/tree_null_saureus_p50_s42 \
+  --out /project/benchmarks/tree_null_saureus_p1000_r3_s42 \
+  --patterns 1000 --repeats 3 --probes 32 --threads 4 --stress-cases
+```
+
+`--include-from` keeps the earlier run's complete selected response matrix as
+the beginning of the new selection, then adds unique sampled patterns until
+1,000 real sampled responses are present. Existing synthetic controls are
+retained rather than regenerated. The earlier probe vectors are retained as
+the first probes for each earlier response; 32 must be at least the original
+probe count. Input hashes, sample order, covariance and hypothesis family must
+match. Old timings/fits are **not** copied: every retained response is fitted
+again using both current methods. This preserves known difficult cases and
+threshold probes while expanding coverage.
+
+The six synthetic controls are additional to the sampled responses. Three
+repeats measure timing/numerical repeatability; they do not triple the number of
+independent patterns or probe vectors. Changing `--patterns` changes the frozen
+selection, so a new output is required. The original run is not overwritten.
+Without `--include-from`, a new random draw need not contain the old responses.
+
+`summary.json` now includes:
+
+- Counts of distinct sampled and synthetic responses with failures, separate
+  from the counts of repeated fit jobs.
+- Median, 95th/99th percentile and maximum errors in probability, intercept,
+  tau, objective, score variance, test statistic and log10 P.
+- Probability-tolerance sensitivity from 1e-8 to 1e-6, while holding every
+  other acceptance criterion fixed. Fitting, weights, optimizer and convergence
+  tolerances are never changed by this reporting sweep.
+- Probe counts within both 10% and 0.01% of the Bonferroni critical statistic.
+  The tighter count is unavailable for old checkpoints that did not record it.
+
+`accuracy_outliers.tsv` joins each exceptional comparison to its response ID,
+sampled/synthetic label, exact failed criteria and both methods' convergence
+diagnostics. Matched monomorphic controls are excluded from the exception list;
+matched failed fits are not treated as successful validation.
+
+The configured strict probability tolerance remains 1e-7. A small excess alone
+does not establish unacceptable score error, but a looser reporting threshold
+cannot repair nonconvergence or decision disagreement. Review fitted-objective
+agreement and score/log-P errors, especially near the decision boundary, before
+choosing any revised acceptance criterion.
+
+You can produce the new diagnostic reports from the existing 50-response
+checkpoint without refitting, using `--plot-only` with its original output.
+Per-fit fields not recorded by the old program remain unavailable. Full fitting
+with the changed benchmark source still requires a new output, preserving the
+original experiment's code identity.

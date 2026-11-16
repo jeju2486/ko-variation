@@ -13,6 +13,68 @@ from ko_variation import glmm, kinship
 
 
 class TreeNullTests(unittest.TestCase):
+    def test_expansion_keeps_previous_responses_and_probe_vectors(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);work=root/'work';work.mkdir()
+            tree=work/'analysis.treefile';tree.write_text('((a:1,b:1):.5,(c:1,d:1):.5);')
+            names=['a','b','c','d']
+            matrix=np.array([[0,0,1,1],[0,1,0,1],[0,1,1,0],[1,0,0,1]],dtype='u1')
+            np.packbits(matrix,axis=1,bitorder='little').tofile(work/'patterns.bin')
+            K=kinship.build_tree_covariance(tree,names).K;np.save(work/'K.npy',K)
+            (work/'prepared.json').write_text(json.dumps(dict(samples=names,n=4,patterns=4,packed_width=1,
+                products={name:bench.digest(work/name) for name in ('patterns.bin','K.npy')})))
+            old=root/'previous';old.mkdir()
+            old_matrix=np.vstack((matrix[[0,2]],np.array([[0,0,0,1],[0,0,0,0]],dtype='u1')))
+            np.save(old/'selected.npy',old_matrix);np.save(old/'K.npy',K)
+            identity=dict(samples=names,responses=['pattern:0','pattern:2','synthetic:rare','synthetic:zero'],
+                alpha=.05,bonferroni_tests=6,seed=42,probes=2,
+                inputs={str(p):bench.digest(p) for p in (tree,work/'prepared.json',work/'patterns.bin',work/'K.npy')})
+            (old/'benchmark_identity.json').write_text(json.dumps(identity))
+            (old/'products.json').write_text(json.dumps({name:bench.digest(old/name) for name in ('selected.npy','K.npy')}))
+            args=SimpleNamespace(work=work,patterns=4,seed=42,tree=tree,engine='python',stress_cases=True,
+                include_from=old,alpha=.05,bonferroni_tests=None,probes=8)
+            selected,_,_,labels,_,_,_=bench.select_inputs(args)
+            np.testing.assert_array_equal(selected[:4],old_matrix)
+            self.assertEqual(len(labels),6)  # Four real patterns, two retained controls.
+            self.assertEqual(labels[:4],identity['responses'])
+            new_identity=dict(seed=42,probes=8,included_selection=args._included_selection)
+            for index in range(4):
+                expected=bench.probe_indices(identity,index,4)
+                actual=bench.probe_indices(new_identity,index,6)
+                np.testing.assert_array_equal(selected[actual[:2]],old_matrix[expected])
+
+    def test_tolerance_sensitivity_does_not_accept_failed_fits_or_decision_mismatches(self):
+        limits=dict(probability_tolerance=1e-7,intercept_tolerance=1e-6,
+                    objective_tolerance=1e-7,tau_tolerance=1e-5,variance_tolerance=1e-6)
+        def payload(index,repeat,response,dense='OK',tree='OK',probability=0.,decisions=0):
+            c=dict(index=index,repeat=repeat,status_match=dense==tree,jointly_successful=dense==tree=='OK')
+            if c['jointly_successful']:
+                c.update(max_probability_difference=probability,intercept_abs_difference=0.,
+                    objective_relative_difference=0.,tau_relative_difference=0.,max_variance_relative_difference=0.,
+                    variance_status_mismatches=0,nominal_decision_mismatches=0,bonferroni_decision_mismatches=decisions)
+            rows=[dict(method=m,response=response,status=s,iterations=20,tau=1.)
+                  for m,s in (('dense',dense),('tree',tree))]
+            return dict(rows=rows,comparison=c)
+        values=[payload(0,0,'pattern:0',probability=1.5e-7),payload(0,1,'pattern:0',probability=1.5e-7),
+                payload(1,0,'synthetic:clade',tree='PQL_NOT_CONVERGED'),
+                payload(2,0,'synthetic:zero',dense='MONOMORPHIC_RESPONSE',tree='MONOMORPHIC_RESPONSE'),
+                payload(3,0,'pattern:3',probability=5e-8,decisions=1)]
+        with tempfile.TemporaryDirectory() as temporary:
+            out=Path(temporary)
+            summary=bench.accuracy_summary(out,values,limits)
+            self.assertEqual(summary['accuracy_outlier_jobs'],4)
+            self.assertEqual(summary['accuracy_by_response_type']['sampled']['unique_responses'],2)
+            self.assertEqual(summary['accuracy_by_response_type']['sampled']['responses_with_accuracy_failure'],2)
+            self.assertEqual(summary['accuracy_by_response_type']['synthetic']['status_mismatch_responses'],1)
+            sweep={r['probability_tolerance']:r for r in summary['probability_tolerance_sensitivity']}
+            self.assertEqual(sweep[1e-7]['all_criteria_pass'],0)
+            self.assertEqual(sweep[2e-7]['all_criteria_pass'],2)
+            self.assertEqual(sweep[1e-6]['all_criteria_pass'],2)  # Decision failure never passes.
+            self.assertEqual(sweep[2e-7]['unique_responses_all_completed_repeats_pass'],1)
+            self.assertEqual(sweep[2e-7]['fit_status_mismatches'],1)
+            self.assertNotIn('BOTH_MONOMORPHIC',(out/'accuracy_outliers.tsv').read_text())
+
     def test_partial_checkpoint_is_ignored_for_plotting_and_repaired_only_on_resume(self):
         with tempfile.TemporaryDirectory() as temporary:
             path=Path(temporary)/'checkpoint.jsonl'
