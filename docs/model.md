@@ -1,4 +1,4 @@
-# Statistical model in KOVAR 0.9.2
+# Statistical model in KOVAR 0.9.4
 
 For predictor pattern A and response pattern B, the alternative association model
 is logit P(B_i=1) = alpha + beta A_i + b_i, with b ~ N(0,tau K). K comes from
@@ -25,5 +25,5 @@ with confirmed distal distance. Neither beta nor statistical significance proves
 phenotype-dependent interaction. Selected estimates may show selection bias.
 
 SPA helpers remain available to historical numerical comparisons; production
-v0.9.2 discovery uses SPA off. The old candidate-table scanner is reproducible
+v0.9.4 discovery uses SPA off. The old candidate-table scanner is reproducible
 from the v0.8.3 tag in a separate environment.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ko-variation"
-version = "0.9.3"
+version = "0.9.4"
 description = "KOVAR: phylogeny-adjusted pangenome covariation score testing"
 readme = "README.md"
 requires-python = ">=3.10"

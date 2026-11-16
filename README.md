@@ -4,14 +4,15 @@ KOVAR tests covariation between binary pangenome features while adjusting for a
 phylogeny-derived covariance. Covariation is a candidate association, not proof
 of causality or biological epistasis.
 
-This is the minimal publication branch, `codex/publication-clean` (version 0.9.3).
+This is the minimal public release, `main` (v0.9.4), also maintained on
+`codex/publication-clean`.
 The development branch `codex/downstream-resume-progress` retains supplementary
 benchmarks and diagnostic tools. No research script is needed for a normal run.
 
 ## Install
 
 ```bash
-git clone --branch codex/publication-clean https://github.com/jeju2486/ko-variation.git
+git clone --branch main https://github.com/jeju2486/ko-variation.git
 cd ko-variation
 python -m pip install '.[tree,network,phenotype]'
 ko-variation --version
