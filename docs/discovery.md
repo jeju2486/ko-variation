@@ -143,13 +143,7 @@ resident bytes/models and refused insertions are reported by worker. A truly
 exhausted budget can still disable admission safely and recover with headroom;
 the configured maximum is not a guarantee of live capacity.
 
-Whole-null-fit eigensolver profiling is available without changing production
-fitting or saved models:
 
-```bash
-python benchmarks/null_fit_benchmark.py --work kovar_v090/.kovar_work \
-  --out null_driver_comparison --patterns 12 --threads 4
-```
 
 The TSV/JSON compare NumPy and SciPy evd/evr on the same frozen response sample,
 with full-fit timings, decomposition/profiling subtimes, convergence statuses
@@ -257,8 +251,15 @@ All significant candidates are retained:
 
 Distance means **minimum shortest-path distance across connected single-genome
 graphs**, not a reference chromosome coordinate. Unknown/disconnected pairs are
-not presumed distal. The cutoff can be set with `--distal-bp` before the first
-distance stage, then is frozen. Beta is an alternative phylogenetic logistic
+not presumed distal. Set the cutoff with `--distal-bp` (default 10,000).
+A cutoff-only change on `--resume` reclassifies saved distances in place;
+association decisions, null models and existing beta fits are retained. Only
+newly eligible pattern pairs without a saved beta attempt are fitted. Increasing
+the cutoff hides local betas from exports without deleting their saved fits.
+Pending distance batches continue normally and unknown distances stay unknown.
+The threshold history is recorded in `run_summary.json`; current exports are
+replaced on completion. Preserve an earlier map separately if needed.
+Beta is an alternative phylogenetic logistic
 mixed-model coefficient, fitted once per selected distal pattern pair and
 reported only on distal original-unitig rows. Separation, nonconvergence,
 clipped weights and invalid variance remain explicit effect statuses.
@@ -320,7 +321,8 @@ Input contents, fitting implementation, numerical environment and scientific
 settings are checked. CPU count, memory budget and numerical batch size may be
 adjusted on resume; they are execution settings.
 Changing scientific settings requires a new output. Distances/beta can be added
-later, but changed distance inputs/cutoffs cannot overwrite earlier results.
+later. A changed `--distal-bp` alone is supported on resume; changing graph inputs,
+the distance executable or k-mer length still requires a new output.
 
 ### Resume a released v0.9.0, v0.9.1 or v0.9.2 run
 
@@ -381,7 +383,7 @@ counters describe completed evaluation batches; interruption can leave a last
 batch's already-committed decisions without its final timing update. Legacy
 v0.9.0 work lacks these counters, so historical time cannot be reconstructed
 from the new counters alone. Progress prints query counts plus fit/cache counts;
-read-only inspection uses `benchmarks/inspect_discovery.py`.
+read-only inspection uses `ko_variation/progress.py`.
 
 `hierarchy_metrics` separately counts proof-pruned internal/cross blocks and
 heuristically pruned representative blocks. Progress also prints bound-certified
@@ -406,9 +408,9 @@ counts describe an interleaved queue, not a sequence of completed depth stages.
 For a readable diagnosis and a saved snapshot:
 
 ```bash
-python benchmarks/inspect_discovery.py --out kovar_v090 --summary --json-out progress_1.json
+python ko_variation/progress.py --out kovar_v090 --summary --json-out progress_1.json
 # Run again later; use a new output filename to retain the earlier snapshot.
-python benchmarks/inspect_discovery.py --out kovar_v090 --summary \
+python ko_variation/progress.py --out kovar_v090 --summary \
   --previous progress_1.json --json-out progress_2.json
 ```
 
@@ -436,19 +438,6 @@ Bonferroni cutoff, selects certified DISTAL rows and uses the explicitly labelle
 refitting beta. Gene names and functional colours retain the existing display
 options. This optional visualization helper loads the significant edge table;
 it is separate from the memory-bounded all-pattern discovery scan.
-
-## Focused benchmark
-
-`benchmarks/discovery_benchmark.py` runs exact, bounded exhaustive, and hierarchical
-production paths on a supplied **small frozen pseudo-FASTA panel**. It reuses
-compatible fitted nulls and reports query counts, recovery and invocation time.
-The default cap is 2,000 original loci; it does not silently launch a full-pool
-exhaustive scan. `--screen-p` matches production by default and
-`--bonferroni-tests` can freeze the larger full-study hypothesis family for a
-sampled panel. The comparison table includes fitting/loading/bound/exact worker
-times and coordinator database times. Exact invocation time includes fitting;
-the next arms reuse models, so these are not independent cold-run timings.
-There are no full ARC runtime or whole-pool recovery guarantees in this release.
 
 ## Beta checkpoints
 

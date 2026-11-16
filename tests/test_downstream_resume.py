@@ -14,7 +14,7 @@ import pandas as pd
 
 from ko_variation import postprocess
 from ko_variation.annotation_cli import main as annotation_main
-from ko_variation.workflow_cache import stage_identity, cache_fields, cache_matches
+from ko_variation.checkpoint import stage_identity, cache_fields, cache_matches
 
 
 class DownstreamResumeTests(unittest.TestCase):

@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from ko_variation.memory_budget import (ByteLRU,cgroup_limits,detect_budget,plan_workers,GIB)
 from ko_variation.discovery_execution import bounded_map,ResponsePool
-from ko_variation.null_identity import migrate_identity,V090_CODE
+from ko_variation.null_identity import migrate_identity
 from ko_variation.discovery_store import connect
 from ko_variation.discovery import schema,search,get_meta
 from ko_variation import discovery_score as kernels
@@ -118,13 +118,13 @@ class ResourceTests(unittest.TestCase):
     def test_migration_rejects_unknown_code_and_changed_science(self):
         with tempfile.TemporaryDirectory() as temporary:
             manifest=Path(temporary)/'identity.json'
-            old=dict(version='0.9.0',code={k:next(iter(v)) for k,v in V090_CODE.items()},settings={'alpha':.05,'batch_size':256},
+            old=dict(version='0.9.0',code={'glmm.py':'old'},settings={'alpha':.05,'batch_size':256},
                      inputs={},numpy='x',scipy='y',null_model_source_sha256='fit')
             expected=dict(old,version='0.9.1',code={'new':'code'},settings={'alpha':.05})
             bad=dict(old,settings={'alpha':.01,'batch_size':256})
             with self.assertRaisesRegex(ValueError,'Scientific'):
                 migrate_identity(bad,expected,manifest)
-            bad=dict(old,code=dict(old['code'],**{'discovery.py':'unknown'}))
+            bad=dict(old,settings=expected['settings'],code=dict(old['code'],**{'discovery.py':'unknown'}))
             with self.assertRaisesRegex(ValueError,'verified'):
                 migrate_identity(bad,expected,manifest)
 

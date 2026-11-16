@@ -1,14 +1,59 @@
 """Focused checks for annotation geometry, ambiguity and exported evidence."""
 import csv
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
 from ko_variation.locus_annotation import create_geometry, qualify_reference, resolve_hits, annotate_work
 from ko_variation.network import build_gene_network
+from ko_variation.annotation_inputs import annotation_environment, main as annotation_main
+
+
+class AnnotationEnvironmentTests(unittest.TestCase):
+    def test_selected_python_environment_supplies_native_tools_and_isolated_imports(self):
+        executable = str(Path(tempfile.gettempdir())/'annotation-env/bin/python')
+        def locate(name,path=None):
+            if name==executable: return executable
+            self.assertTrue(path.startswith(str(Path(executable).parent)+os.pathsep))
+            return str(Path(executable).parent/name)
+        probe = subprocess.CompletedProcess([],0,stdout=json.dumps(dict(pyseer='fixture',pybedtools='fixture')),stderr='')
+        with patch.dict(os.environ,{'PYTHONPATH':'must-not-leak'}), \
+             patch('ko_variation.annotation_inputs.shutil.which',side_effect=locate), \
+             patch('ko_variation.annotation_inputs.subprocess.run',return_value=probe) as run:
+            environment, report = annotation_environment(executable)
+        self.assertNotIn('PYTHONPATH',environment)
+        self.assertEqual(run.call_args.kwargs['env'],environment)
+        self.assertEqual(report['python'],executable)
+        self.assertIn('gff2bed',report['executables'])
+
+    def test_reports_all_missing_dependencies_before_preparing_references(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            selected,fasta,unitigs,panaroo = [root/name for name in ('pairs.tsv','samples.fa','unitigs','genes.csv')]
+            selected.write_text('u\tv\n0\t1\n')
+            for path in (fasta,unitigs,panaroo): path.write_text('placeholder')
+            bakta = root/'bakta'
+            bakta.mkdir()
+            executable = str(Path(tempfile.gettempdir())/'annotation-env/bin/python')
+            def locate(name,path=None): return executable if str(name)==executable else None
+            probe = subprocess.CompletedProcess([],1,stdout='',stderr='No module named pyseer')
+            argv = ['--selected',str(selected),'--fasta',str(fasta),'--unitigs',str(unitigs),
+                    '--panaroo',str(panaroo),'--bakta',str(bakta),'--out',str(root/'output'),
+                    '--pyseer-python',executable]
+            with patch('ko_variation.annotation_inputs.shutil.which',side_effect=locate), \
+                 patch('ko_variation.annotation_inputs.subprocess.run',return_value=probe), \
+                 patch('ko_variation.annotation_inputs.prepare_inputs',side_effect=AssertionError('late dependency check')):
+                self.assertEqual(annotation_main(argv),2)
+                with self.assertRaises(ValueError) as error:
+                    annotation_environment(executable)
+            for name in ('bwa','bedtools','gff2bed','pyseer'):
+                self.assertIn(name,str(error.exception))
 
 
 class LocusAnnotationTests(unittest.TestCase):

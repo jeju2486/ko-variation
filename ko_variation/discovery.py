@@ -84,6 +84,8 @@ def parser():
                    help='Fit all unique response nulls before scoring [all]; needed retains on-demand fitting')
     p.add_argument('--prefit-only',action='store_true',help='Complete/resume null fitting and stop before pair testing')
     p.add_argument('--null-cache-format',choices=['compact','full'],default='compact')
+    p.add_argument('--null-backend',choices=['dense','tree'],default='dense',
+                   help='Tree working algebra with dense fallback; opt in pending full real-data validation')
     p.add_argument('--null-cache-rank',type=int,default=128,
                    help='Retained spectral directions; omitted directions use conservative bounds or exact reconstruction [128]')
     p.add_argument("--resume", action="store_true", help="Reuse compatible completed work")
@@ -126,7 +128,7 @@ def identity(args):
     inputs = {k: digest(getattr(args, k)) for k in ("fasta", "tree", "exclude_samples") if getattr(args, k)}
     code = {name: digest(Path(__file__).with_name(name)) for name in
             ("discovery.py", "discovery_store.py", "discovery_score.py", "discovery_execution.py", "memory_budget.py",
-             "discovery_eligibility.py", "discovery_nulls.py", "coarse_screen.py", "null_identity.py", "glmm.py", "kinship.py")}
+             "discovery_eligibility.py", "discovery_nulls.py", "coarse_screen.py", "null_identity.py", "glmm.py", "kinship.py", "tree_null.py")}
     from .null_identity import null_source_hash
     return dict(version=__version__, execution_revision=__discovery_revision__,inputs=inputs, settings=settings, code=code,
                 numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
@@ -585,6 +587,8 @@ def import_nulls(db, work, info, args, *, current_identity=None):
         root = supplied.parent if supplied.name == "null_models" else supplied
         prior_identity=json.loads((root/"run_identity.json").read_text())
         if str(prior_identity.get("version","")).startswith("0.9."):
+            if prior_identity.get('settings',{}).get('null_backend','dense')!=args.null_backend:
+                raise ValueError('Prior null backend differs; use matching caches or fit fresh nulls')
             if any(prior_identity.get(k)!=current_identity.get(k) for k in ("numpy","scipy","null_model_source_sha256")):
                 raise ValueError("Prior v0.9 null-fitting environment/source differs")
             summary = json.loads((root/"run_summary.json").read_text()) if (root/"run_summary.json").exists() else {}
@@ -631,10 +635,28 @@ def distance_and_beta(db, work, pool, args):
                 graph["path_graphs"].append([str(path),digest(path)])
     graph.update(binary=digest(binary),k=args.kmer_length,distal_bp=args.distal_bp)
     old = get_meta(db,"distance_identity")
-    if old is not None and old != graph:
-        raise ValueError("Distance inputs/settings changed; use a new output")
+    reclassify = old is not None and old != graph
+    if reclassify and ({k:v for k,v in old.items() if k!='distal_bp'} !=
+                       {k:v for k,v in graph.items() if k!='distal_bp'}):
+        raise ValueError("Distance inputs changed; use a new output")
     with db:
+        if reclassify:
+            # The cutoff selects beta eligibility, not the association test or
+            # physical distance. Keep pending/unknown rows and all saved fits.
+            changed = db.execute("""UPDATE distance SET status=CASE
+                WHEN distance>? THEN 'DISTAL' ELSE 'LOCAL' END
+                WHERE status IN ('LOCAL','DISTAL') AND status!=CASE
+                WHEN distance>? THEN 'DISTAL' ELSE 'LOCAL' END""",
+                (args.distal_bp,args.distal_bp)).rowcount
+            history = get_meta(db,'distance_threshold_history',[])
+            history.append(dict(previous_bp=old['distal_bp'],distal_bp=args.distal_bp,
+                                reclassified_unitig_pairs=changed))
+            set_meta(db,'distance_threshold_history',history)
         set_meta(db,"distance_identity",graph)
+    if reclassify:
+        print(f"[KOVAR] distance cutoff: {old['distal_bp']:,} -> {args.distal_bp:,} bp; "
+              f"reclassified {changed:,} saved unitig pairs; distances, association tests "
+              "and saved beta fits retained",flush=True)
     if not get_meta(db,"distance_expanded"):
         with db:
             db.execute("INSERT OR IGNORE INTO distance(u,v,pu,pv) "
@@ -797,6 +819,7 @@ def export(db, info, work, args, total_seconds):
     summary['memory_budget']=getattr(args,'_memory_info',None)
     summary['execution_plan']=getattr(args,'_plan',None)
     summary['coarse_screen']=get_meta(db,'coarse_screen_summary')
+    summary['distance_threshold_history']=get_meta(db,'distance_threshold_history',[])
     summary['reused_prepared_from']=get_meta(db,'reused_prepared_from')
     atomic_json(args.out/"run_summary.json",summary)
 
@@ -833,8 +856,7 @@ def main(argv=None):
             if not args.resume:
                 raise ValueError("Existing work requires --resume")
             from .null_identity import migrate_identity
-            if migrate_identity(json.loads(manifest.read_text()),expected,manifest):
-                print('[KOVAR] verified released checkpoint migrated; saved patterns, hierarchy, decisions and nulls retained',flush=True)
+            migrate_identity(json.loads(manifest.read_text()),expected,manifest)
         else:
             atomic_json(manifest,expected)
         atomic_json(args.out/"run_identity.json",dict(expected,work_directory=str(work)))
@@ -849,6 +871,20 @@ def main(argv=None):
                     from .discovery_store import reuse_prepared
                     reuse_prepared(args,db,work,expected)
                 info = prepare(args,db,work)
+                if args.null_backend=='tree':
+                    from .tree_null import TreeAlgebra, compiled_contrasts
+                    if compiled_contrasts is None:
+                        raise ValueError('Tree backend requires numba: pip install "ko-variation[tree]"')
+                    tree=TreeAlgebra.from_newick(args.tree,info['samples'])
+                    target=work/'tree.npz'
+                    if not target.exists():
+                        np.savez(target,left=tree.left,right=tree.right,tip=tree.tip,length=tree.length)
+                    tree_sha=digest(target)
+                    if info['products'].get('tree.npz',tree_sha)!=tree_sha:
+                        raise ValueError('Shared tree algebra changed')
+                    if 'tree.npz' not in info['products']:
+                        info['products']['tree.npz']=tree_sha
+                        atomic_json(work/'prepared.json',info)
             if args.reuse_prepared_from and args.reuse_prepared_from not in args.reuse_nulls_from:
                 args.reuse_nulls_from.append(args.reuse_prepared_from)
             family = math.comb(info["patterns"],2)
@@ -868,6 +904,7 @@ def main(argv=None):
                             final_critical=float(chi2.isf(args.alpha/family,1)),exact=args.exact,
                             require_cached_nulls=args.require_cached_nulls,batch_size=args.batch_size,
                             null_cache_format=args.null_cache_format,null_cache_rank=args.null_cache_rank,
+                            null_backend=args.null_backend,
                             workers=args.threads,**args._plan)
             print(f'[KOVAR] execution revision: {__discovery_revision__}; '
                   f'null stage={args.prefit_nulls}; cache={args.null_cache_format}',flush=True)
@@ -876,7 +913,8 @@ def main(argv=None):
                   f"cache/worker={args._plan['cache_bytes_per_worker']/(1<<30):.3f} GiB",flush=True)
             print(f"[KOVAR] memory target={args.memory_gb:.3f} GiB; source={args._memory_info['limiting_source']}; "
                   f"bounded query buffer={args._plan['query_buffer_pairs']:,} pairs",flush=True)
-            estimate=8*n*min(args.null_cache_rank,n)+12*n*8 if args.null_cache_format=='compact' else 12*n*n
+            estimate=(12*n*8 if args.null_backend=='tree' else
+                      8*n*min(args.null_cache_rank,n)+12*n*8 if args.null_cache_format=='compact' else 12*n*n)
             print("[KOVAR] numerical null-cache estimate before complement/shared/zero savings: "
                   f"{info['patterns']*estimate/(1<<30):.1f} GiB; "
                   "pair checkpoints and expanded unitig results require additional disk space",flush=True)

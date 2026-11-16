@@ -18,3 +18,9 @@ graph tools require their own versions and deployment validation.
 
 The publication cleanup retires scanner-only tests together with the removed
 scanner. Discovery, shared numerical functions and downstream tests remain.
+
+
+Benchmark and diagnostic source is maintained on `codex/downstream-resume-progress`,
+not this minimal publication branch. A full larger real-data validation of the
+`1e-8` tree optimizer remains pending; the optional backend is not claimed to
+match every dense fit. See `PROJECT_STATE.md` for the current evidence.
