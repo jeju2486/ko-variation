@@ -12,7 +12,7 @@
 - Use focused checks for the changed behavior; avoid redundant validation.
 
 - Read `PROJECT_STATE.md` first: it summarizes the entire chat by importance, including scientific conclusions, rejected approaches and pending validation.
-- `main` and `codex/publication-clean` contain the minimal release; do not add research
+- `main` contains the minimal public release; do not add research
   scripts there. `codex/downstream-resume-progress` retains supplementary tools.
 - Keep compact project decisions in `PROJECT_STATE.md`; do not paste chat logs
   or server results into source files. Retain essential provenance externally.

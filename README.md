@@ -4,8 +4,7 @@ KOVAR tests covariation between binary pangenome features while adjusting for a
 phylogeny-derived covariance. Covariation is a candidate association, not proof
 of causality or biological epistasis.
 
-This is the minimal public release, `main` (v0.9.4), also maintained on
-`codex/publication-clean`.
+This is the minimal public release, `main` (v0.9.4).
 The development branch `codex/downstream-resume-progress` retains supplementary
 benchmarks and diagnostic tools. No research script is needed for a normal run.
 
