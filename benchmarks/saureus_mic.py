@@ -13,11 +13,13 @@ from concurrent.futures import ProcessPoolExecutor
 import csv
 import gzip
 import hashlib
+import inspect
 import json
 import math
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -31,6 +33,13 @@ from ko_variation.amr_report import gene_key, label_tokens, mic_record, read_tsv
 from ko_variation.phenotype import json_write, npz_write, sha256
 
 REVISION = "saureus-mic-1"
+# The initial 2eb840d helper hashed the entire script for matrix preparation.
+# Its preparation algorithm is unchanged; accept its LF/CRLF identities only
+# when every input hash, cohort setting and preparation revision still match.
+LEGACY_PREPARATION_CODES = {
+    "252043a3a00e3f0556c0c36446f0f9e8817c2bd554e613ec925c8c048d051fd3",
+    "9c0e1ad44fd5d7720597f418cac5ee6a682702067bfcb8cbf3263931fe5059ea",
+}
 ALIASES = {"blaZ": {"blaz", "blapc1"}, "gyrA": {"gyra"}, "parC": {"parc", "grla"}}
 TARGETS = {"penicillin": ["blaZ"], "fluoroquinolone": ["gyrA", "parC"]}
 
@@ -171,6 +180,21 @@ def metadata_samples(path, fasta_names, mapping=None):
     return result
 
 
+def preparation_code():
+    """Database discovery and plotting edits must not invalidate the input matrix."""
+    source="\n".join(inspect.getsource(fn).replace("\r\n","\n") for fn in
+                     [load_map,fasta_records,metadata_samples,prepare,gene_key,label_tokens,read_tsv])
+    source+=json.dumps(dict(aliases={g:sorted(a) for g,a in ALIASES.items()},targets=TARGETS),sort_keys=True)
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def compatible_preparation(saved, current):
+    if saved==current: return True
+    return (saved.get("code") in LEGACY_PREPARATION_CODES and
+            {k:v for k,v in saved.items() if k!="code"}==
+            {k:v for k,v in current.items() if k!="code"})
+
+
 def prepare(args, mapped):
     from Bio import Phylo
     data, nodes, groups, adjacency = mapped
@@ -178,11 +202,11 @@ def prepare(args, mapped):
                for key in ["network", "annotation", "fasta", "unitigs", "tree", "metadata"]}
     for key in ["sample_map", "clusters", "locus_map"]:
         if getattr(args, key): sources[key] = dict(path=str(getattr(args, key).resolve()), sha256=sha256(getattr(args, key)))
-    identity = dict(revision=REVISION, code=sha256(__file__), sources=sources, groups=args.groups)
+    identity = dict(revision=REVISION, code=preparation_code(), sources=sources, groups=args.groups)
     state = args.out / "prepared.json"
     if state.exists():
         info = json.loads(state.read_text())
-        if info["identity"] != identity: raise ValueError("Prepared inputs/settings changed; choose a new --out")
+        if not compatible_preparation(info["identity"],identity): raise ValueError("Prepared inputs/settings changed; choose a new --out")
         log("reuse prepared selected-column matrix")
         return info
     annotation = {}
@@ -456,6 +480,22 @@ def audit_sample(job):
     return rows
 
 
+def database_from_version(text):
+    """AMRFinder -V prints a shell-quoted path; normal runs may colour it."""
+    text=re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]","",text)
+    match=re.search(r"^\s*Database directory:\s*(.+?)\s*$",text,re.I|re.M)
+    if not match: return None
+    value=match[1].strip()
+    if value.startswith(("'",'"')):
+        try:
+            parts=shlex.split(value)
+        except ValueError:
+            return None
+        if len(parts)!=1: return None
+        value=parts[0]
+    return Path(value).expanduser() if value else None
+
+
 def allele_audit(args, info):
     assemblies = source_index(args.assemblies, [".fasta.gz", ".fna.gz", ".fa.gz", ".fasta", ".fna", ".fa"], set(info["samples"]))
     gffs = source_index(args.gff_dir, [".gff3.gz", ".gff.gz", ".gff3", ".gff"], set(info["samples"]))
@@ -469,13 +509,12 @@ def allele_audit(args, info):
     version = subprocess.run(command, capture_output=True, text=True, check=True)
     version_text = version.stdout+version.stderr
     (args.out/"amrfinder_version.txt").write_text(version_text)
-    database = args.amrfinder_db
-    if database is None:
-        match = re.search(r"Database directory:\s*(.+)", version_text, re.I)
-        if match: database = Path(match[1].strip())
+    database = args.amrfinder_db or database_from_version(version_text)
     reference_file = args.reference_proteins or (database/"AMRProt.fa" if database else None)
     if reference_file is None or not reference_file.is_file():
-        raise ValueError("Set --amrfinder-db to the installed database directory containing AMRProt.fa (or --reference-proteins)")
+        raise ValueError(f"AMRProt.fa not found at {reference_file or 'an undetected database directory'}. "
+                         f"Database output saved to {args.out/'amrfinder_version.txt'}. "
+                         "Set AMRFINDER_DB=/actual/database/directory or --reference-proteins.")
     audit_identity = dict(prepared=info["identity"], amrfinder=version_text,
                           reference_proteins_sha256=sha256(reference_file), min_gene_coverage=args.min_gene_coverage)
     state = args.out/"audit_identity.json"

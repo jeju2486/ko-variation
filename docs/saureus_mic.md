@@ -21,6 +21,11 @@ AMRFinderPlus can instead live in another environment: set `AMRFINDER_EXEC` to
 its executable. Set `AMRFINDER_DB` to the database directory printed by `-V`,
 containing `AMRProt.fa`. Both caller output and the reference database version are
 recorded. No database is downloaded or updated by this workflow.
+The default database is also read automatically from `amrfinder -V`; quoted
+paths and terminal colour codes are supported. If detection fails, inspect
+`$OUT/amrfinder_version.txt` and set `AMRFINDER_DB` explicitly. The initial
+helper's prepared matrix remains reusable after this database-path-only fix;
+changed biological inputs or cohort settings still require a new output.
 
 From the project root on zoo-ardbeg:
 

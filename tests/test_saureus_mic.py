@@ -12,6 +12,25 @@ from benchmarks import saureus_mic as mic
 
 
 class FocalMicTests(unittest.TestCase):
+    def test_database_version_paths_are_unquoted_and_uncoloured(self):
+        for text,path in [
+            ("Database directory: '/data/amrfinder/2026-11-01.1'\nDatabase version: x", "/data/amrfinder/2026-11-01.1"),
+            ('Database directory: "/data/AMR database/latest"\n', "/data/AMR database/latest"),
+            ("Database directory: /data/amrfinder/latest\n", "/data/amrfinder/latest"),
+            ("Database directory: \x1b[32m'/data/amrfinder/latest'\x1b[0m\n", "/data/amrfinder/latest"),
+            ("Database directory: '/data/O'\\''Brien/db'\n", "/data/O'Brien/db"),
+        ]:
+            self.assertEqual(mic.database_from_version(text),Path(path))
+        self.assertIsNone(mic.database_from_version("No database installed"))
+
+    def test_prepared_matrix_accepts_only_known_legacy_code_and_identical_inputs(self):
+        current=dict(revision=mic.REVISION,code="new preparation code",sources={"fasta":{"sha256":"same"}},groups=10)
+        previous={**current,"code":next(iter(mic.LEGACY_PREPARATION_CODES))}
+        self.assertTrue(mic.compatible_preparation(previous,current))
+        self.assertFalse(mic.compatible_preparation({**previous,"groups":11},current))
+        self.assertFalse(mic.compatible_preparation({**previous,"sources":{"fasta":{"sha256":"changed"}}},current))
+        self.assertFalse(mic.compatible_preparation({**previous,"code":"unknown code"},current))
+
     def test_source_search_ignores_other_species_duplicates(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
@@ -163,6 +182,16 @@ class FocalMicTests(unittest.TestCase):
             self.assertNotIn("s31",prepared["samples"])
             self.assertEqual(prepared["loci"],[0,1,2,3,4])
             self.assertEqual(prepared["random_pool"],[4])
+            # An installed initial helper already produced this matrix on ARC/
+            # Linux. The database-path patch must not redo scientific preparation.
+            from unittest.mock import patch
+            prepared["identity"]["code"]=next(iter(mic.LEGACY_PREPARATION_CODES))
+            mic.json_write(root/"prepared.json",prepared)
+            before=(root/"prepared.json").read_bytes()
+            with patch.object(mic.np,"stack",side_effect=AssertionError("Unexpected matrix rebuild")):
+                reused=mic.prepare(args,(data,ns,groups,adj))
+            self.assertEqual(reused,prepared)
+            self.assertEqual((root/"prepared.json").read_bytes(),before)
 
 
 if __name__=="__main__": unittest.main()
