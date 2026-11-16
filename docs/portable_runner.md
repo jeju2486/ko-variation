@@ -14,10 +14,10 @@ post-hoc beta calculation, also provide the separately installed PAN-GWES
 `unitig_distance` executable and its matching graph files. Pip does not install
 that external executable.
 
-Create an isolated environment and install from the development branch:
+Create an isolated environment and install from the publication branch:
 
 ```bash
-git clone --branch codex/downstream-resume-progress https://github.com/jeju2486/ko-variation.git
+git clone --branch codex/publication-clean https://github.com/jeju2486/ko-variation.git
 cd ko-variation
 python3 -m venv .venv
 source .venv/bin/activate
@@ -251,3 +251,16 @@ for distances, plus the input filenames/checksums and complete run command.
 | Graph files not found | Check `.paths` entries, working directory, original graph files and whether your distance tool requires `--edges` |
 | Another coordinator is using the work directory | Find the existing process/job; only one coordinator may write that checkpoint |
 | No final TSV yet | Check the current stage/progress and saved work; final export follows the long-running computational stages |
+
+## Optional tree-null backend
+
+```bash
+python -m pip install '.[tree]'
+bash examples/run_discovery.sh --fasta graph.sample_ids.fasta --tree rooted.nwk \
+  --out new_tree_results --threads 4 --null-backend tree
+```
+
+Use a new output for this numerical backend. Current-version runs resume normally;
+changing backend or upgrading from earlier fitting code does not reuse old pair
+decisions automatically. Historical exports remain usable for annotation/plotting.
+See [tree-null details](tree_null.md).

@@ -41,157 +41,8 @@ from ko_variation.discovery_store import atomic_json, digest, open_patterns, rec
 STATE = {}
 
 
-def contrasts(left, right, tip, length, weights, tau, data):
-    """Independent Gaussian contrasts, including the fixed-root contribution.
-
-    Tip observation variance is 1/W. Each branch adds tau*length. Combining two
-    subtrees gives one independent contrast and a precision-weighted mean.
-    Zero-length branches and multifurcations (binary zero-edge expansion) work
-    without jitter. No covariance inverse or eigenvectors are constructed.
-    """
-    n, width = data.shape
-    means = np.zeros((len(tip), width))
-    variance = np.empty(len(tip))
-    white = np.empty((n, width))
-    logdet, row = 0.0, 0
-    for v in range(len(tip)):
-        if tip[v] >= 0:
-            variance[v] = 1.0/weights[tip[v]] + tau*length[v]
-            means[v] = data[tip[v]]
-        else:
-            a, b = left[v], right[v]
-            total = variance[a]+variance[b]
-            fraction = variance[b]/total
-            variance[v] = variance[a]*fraction + tau*length[v]
-            for j in range(width):
-                white[row,j] = (means[a,j]-means[b,j])/math.sqrt(total)
-                means[v,j] = fraction*means[a,j]+(variance[a]/total)*means[b,j]
-            logdet += math.log(total)
-            row += 1
-    for j in range(width):
-        white[n-1,j] = means[-1,j]/math.sqrt(variance[-1])
-    logdet += math.log(variance[-1])
-    return white, logdet, means, variance
-
-
-def tree_solve(left, right, tip, length, weights, tau, data):
-    """Apply S^-1 by a forward contrast pass and its reverse adjoint."""
-    _, _, means, variance = contrasts(left,right,tip,length,weights,tau,data)
-    adjoint = np.zeros_like(means)
-    adjoint[-1] = means[-1]/variance[-1]
-    out = np.empty_like(data)
-    for v in range(len(tip)-1,-1,-1):
-        if tip[v] >= 0:
-            out[tip[v]] = adjoint[v]
-        else:
-            a, b = left[v], right[v]
-            total = variance[a]+variance[b]
-            for j in range(data.shape[1]):
-                contrast = (means[a,j]-means[b,j])/total
-                adjoint[a,j] = variance[b]/total*adjoint[v,j]+contrast
-                adjoint[b,j] = variance[a]/total*adjoint[v,j]-contrast
-    return out
-
-
-def tree_multiply(left, right, tip, length, data):
-    """Apply the normalized shared-branch covariance K in two tree passes."""
-    totals = np.zeros((len(tip),data.shape[1]))
-    carry = np.zeros_like(totals)
-    out = np.empty_like(data)
-    for v in range(len(tip)):
-        totals[v] = data[tip[v]] if tip[v]>=0 else totals[left[v]]+totals[right[v]]
-    carry[-1] = length[-1]*totals[-1]
-    for v in range(len(tip)-1,-1,-1):
-        if tip[v]>=0:
-            out[tip[v]] = carry[v]
-        else:
-            a, b = left[v],right[v]
-            carry[a] = carry[v]+length[a]*totals[a]
-            carry[b] = carry[v]+length[b]*totals[b]
-    return out
-
-
-if numba is not None:
-    # No fastmath, parallel reductions, reduced precision or approximate sigmoid.
-    numba.extending.register_jitable(contrasts)
-    compiled_contrasts = numba.njit(cache=True, nogil=True, fastmath=False)(contrasts)
-    compiled_solve = numba.njit(cache=True, nogil=True, fastmath=False)(tree_solve)
-    compiled_multiply = numba.njit(cache=True, nogil=True, fastmath=False)(tree_multiply)
-else:
-    compiled_contrasts = compiled_solve = compiled_multiply = None
-
-
-@dataclass
-class TreeAlgebra:
-    left: np.ndarray
-    right: np.ndarray
-    tip: np.ndarray
-    length: np.ndarray
-    engine: str = 'numba'
-
-    @classmethod
-    def from_newick(cls, path, samples, engine='numba'):
-        root = kinship._NewickParser(Path(path).read_text().strip()).parse()
-        kinship._assign_depths(root, 'error')
-        lookup = {name:i for i,name in enumerate(samples)}
-        leaves = {v.name:v for v in kinship._walk_preorder(root) if v.is_leaf}
-        if len(lookup)!=len(samples) or set(samples)-set(leaves):
-            raise ValueError('Tree must contain every retained sample exactly once')
-        scale = float(np.mean([leaves[name].depth for name in samples]))
-        if not np.isfinite(scale) or scale<=0:
-            raise ValueError('Tree has invalid covariance normalization')
-        left, right, tip, length = [],[],[],[]
-        def append(a,b,s,d):
-            left.append(a);right.append(b);tip.append(s);length.append(d)
-            return len(tip)-1
-        def visit(node):
-            edge = 0.0 if node.parent is None else float(node.length)
-            if node.is_leaf:
-                return append(-1,-1,lookup[node.name],edge) if node.name in lookup else None
-            children = [v for child in node.children if (v:=visit(child)) is not None]
-            if not children: return None
-            current = children[0]
-            for child in children[1:]: current = append(current,child,-1,0.0)
-            length[current] += edge  # Contract unary nodes without moving the root.
-            return current
-        visit(root)
-        return cls(np.array(left,dtype='i8'),np.array(right,dtype='i8'),
-                   np.array(tip,dtype='i8'),np.array(length,dtype='f8')/scale,engine)
-
-    def apply(self, operation, *args):
-        function = {'white':contrasts,'solve':tree_solve,'multiply':tree_multiply}[operation]
-        if self.engine=='numba':
-            function = {'white':compiled_contrasts,'solve':compiled_solve,'multiply':compiled_multiply}[operation]
-            if function is None: raise ValueError('Install numba, or explicitly use --engine python')
-        return function(self.left,self.right,self.tip,self.length,*args)
-
-
-class TreeWorking:
-    def __init__(self, tree, weights, C, z):
-        self.tree, self.weights, self.C, self.z = tree,weights,C,z
-        if C.shape[1]!=1 or not np.all(C==1):
-            raise ValueError('This benchmark compares intercept-only null models')
-        self.data = np.ascontiguousarray(np.column_stack((C,z)))
-
-    def point(self,tau):
-        white,logdet,_,_ = self.tree.apply('white',self.weights,tau,self.data)
-        c,z = white[:,0],white[:,1]
-        information = float(c@c)
-        if not np.isfinite(information) or information<=0:
-            raise np.linalg.LinAlgError('Fixed-effect information is singular')
-        beta = float(c@z)/information
-        residual = z-beta*c
-        return float(logdet+math.log(information)+residual@residual),beta,1.0/information
-
-    def objective(self,tau):
-        return self.point(tau)[0]
-
-    def materialize(self,tau):
-        objective,beta,inverse = self.point(tau)
-        rhs = np.ascontiguousarray(np.column_stack((self.C,self.z-beta)))
-        solved = self.tree.apply('solve',self.weights,tau,rhs)
-        effect = tau*self.tree.apply('multiply',np.ascontiguousarray(solved[:,-1:]))[:,0]
-        return objective,np.array([beta]),effect,solved[:,:1],np.array([[inverse]])
+from ko_variation.tree_null import (TreeAlgebra, TreeWorking, contrasts,
+    tree_solve, tree_multiply, compiled_contrasts, compiled_solve, compiled_multiply)
 
 
 @dataclass
@@ -204,42 +55,11 @@ def weighted_tree(K,weights,kinship_eigensystem=None):
 
 
 def profile_tree(decomp,z,C,K,has_shared_covariance=None):
-    """Same grid, expansion, bounded optimizer and tolerances as _profile_tau.
-
-    The tree backend changes only working-objective/solve evaluation. The
-    production source hash is frozen in benchmark_identity.json for restart.
-    """
+    """Use the production tree working model and tighter inner optimizer."""
     working = TreeWorking(STATE['tree'],decomp.weights,C,z)
     if not has_shared_covariance:
         return 0.0,False,working.materialize(0.0)
-    cache = {}
-    def evaluate(tau):
-        key = float(tau)
-        if key not in cache: cache[key] = working.objective(key)
-        return cache[key]
-    candidates = [0.0]+list(np.logspace(glmm._TAU_GRID_MIN,glmm._TAU_GRID_MAX,25))
-    def safe(tau):
-        try: return evaluate(tau)
-        except (np.linalg.LinAlgError,ValueError,FloatingPointError): return np.inf
-    values = [safe(tau) for tau in candidates]
-    best,boundary = int(np.argmin(values)),False
-    while best==len(candidates)-1 and candidates[-1]<glmm._TAU_ABSOLUTE_MAX:
-        tau = min(glmm._TAU_ABSOLUTE_MAX,candidates[-1]*100.0)
-        candidates.append(float(tau)); values.append(safe(tau))
-        best = int(np.argmin(values))
-        if tau>=glmm._TAU_ABSOLUTE_MAX:
-            boundary = best==len(candidates)-1; break
-    best_tau,best_value = float(candidates[best]),float(values[best])
-    if best>0:
-        lo,hi = max(1e-14,float(candidates[best-1])),float(candidates[min(best+1,len(candidates)-1)])
-        if hi>lo:
-            try:
-                result = optimize.minimize_scalar(lambda t:evaluate(float(math.exp(t))),
-                    bounds=(math.log(lo),math.log(hi)),method='bounded',options={'xatol':1e-6,'maxiter':100})
-                if result.success and np.isfinite(result.fun) and float(result.fun)<best_value:
-                    best_tau,best_value = float(math.exp(result.x)),float(result.fun)
-            except (ValueError,FloatingPointError,np.linalg.LinAlgError): pass
-    return best_tau,boundary,working.materialize(best_tau)
+    return glmm._profile_working(working,xatol=1e-8)
 
 
 def tree_scores(X,cache,tree):
@@ -291,9 +111,10 @@ def probe_indices(identity,index,population):
     ids = rng.choice(population,size=identity['probes'],replace=population<identity['probes'])
     included=identity.get('included_selection')
     if included and index<included['responses']:
-        old_rng=np.random.default_rng(included['seed']+index*1009)
         count=included['probes']
-        ids[:count]=old_rng.choice(included['responses'],size=count,replace=included['responses']<count)
+        prior=dict(seed=included['seed'],probes=count,
+                   included_selection=included.get('included_selection'))
+        ids[:count]=probe_indices(prior,index,included['responses'])
     return ids
 
 
@@ -409,7 +230,7 @@ def include_selection(args,selected,K,names,labels,family):
     if count<target:raise ValueError('Insufficient additional unique responses in sampled pool')
     args._included_selection=dict(directory=str(previous),identity_sha256=digest(previous/'benchmark_identity.json'),
         selected_sha256=products['selected.npy'],responses=len(old),sampled_responses=len(real),
-        probes=identity['probes'],seed=identity['seed'])
+        probes=identity['probes'],seed=identity['seed'],included_selection=identity.get('included_selection'))
     return np.asarray(merged,dtype='u1'),merged_labels
 
 
@@ -645,7 +466,7 @@ def main(argv=None):
     p.add_argument('--engine',choices=['numba','python'],default='numba')
     p.add_argument('--stress-cases',action='store_true');p.add_argument('--plot-only',action='store_true')
     p.add_argument('--alpha',type=float,default=.05);p.add_argument('--bonferroni-tests',type=int)
-    p.add_argument('--probability-tolerance',type=float,default=1e-7)
+    p.add_argument('--probability-tolerance',type=float,default=5e-7)
     p.add_argument('--tau-tolerance',type=float,default=1e-5)
     p.add_argument('--variance-tolerance',type=float,default=1e-6)
     p.add_argument('--intercept-tolerance',type=float,default=1e-6)
@@ -679,7 +500,7 @@ def main(argv=None):
         identity=dict(revision=1,inputs={str(path):digest(path) for path in
             (args.tree,)+(tuple(args.work/name for name in ('prepared.json','patterns.bin','K.npy')) if args.work else (args.fasta,))},
             samples=names,responses=labels,seed=args.seed,repeats=args.repeats,probes=args.probes,
-            engine=args.engine,stress_cases=args.stress_cases,alpha=args.alpha,bonferroni_tests=family,
+            tree_inner_tolerance=1e-8,engine=args.engine,stress_cases=args.stress_cases,alpha=args.alpha,bonferroni_tests=family,
             included_selection=getattr(args,'_included_selection',None),
             critical=float(stats.chi2.isf(args.alpha/family,1)),nominal_critical=float(stats.chi2.isf(.05,1)),
             probability_tolerance=args.probability_tolerance,tau_tolerance=args.tau_tolerance,variance_tolerance=args.variance_tolerance,

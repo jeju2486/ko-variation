@@ -14,7 +14,7 @@ from . import __version__
 from .io_utils import read_fake_fasta
 from .kinship import build_tree_covariance
 from .glmm import prepare_kinship
-from .workflow_cache import cache_matches
+from .checkpoint import cache_matches
 
 
 def main(argv: list[str] | None = None) -> int:

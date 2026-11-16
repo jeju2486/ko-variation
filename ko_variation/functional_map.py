@@ -28,7 +28,7 @@ from ko_variation.discovery_store import atomic_json, write_gzip
 from ko_variation.functional_annotation import prepare_proteins
 from ko_variation.network import discovery_network_input, NODE_COLUMNS, EDGE_COLUMNS
 from ko_variation.network_display import export_gene_network
-from ko_variation.workflow_cache import stage_identity, cache_matches, save_cache, file_signature
+from ko_variation.checkpoint import stage_identity, cache_matches, save_cache, file_signature
 
 
 def recover_sample(source, destination, default_table):

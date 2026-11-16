@@ -371,6 +371,11 @@ def _profile_tau(
         solution = working.materialize(0.0)
         return 0.0, False, solution
 
+    return _profile_working(working)
+
+
+def _profile_working(working, xatol=1e-6):
+    """Shared tau search; dense reference retains its original tolerance."""
     cache: dict[float, float] = {}
 
     def evaluate(tau: float) -> float:
@@ -402,6 +407,8 @@ def _profile_tau(
 
     best_tau = float(candidates[best])
     best_value = float(values[best])
+    if not np.isfinite(best_value):
+        raise np.linalg.LinAlgError("No finite working variance profile")
     if best > 0:
         lo = max(1e-14, float(candidates[best - 1]))
         hi = float(candidates[min(best + 1, len(candidates) - 1)])
@@ -411,7 +418,7 @@ def _profile_tau(
                     lambda log_tau: evaluate(float(math.exp(log_tau))),
                     bounds=(math.log(lo), math.log(hi)),
                     method="bounded",
-                    options={"xatol": 1e-6, "maxiter": 100},
+                    options={"xatol": xatol, "maxiter": 100},
                 )
                 if opt.success and np.isfinite(opt.fun) and float(opt.fun) < best_value:
                     best_tau = float(math.exp(float(opt.x)))
@@ -432,6 +439,7 @@ def fit_logistic_mixed(
     damping: float = 0.8,
     kinship_eigensystem: KinshipEigensystem | None = None,
     timing: dict[str, float] | None = None,
+    tree_algebra=None,
 ) -> tuple[GLMMFit, dict[str, Any]]:
     """Fit a one-kernel logistic mixed model by PQL/pseudo-REML profiling."""
     y = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -500,18 +508,23 @@ def fit_logistic_mixed(
             weights = np.maximum(raw_w, float(weight_floor))
             z = eta + (y - mu) / weights
             operation_started = time.perf_counter()
-            decomp = _weighted_eigen(K, weights, kinship_eigensystem)
+            if tree_algebra is None:
+                decomp = _weighted_eigen(K, weights, kinship_eigensystem)
+            else:
+                from .tree_null import TreeWeights
+                decomp = TreeWeights(weights, tree_algebra)
             timing_output["weighted_eigendecomposition"] += (
                 time.perf_counter() - operation_started
             )
             operation_started = time.perf_counter()
-            tau, boundary, solution = _profile_tau(
-                decomp,
-                z,
-                C,
-                K,
-                has_shared_covariance=has_shared_covariance,
-            )
+            if tree_algebra is None:
+                tau, boundary, solution = _profile_tau(
+                    decomp, z, C, K, has_shared_covariance=has_shared_covariance)
+            else:
+                from .tree_null import TreeWorking
+                working = TreeWorking(tree_algebra, weights, C, z)
+                tau, boundary, solution = (_profile_working(working, xatol=1e-8)
+                    if has_shared_covariance else (0.0, False, working.materialize(0.0)))
             timing_output["tau_profiling"] += time.perf_counter() - operation_started
             objective, beta, random_effect, Sinv_C, M_inv = solution
             eta_target = C @ beta + random_effect
@@ -596,6 +609,13 @@ def fit_null_glmm(
     **kwargs,
 ) -> tuple[GLMMFit, dict[str, Any]]:
     fit, cache = fit_logistic_mixed(y, K, covariates=None, **kwargs)
+    if kwargs.get("tree_algebra") is not None and fit.status not in ("OK", "MONOMORPHIC_RESPONSE"):
+        tree_status = fit.status
+        dense = dict(kwargs); dense.pop("tree_algebra")
+        fit, cache = fit_logistic_mixed(y, K, covariates=None, **dense)
+        fit.message = f"Tree fallback: {tree_status}. " + fit.message
+        if cache:
+            cache["_tree_fallback"] = tree_status
     if cache:
         cache["response"] = int(response)
     return fit, cache
@@ -648,14 +668,17 @@ def score_predictor_block(
     # forward transform, avoiding both the back-transform and cancellation
     # in X.T S^-1 X minus the nuisance-covariate correction.
     coefficient = M_inv @ (Sinv_C.T @ block)
-    weighted_residual = decomp.sqrt_w[:, None] * (block - C @ coefficient)
-    if tau == 0.0:
-        # With S^-1 = W, orthogonality makes even the forward transform redundant.
-        variances = np.sum(weighted_residual * weighted_residual, axis=0)
+    projected = block - C @ coefficient
+    if hasattr(decomp, 'score_variance'):
+        variances = decomp.score_variance(projected, tau)
     else:
-        rotated = decomp.eigenvectors.T @ weighted_residual
-        inverse_spectrum = 1.0 / (1.0 + tau * decomp.eigenvalues)
-        variances = np.sum(inverse_spectrum[:, None] * rotated * rotated, axis=0)
+        weighted_residual = decomp.sqrt_w[:, None] * projected
+        if tau == 0.0:
+            variances = np.sum(weighted_residual * weighted_residual, axis=0)
+        else:
+            rotated = decomp.eigenvectors.T @ weighted_residual
+            inverse_spectrum = 1.0 / (1.0 + tau * decomp.eigenvalues)
+            variances = np.sum(inverse_spectrum[:, None] * rotated * rotated, axis=0)
     residual = y - np.asarray(cache["mu"])
     scores = block.T @ residual
     spa_block: np.ndarray | None = None

@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .postprocess import SelectionConfig, select_distal_signals
-from .workflow_cache import cache_matches, save_cache, stage_identity
+from .checkpoint import cache_matches, save_cache, stage_identity
 
 
 def select_file(source, output, config, *, chunk_rows=50000, pangwes_distances=False,

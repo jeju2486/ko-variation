@@ -36,7 +36,7 @@ from ko_variation.glmm import prepare_kinship
 from ko_variation.kinship import build_tree_covariance
 from ko_variation.phenotype import binary_fasta, filter_cohort, json_write
 from ko_variation.amr_report import read_tsv
-from ko_variation.workflow_cache import stage_identity, cache_matches, save_cache
+from ko_variation.checkpoint import stage_identity, cache_matches, save_cache
 
 ALGORITHM = "tree-pc-screen-benchmark-2"
 POPCOUNT = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(axis=1)

@@ -143,13 +143,7 @@ resident bytes/models and refused insertions are reported by worker. A truly
 exhausted budget can still disable admission safely and recover with headroom;
 the configured maximum is not a guarantee of live capacity.
 
-Whole-null-fit eigensolver profiling is available without changing production
-fitting or saved models:
 
-```bash
-python benchmarks/null_fit_benchmark.py --work kovar_v090/.kovar_work \
-  --out null_driver_comparison --patterns 12 --threads 4
-```
 
 The TSV/JSON compare NumPy and SciPy evd/evr on the same frozen response sample,
 with full-fit timings, decomposition/profiling subtimes, convergence statuses
@@ -389,7 +383,7 @@ counters describe completed evaluation batches; interruption can leave a last
 batch's already-committed decisions without its final timing update. Legacy
 v0.9.0 work lacks these counters, so historical time cannot be reconstructed
 from the new counters alone. Progress prints query counts plus fit/cache counts;
-read-only inspection uses `benchmarks/inspect_discovery.py`.
+read-only inspection uses `ko_variation/progress.py`.
 
 `hierarchy_metrics` separately counts proof-pruned internal/cross blocks and
 heuristically pruned representative blocks. Progress also prints bound-certified
@@ -414,9 +408,9 @@ counts describe an interleaved queue, not a sequence of completed depth stages.
 For a readable diagnosis and a saved snapshot:
 
 ```bash
-python benchmarks/inspect_discovery.py --out kovar_v090 --summary --json-out progress_1.json
+python ko_variation/progress.py --out kovar_v090 --summary --json-out progress_1.json
 # Run again later; use a new output filename to retain the earlier snapshot.
-python benchmarks/inspect_discovery.py --out kovar_v090 --summary \
+python ko_variation/progress.py --out kovar_v090 --summary \
   --previous progress_1.json --json-out progress_2.json
 ```
 

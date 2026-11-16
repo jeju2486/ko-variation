@@ -29,6 +29,7 @@ class TreeNullTests(unittest.TestCase):
             np.save(old/'selected.npy',old_matrix);np.save(old/'K.npy',K)
             identity=dict(samples=names,responses=['pattern:0','pattern:2','synthetic:rare','synthetic:zero'],
                 alpha=.05,bonferroni_tests=6,seed=42,probes=2,
+                included_selection=dict(responses=2,probes=2,seed=7),
                 inputs={str(p):bench.digest(p) for p in (tree,work/'prepared.json',work/'patterns.bin',work/'K.npy')})
             (old/'benchmark_identity.json').write_text(json.dumps(identity))
             (old/'products.json').write_text(json.dumps({name:bench.digest(old/name) for name in ('selected.npy','K.npy')}))

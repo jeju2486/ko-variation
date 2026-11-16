@@ -18,7 +18,7 @@ import tempfile
 import pandas as pd
 
 from .locus_annotation import annotate_work, create_geometry, qualify_reference
-from .workflow_cache import cache_matches, save_cache, stage_identity
+from .checkpoint import cache_matches, save_cache, stage_identity
 
 
 def annotation_environment(python, smoke_test=False):

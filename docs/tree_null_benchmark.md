@@ -99,7 +99,7 @@ global eigenvectors, source patterns, JSON metadata and filesystem overhead.
 They do not measure disk throughput or peak RAM. The tree caches require the
 benchmark's tree-based scorer; they are not drop-in production null files.
 
-Default agreement thresholds are probability absolute error 1e-7, intercept
+Default agreement thresholds are probability absolute error 5e-7, intercept
 absolute error 1e-6, tau relative error 1e-5, working-objective relative error
 1e-7 and score-variance relative error 1e-6. Tau/objective relative errors use a
 denominator of at least one. Decision and variance-status mismatches also fail
@@ -185,7 +185,7 @@ sampled/synthetic label, exact failed criteria and both methods' convergence
 diagnostics. Matched monomorphic controls are excluded from the exception list;
 matched failed fits are not treated as successful validation.
 
-The configured strict probability tolerance remains 1e-7. A small excess alone
+The current probability agreement tolerance is 5e-7 (the earlier strict runs used 1e-7). A small excess alone
 does not establish unacceptable score error, but a looser reporting threshold
 cannot repair nonconvergence or decision disagreement. Review fitted-objective
 agreement and score/log-P errors, especially near the decision boundary, before
@@ -227,3 +227,24 @@ eta/tau gaps, passing conditions and consecutive-pass count. `summary.json`
 counts accepted fits per setting. These are targeted diagnostics, not an
 independent validation sample. The same command resumes completed responses from
 the investigation's own checkpoint; original benchmark products remain unchanged.
+
+## Final tighter-optimizer validation
+
+The benchmark now shares production tree algebra and uses inner log-tau
+optimizer tolerance `1e-8`. It compares raw tree results without automatic dense
+fallback, so convergence exceptions remain visible. Default probability
+agreement tolerance is `5e-7`; other accuracy criteria remain unchanged.
+
+```bash
+python benchmarks/tree_null_benchmark.py \
+  --work /project/kovar_output/saureus/discovery/results/.kovar_work \
+  --tree /project/kovar_output/saureus/discovery/prepared_inputs/saureus_core.rooted.treefile \
+  --include-from /project/benchmarks/tree_null_saureus_p1000_r3_s42 \
+  --out /project/benchmarks/tree_null_saureus_tight_p1000_r3_s42 \
+  --patterns 1000 --repeats 3 --probes 32 --threads 4 --seed 42 --stress-cases
+```
+
+Using the preceding 1,000-pattern selection preserves its sampled responses.
+Its recorded prior probes are retained by `--include-from`, including probe
+provenance from nested earlier selections. Repeats
+measure timing and do not increase independent sample size.

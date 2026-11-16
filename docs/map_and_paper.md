@@ -56,14 +56,13 @@ only its temporary files. It does not fit KOVAR or modify biological inputs.
 Successful production annotation records the interpreter, package versions and
 native executable paths in `annotation/annotation_summary.json`.
 
-The portable runner adds a combined preflight for mapping, eggNOG/DIAMOND,
-eggNOG v2 database-file availability and plotting libraries:
+Run the portable workflow after installing the required mapping and eggNOG tools:
 
 ```bash
-ROOT=/project CHECK_ONLY=1 SMOKE_TEST=1 \
+ROOT=/project   \
 PYSEER_PYTHON=/project/envs/pyseer/bin/python \
 EGGNOG_EXEC=/env/eggnog/bin/emapper.py EGGNOG_DATA_DIR=/databases/eggnog \
-bash benchmarks/run_functional_map.sh saureus
+bash examples/run_functional_map.sh saureus
 ```
 
 `ROOT` has no machine-specific default. The conventional discovery input is
@@ -86,17 +85,10 @@ file, as does the Python helper. An explicit `FASTA` always takes precedence.
 The generated figures default to `ROOT/kovar_output/SPECIES/plots/functional_map`;
 use a distinct `MAP_OUT` when plotting different discovery datasets separately.
 
-`CHECK_ONLY=1` stops after the report; remove it to run the map. `SMOKE_TEST=1`
-additionally exercises real native mapping and PNG/SVG export on tiny temporary
-fixtures; ordinary runs perform dependency checks only. The combined report is
-written to `MAP_OUT/map_environment.json`. Checks confirm executable/import/file
-availability and the synthetic mapping/export contracts; they do not validate
-the full eggNOG database contents or run DIAMOND annotation against it.
-
 ## 1. Functional network from existing annotation
 
 ```bash
-python benchmarks/functional_map.py \
+python -m ko_variation.functional_map \
   --results /project/discovery/results \
   --annotation /project/annotation/locus_to_gene.tsv \
   --gene-catalog /project/annotation/gene_catalog.tsv \
@@ -135,7 +127,7 @@ When the original Bakta files were not copied, use `--gff-dir` instead of
 sample columns, with CDS records and an embedded `##FASTA` assembly section:
 
 ```bash
-python benchmarks/functional_map.py \
+python -m ko_variation.functional_map \
   --results /project/discovery/results \
   --unitigs /project/pangwes/graph.unitigs \
   --panaroo /project/panaroo/gene_presence_absence_roary.csv \
@@ -249,7 +241,7 @@ Functional assignment never adds/deletes a selected edge. See
 ## 3. Generate publication PNG/SVG figures
 
 ```bash
-python benchmarks/paper_plots.py \
+python -m ko_variation.paper_plots \
   --layout /project/plots/functional_map/map.layout.json \
   --out /project/plots/paper --focus mprF --dpi 300
 ```

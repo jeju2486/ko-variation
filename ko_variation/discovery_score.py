@@ -37,6 +37,10 @@ def initialize(work, info, settings):
                   eigen=KinshipEigensystem(np.load(work/"K_values.npy", mmap_mode="r"),
                       np.load(work/"K_vectors.npy", mmap_mode="r"), info["shared_covariance"]))
     alias=work/"null_canonical.npy"
+    if settings.get('null_backend','dense')=='tree':
+        from .tree_null import TreeAlgebra
+        with np.load(work/'tree.npz',allow_pickle=False) as arrays:
+            _STATE['tree']=TreeAlgebra(*(arrays[k] for k in ('left','right','tip','length')))
     _STATE["canonical"]=np.load(alias,mmap_mode="r") if alias.exists() else None
 
 
@@ -238,7 +242,7 @@ def get_null(pattern, external=None, *, manifest=None):
             if record is None:
                 record=json.loads(source.read_text())
             if record['array'] is not None:
-                cache=null_cache.load(record,source,s['eigen'],verify_product)
+                cache=null_cache.load(record,source,s['eigen'],verify_product,s.get('tree'))
                 if not np.array_equal(cache['y'],bits([canonical])[0]):
                     raise ValueError('Cached null response differs')
             if record['status']=='OK' and cache is None:
@@ -252,11 +256,14 @@ def get_null(pattern, external=None, *, manifest=None):
                 print(f'[KOVAR worker {os.getpid()}] fitting response pattern {canonical}',flush=True)
                 s['last_log']=started
             fit,cache=fit_null_glmm(canonical,bits([canonical])[0].astype(float),s['K'],
-                                   kinship_eigensystem=s['eigen'])
+                                   kinship_eigensystem=s['eigen'],tree_algebra=s.get('tree'))
             metric('new_null_fits')
             metric('null_fit_worker_seconds',time.monotonic()-started)
             record=dict(pattern=canonical,status=fit.status,fit_seconds=time.monotonic()-started,
                         iterations=fit.iterations,array=None)
+            if cache is not None and cache.get('_tree_fallback'):
+                record['tree_fallback']=cache['_tree_fallback']
+                metric('tree_null_fallbacks')
             if fit.status!='OK':
                 cache=None
         compact=s['settings'].get('null_cache_format','full')=='compact'
@@ -264,7 +271,7 @@ def get_null(pattern, external=None, *, manifest=None):
         compatible=null_cache.compatible(record,compact,rank,s['info']['n'])
         if source is None or not compatible:
             started=time.perf_counter()
-            if cache is not None and cache['decomp'].eigenvectors.shape[1]<min(rank,len(cache['y'])):
+            if cache is not None and not hasattr(cache['decomp'],'score_variance') and cache['decomp'].eigenvectors.shape[1]<min(rank,len(cache['y'])):
                 null_cache.complete(cache,s['K'],s['eigen'])
             record=null_cache.save(meta.parent,canonical,cache,record,s['K'],s['eigen'],compact=compact,rank=rank,
                                    previous_record=record if source==meta else {})
@@ -274,7 +281,8 @@ def get_null(pattern, external=None, *, manifest=None):
         s['last_null_manifest']=(source,record)
         if cache is not None:
             cache['_pattern']=canonical
-            cache['_inverse_spectrum']=1/(1+cache['tau']*cache['decomp'].eigenvalues)
+            if not hasattr(cache['decomp'],'score_variance'):
+                cache['_inverse_spectrum']=1/(1+cache['tau']*cache['decomp'].eigenvalues)
         value=(cache,record['status'])
         s['nulls'].put(canonical,value,cache_charge(cache))
     value=_view(value,pattern,canonical)
@@ -284,6 +292,7 @@ def get_null(pattern, external=None, *, manifest=None):
 
 
 def ensure_complete(cache):
+    if hasattr(cache['decomp'],'score_variance'): return
     started=time.perf_counter()
     needed=cache['tau']!=0 and cache['decomp'].eigenvectors.shape[1]<len(cache['decomp'].eigenvalues)
     if needed and null_cache.complete(cache,_STATE['K'],_STATE['eigen']):
@@ -331,6 +340,20 @@ def adaptive_statistics(X, cache, criticals, ranks=(0, 8, 16, 32, 64, 128)):
     Outward roundoff margins prevent near-boundary decisions from being
     accepted prematurely. Singular/invalid cases use the existing exact core.
     """
+    if hasattr(cache['decomp'],'score_variance'):
+        # Tree contrasts provide the exact variance in O(n) per predictor.
+        # Spectral truncation is unnecessary; retain the same score definition.
+        started=time.perf_counter()
+        lo,hi=np.zeros(X.shape[1]),np.full(X.shape[1],np.inf)
+        p,status=[None]*X.shape[1],[]
+        for i,result in enumerate(score_predictor_block(X,cache,compute_spa_adjustment=False)):
+            status.append(result.status)
+            if result.status=='OK':
+                lo[i]=hi[i]=result.score_z**2
+                p[i]=float(result.p_score)
+        metric('exact_worker_seconds',time.perf_counter()-started)
+        metric('exact_pairs',X.shape[1])
+        return lo,hi,p,status
     C, decomp = cache["C"], cache["decomp"]
     A = decomp.sqrt_w[:, None]*(X-C @ (cache["M_inv"] @ (cache["Sinv_C"].T @ X)))
     energy = np.sum(A*A, axis=0)

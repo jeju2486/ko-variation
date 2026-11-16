@@ -17,9 +17,9 @@ python -m pip install -e '.[network,phenotype]'
 ko-variation --version
 ```
 
-The package version is 0.9.2; the numerical execution revision remains
-`pc-screen-1`. The publication cleanup changes interfaces and optional helpers,
-while keeping the discovery, null-fitting and score kernels unchanged.
+Version 0.9.3 adds an optional compact tree-null backend. Dense fitting remains
+the default until the full real-data validation of the tighter optimizer is
+complete. Install `.[tree]` and add `--null-backend tree` to use it.
 
 ## Discover covariation
 
@@ -72,10 +72,6 @@ The same `--resume` command skips committed beta fits. Its beta-stage log and
 statuses and new fits in the current invocation. There is no separate beta
 restart command. See [beta checkpoints](docs/discovery.md#beta-checkpoints).
 
-For missing S. aureus AMR targets, the separate [target diagnosis](docs/target_diagnosis.md)
-searches the original unitig pool and compares direct mecA–graR/mecA–sen score
-tests and beta fits against the saved run. It does not modify discovery results.
-
 The first discovery output must be empty. For a wrapper that prepares inputs
 itself, use sibling directories `run/prepared_inputs` and `run/results`, and
 pass only `run/results` to `--out`. [Full run/cache instructions](docs/discovery.md).
@@ -95,8 +91,8 @@ pass only `run/results` to `--out`. [Full run/cache instructions](docs/discovery
 | Prepare/resolve annotations | `ko-variation-map-loci` | [annotation](docs/downstream.md) |
 | Select/refit existing tables | `ko-variation-select`, `ko-variation-annotation` | [downstream](docs/downstream.md) |
 | Draw covariation maps | `ko-variation-network` | [networks](docs/functional_map.md) |
-| Build functional maps from discovery exports | `benchmarks/functional_map.py` | [standalone map workflow](docs/map_and_paper.md) |
-| Draw publication overview/focal panels | `benchmarks/paper_plots.py` | [PNG/SVG paper figures](docs/map_and_paper.md#3-generate-publication-pngsvg-figures) |
+| Build functional maps from discovery exports | `ko-variation-functional-map` | [standalone map workflow](docs/map_and_paper.md) |
+| Draw publication overview/focal panels | `ko-variation-paper-plots` | [PNG/SVG paper figures](docs/map_and_paper.md#3-generate-publication-pngsvg-figures) |
 | Functional annotation | `ko-variation-prepare-proteins` | [functional map](docs/functional_map.md) |
 | Match AMR phenotypes/determinants | `ko-variation-amr-report` | [AMR report](docs/amr_report.md) |
 | Quantitative MIC comparison | `ko-variation-phenotype` | [phenotype](docs/phenotype.md) |
@@ -113,5 +109,8 @@ analysis. [Package structure](docs/architecture.md).
 Benchmarks are optional source-checkout programs outside the installed package.
 They do not run during discovery. [Benchmark index](benchmarks/README.md) covers
 PC-count/retention recovery, exact-versus-bounded significance, beta refits and
-eigensolvers. Existing raw benchmark tables/figures are retained separately from
+tree-null numerical validation. Existing raw benchmark tables/figures are retained separately from
 software source. [Validation scope](docs/validation.md).
+
+See [current project state](PROJECT_STATE.md) for branch responsibilities and
+[tree-null settings](docs/tree_null.md) for accuracy, storage and restart rules.

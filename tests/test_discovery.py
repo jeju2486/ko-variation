@@ -77,43 +77,8 @@ class DiscoveryTests(unittest.TestCase):
                 set_meta(db,"exhaustive_cursor",[1,0])
             db.close()
             kernels._STATE.clear()
-            # Exercise migration from the exact released v0.9.0 identity while
-            # preserving the completed pattern/model/decision products.
-            from ko_variation.null_identity import V090_CODE
-            legacy=json.loads((work/"run_identity.json").read_text())
-            legacy['version']='0.9.0'
-            legacy['code']={key:sorted(values)[0] for key,values in V090_CODE.items()}
-            legacy['settings']['batch_size']=3
-            atomic_json(work/'run_identity.json',legacy)
             self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
-            self.assertTrue((work/'run_identity.v090.json').exists())
             self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
-            # The execution-only v0.9.1 migration also keeps every saved model.
-            from ko_variation.null_identity import V091_CODE
-            legacy=json.loads((work/'run_identity.json').read_text())
-            legacy['version']='0.9.1'
-            legacy['code']={key:sorted(values)[0] for key,values in V091_CODE.items()}
-            atomic_json(work/'run_identity.json',legacy)
-            self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
-            self.assertTrue((work/'run_identity.v091.json').exists())
-            self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
-            from ko_variation.null_identity import V092_CODE
-            legacy=json.loads((work/'run_identity.json').read_text())
-            legacy.pop('execution_revision',None)
-            legacy['code']={key:sorted(values)[0] for key,values in V092_CODE.items()}
-            atomic_json(work/'run_identity.json',legacy)
-            self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
-            self.assertTrue((work/'run_identity.v092.json').exists())
-            self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
-            from ko_variation.null_identity import PREFIT1_CODE,PREFIT2_CODE,STREAMLINED_CODE
-            for revision,code in [('prefit-compact-1',PREFIT1_CODE),('prefit-compact-2',PREFIT2_CODE),('streamlined-1',STREAMLINED_CODE)]:
-                previous=json.loads((work/'run_identity.json').read_text())
-                previous['execution_revision']=revision
-                previous['code']={key:sorted(values)[0] for key,values in code.items()}
-                atomic_json(work/'run_identity.json',previous)
-                self.assertEqual(main(common+["--out",str(out),"--search","exhaustive","--resume","--require-cached-nulls"]),0)
-                self.assertTrue((work/f'run_identity.v092.{revision}.json').exists())
-                self.assertEqual(before,{p:p.stat().st_mtime_ns for p in before})
             exact_out = folder/"exact"
             self.assertEqual(main(common+["--out",str(exact_out),"--search","exhaustive","--exact",
                                           "--reuse-nulls-from",str(out),"--require-cached-nulls"]),0)

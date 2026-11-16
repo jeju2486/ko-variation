@@ -100,7 +100,7 @@ def saved_null(response):
                 def verify(path, expected):
                     if digest(path) != expected:
                         raise ValueError(f'Corrupted cached null: {path}')
-                value = discovery_nulls.load(record, source, STATE['eigen'], verify)
+                value = discovery_nulls.load(record, source, STATE['eigen'], verify, shared_tree(STATE))
                 if not np.array_equal(value['y'], bits(canonical)):
                     raise ValueError('Saved null response does not match the pattern pool')
         cache[canonical] = (value, status)
@@ -406,6 +406,14 @@ def main(argv=None):
     print(json.dumps(summary['methods'],indent=2),flush=True)
     print(f'[beta benchmark] Reports saved to {args.out}',flush=True)
 
+
+
+def shared_tree(state):
+    path = state['work']/'tree.npz'
+    if 'tree' not in state:
+        from ko_variation.tree_null import TreeAlgebra
+        state['tree'] = TreeAlgebra.load(path) if path.exists() else None
+    return state['tree']
 
 if __name__ == '__main__':
     try:

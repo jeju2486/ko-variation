@@ -10,8 +10,8 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from benchmarks.functional_map import main as map_main,function_inputs,recover_inputs,recover_sample
-from benchmarks.paper_plots import main as paper_main
+from ko_variation.functional_map import main as map_main,function_inputs,recover_inputs,recover_sample
+from ko_variation.paper_plots import main as paper_main
 from ko_variation.network import discovery_network_input,build_gene_network
 
 
@@ -110,8 +110,8 @@ class MapPaperTests(unittest.TestCase):
 
             nodes = pd.DataFrame({'gene':['A','B']})
             edges = pd.DataFrame({'gene_a':['A'],'gene_b':['B']})
-            with patch('benchmarks.functional_map.shutil.which',return_value=str(executable)), \
-                 patch('benchmarks.functional_map.subprocess.run',side_effect=fake):
+            with patch('ko_variation.functional_map.shutil.which',return_value=str(executable)), \
+                 patch('ko_variation.functional_map.subprocess.run',side_effect=fake):
                 with self.assertRaises(subprocess.CalledProcessError):
                     function_inputs(args,nodes,edges)
                 saved = function_inputs(args,nodes,edges)

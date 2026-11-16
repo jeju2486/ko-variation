@@ -445,7 +445,7 @@ def response_null(response):
     save_local = False
     if local_record and (not required or local_record.get('origin')=='original_null_cache'):
         record = local_record; origin = record.get('origin', 'diagnostic_checkpoint')
-        if record['status']=='OK': cache = discovery_nulls.load(record, local, s['eigen'], verify)
+        if record['status']=='OK': cache = discovery_nulls.load(record, local, s['eigen'], verify, shared_tree(s))
     elif s['reuse']['enabled']:
         row = s['source'].execute('SELECT canonical FROM null_aliases WHERE pid=?', (response,)).fetchone()
         canonical = row[0] if row else response
@@ -458,7 +458,7 @@ def response_null(response):
             if record.get('format')!=2:
                 raise ValueError(f'Unsupported original null cache format for response {response}: {old}')
             if record['status']=='OK':
-                cache = discovery_nulls.load(record, old, s['eigen'], verify)
+                cache = discovery_nulls.load(record, old, s['eigen'], verify, shared_tree(s))
                 if not np.array_equal(cache['y'], vector(canonical)):
                     raise ValueError('Cached null response differs from frozen pattern')
                 if response != canonical: cache = dict(cache, y=vector(response), mu=1-cache['mu'])
@@ -1604,6 +1604,14 @@ def main(argv=None):
     args, remaining = parser.parse_known_args(argv)
     return {'kovar': run_kovar, 'pyseer': run_pyseer, 'sccmec': run_sccmec}[args.command](remaining)
 
+
+
+def shared_tree(state):
+    path = state['work']/'tree.npz'
+    if 'tree' not in state:
+        from ko_variation.tree_null import TreeAlgebra
+        state['tree'] = TreeAlgebra.load(path) if path.exists() else None
+    return state['tree']
 
 if __name__ == '__main__':
     main()

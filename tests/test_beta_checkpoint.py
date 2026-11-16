@@ -138,37 +138,15 @@ class BetaCheckpointTests(unittest.TestCase):
                 self.assertEqual(json.loads((root/'beta_progress.json').read_text())['saved'], 3)
             db.close()
 
-    def test_previous_pc40_checkpoint_migrates_without_relaxing_scientific_checks(self):
+    def test_restart_requires_same_numerical_release(self):
+        expected=dict(settings={'alpha':.05},code={'glmm.py':'current'})
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fasta, tree = root/'input.fa', root/'tree.nwk'
-            fasta.write_text('>s\nAC\n')
-            tree.write_text('(s:1);')
-            args = parser().parse_args(['--fasta', str(fasta), '--tree', str(tree), '--out', str(root)])
-            expected = identity(args)
-            previous = copy.deepcopy(expected)
-            previous['code'].update({
-                'discovery.py': 'ed0f27ddee6a7b90a45d6002ffbe147a0787a7cef01520d78304bc25fae3b78e',
-                'null_identity.py': 'dc344fa33bad4180ce81f4cd7e21f2cd900c789af2c558906bc2155cc4471133'})
-            manifest = root/'run_identity.json'
-            manifest.write_text(json.dumps(previous))
-            self.assertTrue(migrate_identity(previous, expected, manifest))
-            self.assertEqual(json.loads(manifest.read_text()), expected)
-            # Immediately preceding release is accepted with numerical code unchanged.
-            prior_cutoff = copy.deepcopy(expected)
-            prior_cutoff['code'].update({
-                'discovery.py':'03a470f36404bfad4521d5934d17c59b79dedeed16b2fccb0e525f934aa58a37',
-                'null_identity.py':'d655a839c4d94928b2f1d8e476686192474a63fcf164e5b131a4bb037a581440'})
-            self.assertTrue(migrate_identity(prior_cutoff,expected,manifest))
-            self.assertTrue((root/'run_identity.v092.pc-screen-1.json').is_file())
-            changed = copy.deepcopy(previous)
-            changed['settings']['min_maf'] = .1
-            with self.assertRaisesRegex(ValueError, 'Scientific settings changed'):
-                migrate_identity(changed, expected, manifest)
-            changed = copy.deepcopy(previous)
-            changed['code']['glmm.py'] = 'unverified numerical source'
-            with self.assertRaisesRegex(ValueError, 'not a verified release'):
-                migrate_identity(changed, expected, manifest)
+            manifest=Path(temporary)/'identity.json'
+            self.assertFalse(migrate_identity(expected,expected,manifest))
+            with self.assertRaisesRegex(ValueError,'Scientific'):
+                migrate_identity(dict(expected,settings={'alpha':.01}),expected,manifest)
+            with self.assertRaisesRegex(ValueError,'verified'):
+                migrate_identity(dict(expected,code={'glmm.py':'old'}),expected,manifest)
 
 
 if __name__ == '__main__':

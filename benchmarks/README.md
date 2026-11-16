@@ -1,56 +1,32 @@
-# Benchmarks and standalone publication figures
+# Manuscript reproducibility and development
 
-These optional programs are outside the installed statistical package. Run from
-the repository root with KOVAR importable. Store results outside this source tree.
+These tools are optional and are not imported by a normal KOVAR run. Keep outputs
+outside the checkout, retaining identities, sample selections, checkpoints,
+comparison tables and figure source data. Numerical and candidate universes must
+match before comparing recovery percentages.
 
-| Question | Program | Preserved outputs |
+| Priority | Purpose | Programs |
 |---|---|---|
-| MI vs tree-PC ranking, PC count/retention | `python -m benchmarks.screen_benchmark` | recovery.tsv, ranks, timings, frozen panel/reference |
-| Extend/redraw completed PC results | `benchmarks.screen_benchmark_extend`, `python -m benchmarks.plot_screen_benchmark --out DIR` | extended_pcs and PNG/SVG |
-| Exact vs adaptive significance, hierarchy and PC40 recovery | `python -m benchmarks.discovery_benchmark` | comparison.tsv and per-arm summaries/checkpoints |
-| Redraw saved significance benchmark | `python -m benchmarks.plot_discovery_benchmark --out DIR` | recovery, wall-time and query-count PNG/SVG |
-| Full vs warm/score beta | `python benchmarks/beta_benchmark.py` | beta_results.tsv, beta_summary.json, plots |
-| Full-refit eigensolvers | `python benchmarks/beta_eigensolver_benchmark.py` | eigensolver_results.tsv, eigensolver_summary.json, plots |
-| Dense versus tree-based PQL null fitting, scores and cache sizes | `python benchmarks/tree_null_benchmark.py` | [paired timings, numerical agreement, PNG/SVG and restart](../docs/tree_null_benchmark.md) |
-| Progress of a discovery run | `python benchmarks/inspect_discovery.py` | read-only snapshots and ETA comparisons |
-| KOVAR target diagnosis, matched pyseer and optional carriage checks | `bash benchmarks/run_amr_checks.sh saureus` or `python benchmarks/amr_checks.py COMMAND` | [inputs, separate environments, reports and resume](../docs/amr_checks.md) |
-| Completed discovery to functional covariation map | `python benchmarks/functional_map.py` | annotated HTML/PNG/SVG, gene tables and unitig-support audit |
-| Check mapping/eggNOG/plot environment and run the map | `ROOT=/project bash benchmarks/run_functional_map.sh SPECIES` | map_environment.json; CHECK_ONLY/SMOKE_TEST controls |
-| Publication overview and focal neighbourhoods | `python benchmarks/paper_plots.py` | editable SVG/PNG, component/function summaries and captions |
+| Essential | Dense versus tree nulls: convergence, score agreement, runtime and cache size | tree_null_benchmark.py |
+| Essential | MI versus tree-PC recovery, PC counts and retention | screen_benchmark.py, screen_benchmark_extend.py, plot_screen_benchmark.py |
+| Essential | Exact versus adaptive decisions and hierarchical/PC screening recovery | discovery_benchmark.py, plot_discovery_benchmark.py |
+| Useful | Full beta refitting versus warm fitting and score approximation | beta_benchmark.py |
+| Conditional | Consolidated KOVAR/pyseer/AMR checks supporting biological claims | amr_checks.py, run_amr_checks.sh |
+| Temporary | Trace unresolved tree-null cases | investigate_tree_null.py |
 
-The PC benchmark was moved from the research modules injected into ko_variation
-into this separate directory. Existing completed PC results can still be plotted
-or extended. A fresh historical reference needs `--reference-python` pointing to
-an independent, non-editable v0.8.3 environment; the subprocess removes PYTHONPATH
-so this release's direct-discovery CLI cannot override that installation.
-Recomputing a reference after source/settings changes needs a new output.
+[Tree validation and investigation](../docs/tree_null_benchmark.md),
+[beta comparison](beta_benchmark.md), [AMR checks](../docs/amr_checks.md).
+The superseded alternative-eigensolver benchmark was retired; historical source
+remains available in Git. Preserve any result used by the manuscript externally.
 
-The current significance benchmark uses the production exact/bounded paths and
-caps input at 2,000 loci by default. It keeps the hypothesis family fixed when
-specified and reuses compatible nulls. It reports final-hit and coarse-gate
-recovery separately. The historical PC rank benchmark and production coarse PC
-screen are different candidate universes; do not transfer recall percentages
-between them without testing.
+Functional maps, paper figures and progress inspection are installed tools:
+`ko-variation-functional-map`, `ko-variation-paper-plots`, `ko-variation-progress`.
+They remain available on the minimal publication branch.
 
-The beta/eigensolver benchmarks read prepared arrays and a frozen selection.
-Their scripts/outputs and checkpoints are independent of the main search. See
-[beta details](beta_benchmark.md) and [eigensolver details](beta_eigensolver_benchmark.md).
-No benchmark is a default dependency of discovery.
-
-The two standalone map/figure programs reuse saved association and beta results;
-they do not fit statistical models or generate QQ plots. See the
-[functional map and publication guide](../docs/map_and_paper.md). Server wrappers
-remain separate from this public source tree.
-
-For a fresh production significance benchmark, `--source-run DIR` samples a
-frozen random panel from an existing run's prepared **unique patterns**. Add
-`--patterns 1000 --seed 42 --threads 4 --out NEW_DIR`. The full source-pattern
-Bonferroni family is retained by default. Selection uses no phenotype or
-association results. Existing `--fasta PANEL --tree TREE` inputs remain supported.
-The benchmark never sends the full genome to exhaustive comparison by default.
-Plotting a saved `comparison.tsv` performs no fitting and preserves its timings.
-
-The PC-count benchmark retains its historical design and requires an independent
-installed v0.8.3 reference Python for fresh reference fits. Its reference family
-is recorded separately from the production significance benchmark. These two
-recovery percentages describe their respective candidate/reference universes.
+PC screening and representative hierarchy are approximate candidate searches.
+Their missed-hit rates require measurement; an adaptive score interval certifies
+only the queried pair, conditional on its fitted null. The Bonferroni family stays
+fixed across benchmark arms. The historical PC benchmark may require an isolated
+v0.8.3 reference installation. Production significance comparisons use the current
+package. Never reuse a reference generated under different numerical settings as
+if it were a matched comparison.

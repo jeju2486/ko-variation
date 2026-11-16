@@ -25,6 +25,7 @@ def compatible(record, compact, rank, n):
     if record['status']!='OK': return True
     if record.get('format')!=2: return False
     mode=record.get('mode')
+    if mode=='tree': return True
     if not compact: return mode=='full'
     return mode in ('zero','shared') or (mode=='full' and n<=rank) or (
         mode=='sketch' and record.get('rank',0)>=min(rank,n))
@@ -33,6 +34,7 @@ def compatible(record, compact, rank, n):
 def complete(cache, K, eigen):
     """Materialize missing eigenvectors only for a genuine exact fallback."""
     d=cache['decomp']
+    if hasattr(d, 'score_variance'): return False
     if cache['tau']==0 or d.eigenvectors.shape[1]==len(d.eigenvalues):
         return False
     full=_weighted_eigen(K,cache['weights'],eigen)
@@ -43,7 +45,7 @@ def complete(cache, K, eigen):
     return True
 
 
-def load(record, meta, eigen, verify):
+def load(record, meta, eigen, verify, tree=None):
     product=Path(meta).parent/record['array']['name']
     verify(product,record['array']['sha256'])
     with np.load(product,allow_pickle=False) as saved:
@@ -51,6 +53,11 @@ def load(record, meta, eigen, verify):
         cache['tau']=float(saved['tau'])
         n=len(cache['y'])
         mode=record.get('mode','full')
+        if mode=='tree':
+            if tree is None: raise ValueError('Tree cache requires its shared tree algebra')
+            from .tree_null import TreeWeights
+            cache['decomp']=TreeWeights(cache['weights'],tree)
+            return cache
         sqrt_w=saved['sqrt_w']
         if mode=='zero':
             values,vectors=np.zeros(n),np.empty((n,0))
@@ -75,7 +82,9 @@ def save(folder, pattern, cache, record, K, eigen, *, compact=True, rank=128, pr
     record=dict(record,pattern=pattern,format=2,array=None)
     if cache is not None:
         d=cache['decomp']
-        if compact and cache['tau']==0:
+        if hasattr(d, 'score_variance'):
+            mode='tree'
+        elif compact and cache['tau']==0:
             mode='zero'
         elif compact and np.all(cache['weights']==cache['weights'][0]):
             mode='shared'
@@ -84,8 +93,9 @@ def save(folder, pattern, cache, record, K, eigen, *, compact=True, rank=128, pr
         if mode=='full':
             complete(cache,K,eigen)
         data={key:cache[key] for key in FIELDS}
-        data.update(tau=cache['tau'],sqrt_w=d.sqrt_w,logdet_w_inverse=d.logdet_w_inverse)
-        if mode not in ('zero','shared'):
+        data.update(tau=cache['tau'])
+        if mode!='tree': data.update(sqrt_w=d.sqrt_w,logdet_w_inverse=d.logdet_w_inverse)
+        if mode not in ('zero','shared','tree'):
             order=np.argsort(d.eigenvalues)[::-1]
             # Fits/legacy caches may use ascending eigenvectors. A loaded sketch
             # already has descending values; never index beyond its stored rank.

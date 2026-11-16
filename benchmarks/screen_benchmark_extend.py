@@ -16,7 +16,7 @@ from scipy import linalg
 
 from ko_variation.checkpoint import fingerprint_file
 from ko_variation.phenotype import json_write
-from ko_variation.workflow_cache import stage_identity, cache_matches, save_cache
+from ko_variation.checkpoint import stage_identity, cache_matches, save_cache
 from .screen_benchmark import (
     code_identity, evaluate, log, measure, npz, residual_scores, table, versions,
 )
