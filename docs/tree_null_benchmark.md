@@ -196,3 +196,34 @@ checkpoint without refitting, using `--plot-only` with its original output.
 Per-fit fields not recorded by the old program remain unavailable. Full fitting
 with the changed benchmark source still requires a new output, preserving the
 original experiment's code identity.
+
+## Investigate the remaining exceptions
+
+Use the saved larger benchmark directly; no original discovery folder is needed:
+
+```bash
+python benchmarks/investigate_tree_null.py \
+  --benchmark /project/benchmarks/tree_null_saureus_p1000_r3_s42 \
+  --out /project/benchmarks/tree_null_saureus_investigation \
+  --threads 4
+```
+
+Selection includes nonconvergence and numerical failures remaining at the earlier
+`5e-7` probability sensitivity threshold (nine plus two responses in the reported
+run). This threshold selects cases only: acceptance retains all original strict
+tolerances. Set `--selection-probability-tolerance 1e-7` to investigate every
+original strict outlier instead.
+
+Each selected response is fitted once with five settings: dense/100 iterations,
+tree/100, tree/300, tree/300 with inner log-tau optimization tolerance `1e-8`, and
+tree/300 with damping `0.5`. Outer convergence tolerance remains `1e-7` throughout.
+The script calls the production fitting loop and observes its working solutions;
+it does not replace the loop or modify production files. Scores use the original
+probe vectors and ordinary score test, with SPA disabled as in the benchmark.
+
+`fits.tsv` reports convergence, final gaps and numerical/decision differences
+against a freshly fitted dense reference. `trace.tsv` records every iteration's
+eta/tau gaps, passing conditions and consecutive-pass count. `summary.json`
+counts accepted fits per setting. These are targeted diagnostics, not an
+independent validation sample. The same command resumes completed responses from
+the investigation's own checkpoint; original benchmark products remain unchanged.
