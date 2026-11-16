@@ -11,6 +11,7 @@ the repository root with KOVAR importable. Store results outside this source tre
 | Redraw saved significance benchmark | `python -m benchmarks.plot_discovery_benchmark --out DIR` | recovery, wall-time and query-count PNG/SVG |
 | Full vs warm/score beta | `python benchmarks/beta_benchmark.py` | beta_results.tsv, beta_summary.json, plots |
 | Full-refit eigensolvers | `python benchmarks/beta_eigensolver_benchmark.py` | eigensolver_results.tsv, eigensolver_summary.json, plots |
+| Dense versus tree-based PQL null fitting, scores and cache sizes | `python benchmarks/tree_null_benchmark.py` | [paired timings, numerical agreement, PNG/SVG and restart](../docs/tree_null_benchmark.md) |
 | Progress of a discovery run | `python benchmarks/inspect_discovery.py` | read-only snapshots and ETA comparisons |
 | KOVAR target diagnosis, matched pyseer and optional carriage checks | `bash benchmarks/run_amr_checks.sh saureus` or `python benchmarks/amr_checks.py COMMAND` | [inputs, separate environments, reports and resume](../docs/amr_checks.md) |
 | Completed discovery to functional covariation map | `python benchmarks/functional_map.py` | annotated HTML/PNG/SVG, gene tables and unitig-support audit |
