@@ -7,7 +7,8 @@ before reusing numbers or caches; proposals are distinguished from conclusions.
 
 ## P0 -- release, accepted calculation and immediate next step
 
-- Public release: **main / v0.9.4**, also maintained as codex/publication-clean.
+- Public release: **main / v0.9.4**. The temporary publication branch was
+  deleted after its commits were merged; use main for the minimal public tool.
   Keep discovery, annotation, maps, PNG/SVG figures, AMR/MIC helpers, progress
   and portable runners. Development: **codex/downstream-resume-progress**;
   supplementary benchmarks and temporary diagnostics stay there.
@@ -194,3 +195,31 @@ before reusing numbers or caches; proposals are distinguished from conclusions.
 - User preferences: concise updates, focused checks, useful comments, genuinely
   fewer/clearer functions, commit/push authorized work; respect “do not change
   scripts yet” and distinguish local tests from external server execution.
+
+## Prioritized to-do list
+
+1. [ ] Validate the tighter tree optimizer on the frozen 1,000-pattern selection;
+   retain dense comparison, original probe provenance, all fitting failures and
+   significance decisions. Use the agreed probability criterion of 5e-7.
+2. [ ] Validate on an independent selection and improve coverage immediately
+   around the Bonferroni decision threshold. Resolve the earlier execution/
+   environment discrepancy using the matching original benchmark identity.
+3. [ ] Measure integrated runtime, peak memory, cache I/O and storage rather than
+   transferring per-fit speedups to the whole pipeline. Keep dense default until
+   the larger evidence supports changing it.
+4. [ ] Recheck PC40/retention/hierarchy recovery against exact small-panel
+   references using the same cohort, eligibility rules and full hypothesis family;
+   quantify missed hits before tightening query budgets.
+5. [ ] Run final species-specific configurations with frozen cohort/sample order,
+   documented cell and distance cutoffs, durable state and restart checks.
+6. [ ] Revisit missing AMR targets and any GOLD/pyseer differences only from
+   matched feature definitions, cohorts, relatedness and test families; preserve
+   unresolved findings rather than infer absence or epistasis from a map.
+7. [ ] Generate final functional maps and publication SVG/PNG panels. Select
+   biological interpretation/phenotype analyses according to observed support.
+8. [ ] Assemble supplementary figures: null accuracy/runtime/storage; PC-budget
+   recovery; exact/bounded/hierarchy recovery. Add beta and AMR/MIC evidence only
+   where useful to manuscript claims, with frozen tables/settings and provenance.
+9. [ ] Retire temporary investigation code after validation; keep only main and
+   the development branch for this workflow, preserving reproducibility sources
+   on development and the concise handoff here.
