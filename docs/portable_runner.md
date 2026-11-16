@@ -17,7 +17,7 @@ that external executable.
 Create an isolated environment and install from the publication branch:
 
 ```bash
-git clone --branch codex/publication-clean https://github.com/jeju2486/ko-variation.git
+git clone --branch main https://github.com/jeju2486/ko-variation.git
 cd ko-variation
 python3 -m venv .venv
 source .venv/bin/activate

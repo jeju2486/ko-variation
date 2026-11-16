@@ -33,3 +33,9 @@ The proposed validation probability tolerance is `5e-7`, alongside the existing
 intercept/objective/tau/variance checks and significance decisions. The large
 tighter-optimizer benchmark remains pending. See `PROJECT_STATE.md` for the
 current evidence and the development branch for reproducibility programs.
+
+
+Version 0.9.4 is a metadata/documentation release of the same numerical revision.
+It accepts a v0.9.3 checkpoint only when every scientific input, numerical
+source, environment, setting and execution revision still matches. Version and
+identity-helper metadata are updated without refitting in that specific case.

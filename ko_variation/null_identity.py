@@ -25,9 +25,18 @@ def null_source_hash():
 
 
 def migrate_identity(previous, expected, manifest):
-    """Resume this numerical release only; never migrate old statistical state."""
+    """Allow metadata-only releases; never migrate changed numerical state."""
     if previous == expected:
         return False
+    if previous.get('null_model_source_sha256'):
+        metadata_only=dict(previous,version=expected.get('version'))
+        code=dict(previous.get('code',{}))
+        code['null_identity.py']=expected.get('code',{}).get('null_identity.py')
+        metadata_only['code']=code
+        if metadata_only==expected:
+            from .discovery_store import atomic_json
+            atomic_json(manifest,expected)
+            return True
     if previous.get('settings') != expected.get('settings'):
         raise ValueError('Scientific settings changed; use a new output')
     raise ValueError('Input/code/environment differs from this verified run; use a new output')

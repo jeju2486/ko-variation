@@ -148,6 +148,26 @@ class BetaCheckpointTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'verified'):
                 migrate_identity(dict(expected,code={'glmm.py':'old'}),expected,manifest)
 
+    def test_metadata_release_reuses_identical_numerical_state(self):
+        expected=dict(version='0.9.4',settings={'null_backend':'tree'},
+            execution_revision='tree-null-1',null_model_source_sha256='same-fitter',
+            numpy='same-numpy',scipy='same-scipy',inputs={'tree':'same-tree'},
+            code={'glmm.py':'same','tree_null.py':'same','null_identity.py':'new-helper'})
+        previous=copy.deepcopy(expected)
+        previous['version']='0.9.3'
+        previous['code']['null_identity.py']='old-helper'
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest=Path(temporary)/'run_identity.json'
+            self.assertTrue(migrate_identity(previous,expected,manifest))
+            self.assertEqual(json.loads(manifest.read_text()),expected)
+            for key in ('glmm.py','tree_null.py'):
+                changed=copy.deepcopy(previous);changed['code'][key]='changed'
+                with self.assertRaisesRegex(ValueError,'verified'):
+                    migrate_identity(changed,expected,manifest)
+            changed=dict(previous,null_model_source_sha256='other-fitter')
+            with self.assertRaisesRegex(ValueError,'verified'):
+                migrate_identity(changed,expected,manifest)
+
 
 if __name__ == '__main__':
     unittest.main()

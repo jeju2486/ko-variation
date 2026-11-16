@@ -17,7 +17,7 @@ python -m pip install -e '.[network,phenotype]'
 ko-variation --version
 ```
 
-Version 0.9.3 adds an optional compact tree-null backend. Dense fitting remains
+Version 0.9.4 adds an optional compact tree-null backend. Dense fitting remains
 the default until the full real-data validation of the tighter optimizer is
 complete. Install `.[tree]` and add `--null-backend tree` to use it.
 
