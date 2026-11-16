@@ -16,3 +16,6 @@
   scripts there. `codex/downstream-resume-progress` retains supplementary tools.
 - Keep compact project decisions in `PROJECT_STATE.md`; do not paste chat logs
   or server results into source files. Retain essential provenance externally.
+- When merging a minimal-publication `main` into development, preserve the
+  development-only benchmark/diagnostic files from the pre-merge development
+  commit. Publication cleanup deletions must not erase supplementary sources.
