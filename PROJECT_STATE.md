@@ -58,6 +58,13 @@ before reusing numbers or caches; proposals are distinguished from conclusions.
   resistance mutation. Core mprF/rpoC mechanisms need defined alleles/SNPs.
   Compare models on identical phylogeny-aware held-out folds, training-only
   preprocessing and mean/phylogeny baselines; preserve MIC censoring.
+- Current S. aureus follow-up: blaZ carriage and gyrA/parC allele states. The
+  development-only `benchmarks/saureus_mic.py` audits target-unitig overlap with
+  AMRFinder curated sites, then compares known markers/target unitigs/neighbours
+  with matched random partners. Censored Gaussian ridge uses tree-PC covariates,
+  not the binary KOVAR model or a full phylogenetic MIC random effect. Actual
+  server allele calls and phenotype results remain unverified. mecA remains a
+  valid MIC baseline despite absent map partners; no guarantee of improvement.
 
 ## P1 -- current pipeline, data and restart contract
 

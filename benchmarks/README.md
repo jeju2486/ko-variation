@@ -12,10 +12,13 @@ match before comparing recovery percentages.
 | Essential | Exact versus adaptive decisions and hierarchical/PC screening recovery | discovery_benchmark.py, plot_discovery_benchmark.py |
 | Useful | Full beta refitting versus warm fitting and score approximation | beta_benchmark.py |
 | Conditional | Consolidated KOVAR/pyseer/AMR checks supporting biological claims | amr_checks.py, run_amr_checks.sh |
+| Conditional | S. aureus target-unitig allele audit, censor-aware MIC prediction and random partners | saureus_mic.py, run_saureus_mic.sh |
 | Temporary | Trace unresolved tree-null cases | investigate_tree_null.py |
 
 [Tree validation and investigation](../docs/tree_null_benchmark.md),
 [beta comparison](beta_benchmark.md), [AMR checks](../docs/amr_checks.md).
+[S. aureus MIC workflow](../docs/saureus_mic.md) uses the completed functional map;
+it does not rerun discovery or reuse a binary KOVAR beta as a MIC coefficient.
 The superseded alternative-eigensolver benchmark was retired; historical source
 remains available in Git. Preserve any result used by the manuscript externally.
 
