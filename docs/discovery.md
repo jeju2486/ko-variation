@@ -439,19 +439,6 @@ refitting beta. Gene names and functional colours retain the existing display
 options. This optional visualization helper loads the significant edge table;
 it is separate from the memory-bounded all-pattern discovery scan.
 
-## Focused benchmark
-
-`benchmarks/discovery_benchmark.py` runs exact, bounded exhaustive, and hierarchical
-production paths on a supplied **small frozen pseudo-FASTA panel**. It reuses
-compatible fitted nulls and reports query counts, recovery and invocation time.
-The default cap is 2,000 original loci; it does not silently launch a full-pool
-exhaustive scan. `--screen-p` matches production by default and
-`--bonferroni-tests` can freeze the larger full-study hypothesis family for a
-sampled panel. The comparison table includes fitting/loading/bound/exact worker
-times and coordinator database times. Exact invocation time includes fitting;
-the next arms reuse models, so these are not independent cold-run timings.
-There are no full ARC runtime or whole-pool recovery guarantees in this release.
-
 ## Beta checkpoints
 
 Repeat the original discovery command with `--resume`, using the same output

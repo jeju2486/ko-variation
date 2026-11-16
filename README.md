@@ -1,116 +1,93 @@
 # KOVAR
 
-KOVAR identifies associations between binary pangenome features after adjustment
-for a phylogeny-derived sample covariance. Direct unitig discovery combines
-unique-pattern reuse, a global tree-PC coarse screen, hierarchical search and
-adaptive significance bounds. The output describes covariation; it does not
-establish causality or biological epistasis.
+KOVAR tests covariation between binary pangenome features while adjusting for a
+phylogeny-derived covariance. Covariation is a candidate association, not proof
+of causality or biological epistasis.
+
+This is the minimal publication branch, `codex/publication-clean` (version 0.9.3).
+The development branch `codex/downstream-resume-progress` retains supplementary
+benchmarks and diagnostic tools. No research script is needed for a normal run.
 
 ## Install
 
-From this release checkout, using Python 3.10 or newer:
-
 ```bash
-python -m pip install -e .
-# Optional network/figure and quantitative-phenotype dependencies:
-python -m pip install -e '.[network,phenotype]'
+git clone --branch codex/publication-clean https://github.com/jeju2486/ko-variation.git
+cd ko-variation
+python -m pip install '.[tree,network,phenotype]'
 ko-variation --version
 ```
 
-Version 0.9.3 adds an optional compact tree-null backend. Dense fitting remains
-the default until the full real-data validation of the tighter optimizer is
-complete. Install `.[tree]` and add `--null-backend tree` to use it.
+Python 3.10+ is required. `tree`, `network` and `phenotype` are optional extras;
+`pip install .` supplies dense discovery alone. PAN-GWES `unitig_distance` and
+annotation tools/databases are installed separately.
 
-## Discover covariation
+## Run
 
 ```bash
-ko-variation discover \
+bash examples/run_discovery.sh \
   --fasta graph.sample_ids.fasta --tree rooted_tree.nwk \
   --unitigs graph.unitigs --paths graph.paths \
   --unitig-distance /path/to/unitig_distance --kmer-length 61 \
   --out results --threads 4
 ```
 
-`ko-variation-discover` and `python -m ko_variation.discovery` run the same
-pipeline. The sample-labelled A/C FASTA must preserve original graph columns:
-A=absence, C=presence. The tree needs branch lengths and matching sample IDs.
-The external PAN-GWES graph-distance executable is supplied separately.
+The Bash runner uses the installed environment, has no scheduler/account paths
+and resumes matching checkpoints automatically. `KOVAR_PYTHON=/path/to/python`
+selects another interpreter. The same arguments work with `ko-variation discover`
+or `python -m ko_variation.discovery`.
 
-The [portable Bash runner](examples/run_discovery.sh) takes the same options
-and automatically resumes an existing checkpoint. It uses the installed Python
-environment, accepts `KOVAR_PYTHON=/path/to/python`, and has no scheduler or
-account-specific paths. See [portable running instructions](docs/portable_runner.md).
-That guide includes isolated-environment installation, input requirements, full
-run/restart commands, logging, output descriptions and troubleshooting.
+The sample-ID FASTA encodes A=absence and C=presence, preserving original unitig
+columns. The rooted Newick tree needs branch lengths and matching sample IDs.
+[Input, resource and restart guide](docs/portable_runner.md).
 
-Defaults are MAF >=0.05, minimum final joint-cell count 20, 40 tree PCs and
-10% coarse-pair retention. PC and representative screening are heuristics;
-use `--coarse-screen none` or `--search exhaustive` for the corresponding
-references. Bonferroni alpha is 0.05 across all unique-pattern pairs, including
-pairs not selected by the heuristic screen. The exploration gate is separate.
+Dense null fitting remains the default while larger validation of the new
+optimizer is pending. Add `--null-backend tree` for tree nulls, compact O(n)
+per-pattern caches and automatic dense fallback on fitting failure. Tree scoring
+uses exact contrasts; selected beta effects retain full dense refits.
+[Tree-null details and limitations](docs/tree_null.md).
 
-Significance selects candidate edges; post-hoc beta describes their magnitude.
-Significant pairs <=10 kb remain in the table with beta skipped. Distal pairs
-are >10 kb by default. Exact P-values are optional when bounds certify the
-significance decision. See [discovery](docs/discovery.md),
-[model](docs/model.md) and [interpretation](docs/interpretation.md).
+## Interpretation and outputs
 
-## Restart and resources
+Defaults are MAF >=0.05, minimum final joint-cell count 20, 40 tree PCs and 10%
+coarse-pair retention. PC/representative screening is approximate. Bonferroni alpha
+is 0.05 over all unique-pattern pairs, including pairs not selected by screening.
+Use `--coarse-screen none` or `--search exhaustive` for the corresponding references.
 
-Repeat the same command with `--resume`. Input cohort and scientific settings
-must match. `--threads` is the total CPU budget. Memory follows the allocation;
-`--memory-gb` optionally caps it. `--tmp-dir` must persist across jobs.
-Borrowed null directories must remain accessible until retained runs finish.
+Significant close pairs remain in the output; beta is fitted only for pairs
+beyond `--distal-bp` (10,000 bp by default). Distances come from the supplied
+PAN-GWES tool. Exact P-values are unnecessary when intervals certify a queried
+score decision. [Model](docs/model.md), [discovery](docs/discovery.md),
+[interpretation](docs/interpretation.md).
 
-Changing only `--distal-bp` on resume reuses association decisions and graph
-distances. Saved pairs are reclassified and only missing, newly eligible beta
-fits are calculated. The updated exports replace the earlier distance-filtered
-results; graph inputs and the numerical model must still match.
+- `unitigs.tsv.gz`: original unitig IDs and exact-pattern assignments.
+- `associations.tsv.gz`: significant candidates, P-value fields, distance, beta and status.
+- `run_summary.json`: settings, hypothesis family and provenance.
+- `.kovar_work`: persistent nulls and search/distance/beta checkpoints.
 
-The same `--resume` command skips committed beta fits. Its beta-stage log and
-`beta_progress.json` report cumulative saved/remaining pattern pairs, OK/non-OK
-statuses and new fits in the current invocation. There is no separate beta
-restart command. See [beta checkpoints](docs/discovery.md#beta-checkpoints).
+Repeat a current-version command with `--resume` to reuse committed work. Keep
+its working directory. Backend/code changes require a new output; earlier
+exports remain readable for plotting. Changing only `--distal-bp` reuses saved
+distances and beta attempts and fits newly eligible missing effects.
 
-The first discovery output must be empty. For a wrapper that prepares inputs
-itself, use sibling directories `run/prepared_inputs` and `run/results`, and
-pass only `run/results` to `--out`. [Full run/cache instructions](docs/discovery.md).
+## Annotation, maps and reports
 
-## Results
+| Purpose | Installed command |
+|---|---|
+| Unitig-to-gene annotation | ko-variation-map-loci |
+| Functional maps | ko-variation-functional-map |
+| Publication PNG/SVG figures | ko-variation-paper-plots |
+| Gene networks | ko-variation-network |
+| Protein preparation | ko-variation-prepare-proteins |
+| AMR phenotype/determinant report | ko-variation-amr-report |
+| MIC comparisons | ko-variation-phenotype |
+| Saved-table selection and refitting | ko-variation-select, ko-variation-annotation |
+| Run progress | ko-variation-progress |
 
-- `unitigs.tsv.gz`: original unitig IDs and their unique-pattern assignments.
-- `associations.tsv.gz`: significant candidates, exact/bounded P-value fields,
-  distance classification, beta and fitting status.
-- `run_summary.json`: hypothesis family, decisions, resources and provenance.
-- `.kovar_work`: durable preparation, null models and search/distance/beta state.
+For conventional species folders: `ROOT=/project bash examples/run_functional_map.sh saureus`.
+Set `RESULTS` explicitly for another discovery location. See
+[functional maps and paper figures](docs/map_and_paper.md),
+[AMR reports](docs/amr_report.md) and [phenotype analysis](docs/phenotype.md).
 
-## Downstream commands
-
-| Purpose | Command | Guide |
-|---|---|---|
-| Prepare/resolve annotations | `ko-variation-map-loci` | [annotation](docs/downstream.md) |
-| Select/refit existing tables | `ko-variation-select`, `ko-variation-annotation` | [downstream](docs/downstream.md) |
-| Draw covariation maps | `ko-variation-network` | [networks](docs/functional_map.md) |
-| Build functional maps from discovery exports | `ko-variation-functional-map` | [standalone map workflow](docs/map_and_paper.md) |
-| Draw publication overview/focal panels | `ko-variation-paper-plots` | [PNG/SVG paper figures](docs/map_and_paper.md#3-generate-publication-pngsvg-figures) |
-| Functional annotation | `ko-variation-prepare-proteins` | [functional map](docs/functional_map.md) |
-| Match AMR phenotypes/determinants | `ko-variation-amr-report` | [AMR report](docs/amr_report.md) |
-| Quantitative MIC comparison | `ko-variation-phenotype` | [phenotype](docs/phenotype.md) |
-| Optional distance/significance plot | `ko-variation-plot` | [downstream](docs/downstream.md) |
-
-Historical result tables remain readable by the downstream helpers. The old
-`--pairs` scanner, standalone D audit and fastBAPS wrapper were retired from
-this package. Use the historical v0.8.3 tag in a separate environment for old
-candidate-table scans; supply externally generated population labels to MIC
-analysis. [Package structure](docs/architecture.md).
-
-## Benchmarks
-
-Benchmarks are optional source-checkout programs outside the installed package.
-They do not run during discovery. [Benchmark index](benchmarks/README.md) covers
-PC-count/retention recovery, exact-versus-bounded significance, beta refits and
-tree-null numerical validation. Existing raw benchmark tables/figures are retained separately from
-software source. [Validation scope](docs/validation.md).
-
-See [current project state](PROJECT_STATE.md) for branch responsibilities and
-[tree-null settings](docs/tree_null.md) for accuracy, storage and restart rules.
+[Current project decisions](PROJECT_STATE.md) identify remaining validation work.
+[Development and supplementary programs](https://github.com/jeju2486/ko-variation/tree/codex/downstream-resume-progress/benchmarks)
+remain on the separate development branch.
