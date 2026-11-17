@@ -1,5 +1,8 @@
 # Functional maps and publication figures from completed discovery
 
+Development maps now include a community overview, focal neighbourhoods and an
+ordered adjacency matrix. [View design and saved-map redraw](network_views.md).
+
 This workflow reads v0.9 `associations.tsv.gz` and `run_summary.json`. It does
 not run score tests, estimate new beta values, use phenotype labels to construct
 the network, or generate QQ plots. It reuses discovery's significance decisions

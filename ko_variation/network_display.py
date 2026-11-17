@@ -156,7 +156,7 @@ def export_gene_network(nodes, edges, prefix, *, seed=42, dpi=300, title="Distal
     prefix = Path(prefix)
     prefix.parent.mkdir(parents=True, exist_ok=True)
     paths = {key: Path(str(prefix) + suffix) for key, suffix in (
-        ("png", ".png"), ("svg", ".svg"), ("html", ".html"), ("nodes", ".nodes.tsv"),
+        ("png", ".full.png"), ("svg", ".full.svg"), ("html", ".html"), ("nodes", ".nodes.tsv"),
         ("edges", ".edges.tsv"), ("layout", ".layout.json"))}
     edge_display, boundaries = _display_edges(edges, strength_cutoffs, link_distances)
     degree_max = max(float(nodes.degree.max()), 1) if len(nodes) else 1
@@ -235,15 +235,5 @@ def export_gene_network(nodes, edges, prefix, *, seed=42, dpi=300, title="Distal
                              representative_rule="smallest-P successful locus refit; ties u,v",
                              layout_method="packed connected components; beta-weighted shortest-path springs",
                              layout_distance_units="diagram units, not genomic bp"))
-    serialized = json.dumps(payload, allow_nan=False)
-    paths["layout"].write_text(serialized, encoding="utf-8")
-    package = Path(__file__).parent
-    document = (package / "templates/network_d3.html").read_text(encoding="utf-8")
-    d3 = (package / "vendor/d3.v7.9.0.min.js").read_text(encoding="utf-8").replace("</script", "<\\/script")
-    safe_payload = serialized.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    document = document.replace("__TITLE__", html.escape(title or "Gene covariation map"))
-    document = document.replace("__DATA__", safe_payload).replace("__D3__", d3)
-    paths["html"].write_text(document, encoding="utf-8")
-    node_display.to_csv(paths["nodes"], sep="\t", index=False)
-    edge_display.to_csv(paths["edges"], sep="\t", index=False)
-    return paths
+    from .network_views import write_views
+    return dict(full_png=paths["png"],full_svg=paths["svg"],**write_views(payload,prefix,dpi))

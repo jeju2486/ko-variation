@@ -1,11 +1,23 @@
 # KOVAR: ranked summary of the whole chat
 
-Updated 2026-11-16. Read this instead of replaying the conversation. This covers
+Updated 2026-11-17. Read this instead of replaying the conversation. This covers
 the scientific, computational and operational discussions, not only the solver.
 Historical results apply to their tested cohorts. Verify the current run identity
 before reusing numbers or caches; proposals are distinguished from conclusions.
 
 ## P0 -- release, accepted calculation and immediate next step
+
+- Public cleanup is deferred until development is finished (user instruction,
+  2026-11-17). Keep main unchanged for now. Afterwards remove research-specific
+  paper/MIC/AMR helpers and catalogue, project-folder/species assumptions, chat
+  history and personal workflow directions; review legacy selection/R plotting
+  and unused duplicate cache/SPA code. Retain general discovery, annotation,
+  network exploration, progress, resource/checkpoint machinery and focused tests.
+- Developing map views now default to a connectivity-community overview with
+  drill-down, focal gene neighbourhoods and an ordered adjacency matrix; the
+  full graph and original statistics remain accessible. Grouping uses existing
+  NetworkX Louvain plus disconnected-group splitting, not Leiden. Saved HTML/
+  layout redraw reuses annotation and effects without inference or eggNOG.
 
 - Public release: **main / v0.9.4**. The temporary publication branch was
   deleted after its commits were merged; use main for the minimal public tool.

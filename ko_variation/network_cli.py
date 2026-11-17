@@ -7,11 +7,14 @@ import sys
 import pandas as pd
 from .network import build_gene_network, export_gene_network, discovery_network_input
 from .network_display import add_network_arguments, network_options
+from .network_views import read_layout, write_views
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--effects", required=True, help="Native OUT.distal.tsv or v0.9 associations.tsv.gz")
+    source=parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--effects", help="Native OUT.distal.tsv or v0.9 associations.tsv.gz")
+    source.add_argument("--layout", help="Saved map.html or .layout.json; preserve all annotation and statistics")
     parser.add_argument("--annotation", help="Locus-to-gene TSV for v0.9 unitig associations")
     parser.add_argument("--out", required=True)
     parser.add_argument("--missing-genes", choices=["drop", "error"], default="drop")
@@ -21,11 +24,23 @@ def main(argv=None):
     parser.add_argument("--title", default="")
     add_network_arguments(parser)
     args = parser.parse_args(argv)
-    outputs = [Path(args.out + suffix) for suffix in (".png", ".svg", ".html", ".nodes.tsv", ".edges.tsv", ".layout.json", ".network.json")]
-    sources = [Path(path).resolve() for path in (args.effects, args.annotation,args.gene_catalog, args.eggnog) if path]
+    outputs = [Path(args.out + suffix) for suffix in (".png", ".svg", ".full.png", ".full.svg", ".matrix.png", ".matrix.svg", ".communities.tsv", ".community_edges.tsv", ".html", ".nodes.tsv", ".edges.tsv", ".layout.json", ".network.json")]
+    sources = [Path(path).resolve() for path in (args.effects,args.layout,args.annotation,args.gene_catalog,args.eggnog) if path]
     if any(path.resolve() in sources for path in outputs):
         parser.error("Network outputs must not overwrite the effect table or annotation inputs")
     try:
+        if args.layout:
+            if args.annotation or args.gene_catalog or args.eggnog or args.include_self:
+                parser.error("--layout preserves saved biological data; use --effects to change annotation or self-edge selection")
+            data=read_layout(args.layout)
+            if args.title: data["meta"]["title"]=args.title
+            paths=write_views(data,args.out,args.dpi)
+            metadata=dict(source_layout=str(Path(args.layout).resolve()),nodes=len(data["nodes"]),
+                edges=len(data["edges"]),refitted=False,annotation_reused=True,
+                outputs={key:str(path) for key,path in paths.items()})
+            Path(args.out+".network.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
+            print(f"[network] redrawn {len(data['nodes'])} genes and {len(data['edges'])} edges; all saved annotations/statistics retained: {args.out}",flush=True)
+            return 0
         print(f"[network] reading saved effects: {args.effects}; no refitting", flush=True)
         signals = pd.read_csv(args.effects, sep="\t", dtype={"u_gene": str, "v_gene": str})
         significance_column="p_primary"

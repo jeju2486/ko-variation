@@ -1,5 +1,9 @@
 # Annotation names and functional node colours
 
+For the new community/focal/matrix views and saved-HTML redraw, see
+[network exploration](network_views.md). All annotation and biological edge
+statistics are preserved across these display views.
+
 These helpers redraw completed selected-pair effects. They do not change the
 scanner, significance criterion, LD rule, annotation geometry, or fitted effects.
 

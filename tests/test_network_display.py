@@ -3,10 +3,12 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import numpy as np
 import pandas as pd
 from ko_variation.network import build_gene_network, export_gene_network
 from ko_variation.network_cli import main as redraw_main
+from ko_variation.network_views import add_views, read_layout
 
 
 def example_signals():
@@ -21,6 +23,41 @@ def example_signals():
 
 
 class NetworkDisplayTests(unittest.TestCase):
+    def test_communities_account_for_all_edges_and_ignore_association_sign(self):
+        import copy
+        import networkx as nx
+        payload=dict(nodes=[dict(gene=g,display_label=g) for g in ['A','B','C','D','isolated']],
+            edges=[dict(gene_a=a,gene_b=b,adjusted_direction=s,representative_significance=1e-40)
+                   for a,b,s in [('A','B','positive'),('B','C','negative'),('C','D','mixed'),('A','A','positive')]],meta=dict(seed=42))
+        before=copy.deepcopy(payload); rendered=add_views(payload)
+        self.assertEqual(payload,before)
+        self.assertEqual(rendered['edges'],before['edges'])
+        self.assertEqual(set(rendered['matrix_order']),{n['gene'] for n in payload['nodes']})
+        self.assertEqual(sum(c['n_genes'] for c in rendered['communities']),5)
+        self.assertEqual(sum(c['n_internal_edges'] for c in rendered['communities'])+
+                         sum(e['n_gene_edges'] for e in rendered['community_edges']),4)
+        graph=nx.Graph([(e['gene_a'],e['gene_b']) for e in payload['edges']]);graph.add_node('isolated')
+        self.assertTrue(all(nx.is_connected(graph.subgraph(c['members'])) for c in rendered['communities']))
+        for edge in payload['edges']: edge['adjusted_direction']='negative'
+        self.assertEqual([c['members'] for c in rendered['communities']],
+                         [c['members'] for c in add_views(payload)['communities']])
+
+    def test_saved_layout_redraw_preserves_data_without_effect_or_annotation_reads(self):
+        nodes,edges=build_gene_network(example_signals())
+        with tempfile.TemporaryDirectory() as temporary:
+            folder=Path(temporary)
+            paths=export_gene_network(nodes,edges,folder/'original',dpi=72)
+            source=paths['html'].read_bytes(); original=read_layout(paths['html'])
+            with patch('ko_variation.network_cli.build_gene_network',side_effect=AssertionError('Unexpected biological aggregation')):
+                with patch('ko_variation.network_cli.pd.read_csv',side_effect=AssertionError('Unexpected annotation/effect read')):
+                    self.assertEqual(redraw_main(['--layout',str(paths['html']),'--out',str(folder/'explorer'),'--dpi','72']),0)
+            saved=read_layout(folder/'explorer.layout.json')
+            self.assertEqual(saved['edges'],original['edges'])
+            self.assertEqual(saved['nodes'],original['nodes'])
+            self.assertEqual(paths['html'].read_bytes(),source)
+            self.assertTrue((folder/'explorer.matrix.png').read_bytes().startswith(b'\x89PNG'))
+            self.assertIn('Community overview',(folder/'explorer.html').read_text())
+
     def test_categories_preserve_edges_representative_and_small_pvalues(self):
         nodes, edges = build_gene_network(example_signals())
         with tempfile.TemporaryDirectory() as folder:

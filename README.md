@@ -86,6 +86,10 @@ pass only `run/results` to `--out`. [Full run/cache instructions](docs/discovery
 
 ## Downstream commands
 
+The development network explorer defaults to a community overview, with member
+drill-down, focal gene neighbourhoods, an ordered adjacency matrix and the full
+retained graph. [Redraw a saved HTML/layout without refitting](docs/network_views.md).
+
 | Purpose | Command | Guide |
 |---|---|---|
 | Prepare/resolve annotations | `ko-variation-map-loci` | [annotation](docs/downstream.md) |
