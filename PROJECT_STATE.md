@@ -1,11 +1,23 @@
 # KOVAR: ranked summary of the whole chat
 
-Updated 2026-11-17. Read this instead of replaying the conversation. This covers
+Updated 2026-11-18. Read this instead of replaying the conversation. This covers
 the scientific, computational and operational discussions, not only the solver.
 Historical results apply to their tested cohorts. Verify the current run identity
 before reusing numbers or caches; proposals are distinguished from conclusions.
 
 ## P0 -- release, accepted calculation and immediate next step
+
+- MIC development revision: primary censored ridge models now use no tree PCs;
+  retain lineage-separated inner/outer CV. Compare blaZ carriage and unitig
+  baselines separately with N1, N1+N2 and budget/MAF-matched random additions.
+  Verify gyrA/parC alleles with installed mutation-catalogue reference offsets;
+  recover missing calls conservatively from unique TBLASTN reference hits, saving
+  provenance and leaving ambiguous calls missing. Compare separate/joint alleles
+  and neighbour additions. Preserve raw AMRFinder/prepared caches; revised
+  predictions use fingerprinted subfolders, retry failures and expose inner-fit
+  errors. The uploaded audit had no callable gyrA/parC sites; previous fitting
+  failures were incomplete numerical results, not evidence of no MIC effects.
+  Real-data allele correctness and prediction completion remain unverified.
 
 - Public cleanup is deferred until development is finished (user instruction,
   2026-11-17). Keep main unchanged for now. Afterwards remove research-specific
@@ -242,3 +254,11 @@ before reusing numbers or caches; proposals are distinguished from conclusions.
 9. [ ] Retire temporary investigation code after validation; keep only main and
    the development branch for this workflow, preserving reproducibility sources
    on development and the concise handoff here.
+10. [ ] After development is finished, remove paper plotting, MIC comparison and
+    their research-only helpers from the publishing tool/main, including
+    `ko-variation-paper-plots`, `ko-variation-phenotype`, `paper_plots.py`,
+    `phenotype.py` and `phenotype_lmm.py`, plus their study runners, documentation
+    and exclusive dependencies. Retain these capabilities, source, tests and
+    reproducibility materials on `codex/downstream-resume-progress`. Preserve
+    shared utilities needed by general annotation/network tools. This is a
+    deferred to-do only: no script edits or branch merges are authorized now.

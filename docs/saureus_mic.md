@@ -1,192 +1,211 @@
-# S. aureus blaZ and gyrA/parC MIC comparison
+# S. aureus marker, neighbour and MIC comparison
 
-This development-only workflow uses the completed map and upstream sequences.
-It does not run discovery, fit KOVAR nulls, call eggNOG, or modify any source run.
-`parC` and `grlA` are treated as nomenclature aliases in S. aureus. An annotation
-name identifies a gene region; it does not establish a resistance allele.
+Development-only research workflow. It uses an existing functional map and
+upstream sequences; it does not rerun discovery, fit KOVAR nulls or run eggNOG.
+The purpose is to test incremental phenotype prediction, not prove epistasis.
 
-## Installation and execution
+## Run or resume
 
-Use the Codex development checkout; this helper is not in the minimal v0.9.4
-release. Install the Python plotting/phenotype extras in the active environment:
+Use `codex/downstream-resume-progress`; main remains unchanged. From the project
+directory containing the checkout and existing species outputs:
 
 ```bash
-python -m pip install -e '/data/kell7366/kovar/ko-variation[phenotype]'
-conda install -c conda-forge -c bioconda ncbi-amrfinderplus
+git -C ko-variation pull --ff-only origin codex/downstream-resume-progress
+THREADS=24 PCS=0 bash ko-variation/benchmarks/run_saureus_mic.sh
+```
+
+For a runner copied outside the checkout, refresh that copy first:
+
+```bash
+cp ko-variation/benchmarks/run_saureus_mic.sh scripts/zoo-ardbeg/run_saureus_mic.sh
+THREADS=24 bash scripts/zoo-ardbeg/run_saureus_mic.sh
+```
+
+The default `all` stage upgrades existing neighbourhood metadata, reuses the
+selected-column matrix, reuses AMRFinder reports when assembly/database identity
+matches, rebuilds the derived allele audit, then runs the revised predictions.
+There is no need to delete the old MIC output or rerun KOVAR discovery.
+
+Required Python dependencies are available through the development checkout's
+`[phenotype]` extra. External annotation tools:
+
+```bash
+conda install -c conda-forge -c bioconda ncbi-amrfinderplus blast
 amrfinder -u
 amrfinder -V
 ```
 
-AMRFinderPlus can instead live in another environment: set `AMRFINDER_EXEC` to
-its executable. Set `AMRFINDER_DB` to the database directory printed by `-V`,
-containing `AMRProt.fa`. Both caller output and the reference database version are
-recorded. No database is downloaded or updated by this workflow.
-The default database is also read automatically from `amrfinder -V`; quoted
-paths and terminal colour codes are supported. If detection fails, inspect
-`$OUT/amrfinder_version.txt` and set `AMRFINDER_DB` explicitly. The initial
-helper's prepared matrix remains reusable after this database-path-only fix;
-changed biological inputs or cohort settings still require a new output.
+The workflow never downloads or updates a database automatically. `amrfinder -V`
+locates the installed database, including quoted paths. It must contain
+`AMRProt.fa` and `AMRProt-mutation.tsv`. Set `AMRFINDER_EXEC`, `AMRFINDER_DB`,
+`TBLASTN_EXEC`, `REFERENCE_PROTEINS` or `MUTATION_CATALOG` for nondefault paths.
+BLAST+ is needed only when target calls require recovery. To preserve raw-report
+reuse, use the same installed database version as the original run.
 
-From the project root on zoo-ardbeg:
+Stages: `map`, `prepare`, `audit`, `predict`, `all`. After an initial `all` with
+the new script, `predict` alone reuses the updated allele and preparation files.
+`audit` alone rebuilds derived calls when the audit revision changes, without
+invalidating unchanged raw AMRFinder reports.
 
-```bash
-ROOT=/data/kell7366/kovar \
-AMRFINDER_DB=/actual/amrfinder/database/directory \
-THREADS=4 bash ko-variation/benchmarks/run_saureus_mic.sh
-```
+## Inputs and configuration
 
-The same Bash runner can be copied unchanged to
-`scripts/zoo-ardbeg/run_saureus_mic.sh`. It finds the checkout at `$ROOT/ko-variation`.
-There is no `sbatch` dependency. An optional first argument selects `map`,
-`prepare`, `audit`, `predict`, or `all` (default).
-
-Default layout and overrides:
+The Bash runner accepts these environment overrides:
 
 | Variable | Default |
 |---|---|
 | `ROOT` | Two directories above the runner |
 | `REPO` | Checkout containing `benchmarks/saureus_mic.py` |
-| `DISCOVERY` | `$ROOT/kovar_output/saureus/discovery`; falls back to the `zoo-ardbeg/discovery` subdirectory |
+| `OUT` | `$ROOT/kovar_output/saureus/diagnostics/saureus_mic` |
+| `DISCOVERY` | `$ROOT/kovar_output/saureus/discovery`; fallback `saureus/zoo-ardbeg/discovery` |
 | `FASTA` | `$DISCOVERY/prepared_inputs/saureus_k61.sample_ids.fasta` |
 | `TREE` | `$DISCOVERY/prepared_inputs/saureus_core.rooted.treefile` |
-| `MAP_DIR` | Existing `plots/functional_map` under plain species or `zoo-ardbeg` layout |
+| `MAP_DIR` | Existing species `plots/functional_map`, plain or `zoo-ardbeg` layout |
 | `NETWORK` | `map.html` or `map_saureus.html` under `MAP_DIR` |
 | `ANNOTATION` | `$MAP_DIR/annotation/locus_to_gene.tsv` |
 | `METADATA` | `$ROOT/assemblies/saureus_collection_metadatatxt.txt` |
 | `UNITIGS` | `$ROOT/pangwes_saureus_output/saureus/saureus_k61.unitigs` |
-| `ASSEMBLIES` | `$ROOT/assemblies`, recursively searched by exact sample filename |
-| `GFF_DIR` | `$ROOT/panaroo_saureus_output/panaroo_gff`; embedded-FASTA fallback |
-| `OUT` | `$ROOT/kovar_output/saureus/diagnostics/saureus_mic` |
-| `CLUSTERS` | Optional existing `sample,cluster` TSV, e.g. fastBAPS |
-| `QUINOLONE` | `levofloxacin`; change to `ciprofloxacin` or `moxifloxacin` in a new output |
-| `THREADS`, `RANDOM_SETS`, `PCS`, `FOLDS` | `4`, `100`, `10`, `5` |
+| `ASSEMBLIES` | `$ROOT/assemblies`, exact-name recursive lookup |
+| `GFF_DIR` | `$ROOT/panaroo_saureus_output/panaroo_gff`, embedded-FASTA fallback |
+| `CLUSTERS` | Optional `sample,cluster` TSV, e.g. existing fastBAPS labels |
+| `QUINOLONE` | `levofloxacin`; also accepts `ciprofloxacin`, `moxifloxacin` |
+| `THREADS`, `RANDOM_SETS`, `PCS`, `FOLDS` | `4`, `100`, **`0`**, `5` |
+| `GROUPS_COUNT`, `SEED` | `10`, `42` |
 
-Set `METADATA` explicitly if the table is elsewhere. It must contain `id`,
-`isolate`, `species`, `benzylpenicillin_mic`, `benzylpenicillin_mic_sign`, and the
-chosen fluoroquinolone's `_mic` and `_mic_sign` fields. Default sample joining
-uses the established `id_isolate` assembly basename, with exact matching; an
-explicit `SAMPLE_MAP` TSV (`metadata_id,sample`) can override it. Non-S. aureus
-metadata records and FASTA samples absent from the supplied tree are excluded
-and recorded. Original unitig column numbering is preserved.
+Metadata needs `id`, `isolate`, `species`, `benzylpenicillin_mic`,
+`benzylpenicillin_mic_sign`, and the selected quinolone's `_mic`/`_mic_sign`.
+Default joining uses exact `id_isolate` assembly basenames; `SAMPLE_MAP`
+(`metadata_id,sample`) overrides it. Non-species records and samples absent from
+the tree are excluded and recorded. Original zero-based unitig IDs are retained.
+The Python interface also accepts `--locus-map` (`fasta_column,locus`).
 
-Example with explicit inputs:
+Set `ROOT`, `METADATA`, `NETWORK`, etc. for another filesystem; examples do not
+require the zoo-ardbeg execution host. A tree is still used to define held-out
+lineage groups even when no tree PCs enter the regression. Without `CLUSTERS`,
+the disclosed complete-linkage patristic partition is used; this is not fastBAPS.
 
-```bash
-ROOT=/data/kell7366/kovar \
-METADATA=/actual/path/saureus_collection_metadatatxt.txt \
-NETWORK=/actual/path/map_saureus.html \
-ANNOTATION=/actual/path/annotation/locus_to_gene.tsv \
-AMRFINDER_DB=/actual/amrfinder/database/directory \
-bash scripts/zoo-ardbeg/run_saureus_mic.sh
-```
+## Allele evidence
 
-The direct Python interface supports `--locus-map` (`fasta_column,locus`) for a
-FASTA whose columns are not original zero-based unitig IDs. The Bash runner
-explicitly declares the upstream gfa1_parser column contract.
+1. Read target coding unitigs and full assembly DNA. `parC`/`grlA` are aliases.
+2. Retain raw nucleotide AMRFinder reports and `--mutation_all` results, including
+   wild-type calls. Normalise gene aliases and supported report headers; collapse
+   repeated annotations of the same physical call. Distinct copies stay ambiguous.
+3. Read the installed **S. aureus** mutation catalogue. Its reference-protein
+   offset can differ from the traditional residue number in a mutation symbol.
+4. If AMRFinder yields no parsed calls for a target gene, search the catalogue's
+   reference proteins with TBLASTN. Require at least 90% reference coverage and
+   90% identity in one alignment, and exactly one qualifying genomic locus per
+   gene. Multiple qualifying loci or unresolved residues remain missing.
+   Recovery is an alignment-based inference and retains a distinct source label.
+5. Translate the reported/recovered interval, align it to the matching reference
+   protein, and verify reference and observed residues. Ambiguous mappings stay
+   unresolved. Search each complete unitig on both strands and check whether it
+   covers the entire recognised codon.
 
-## What the allele audit establishes
+`unitig_allele_audit.tsv` reports site evidence and a marker interpretation:
+verified mutant, verified wild type, mixed/incomplete overlap, gene-associated
+without confirmed site overlap, or no callable site. Verification applies to
+callable audited observations; it does not prove all absent unitigs encode the
+opposite allele. Counts are evidence rows, potentially multiple per isolate/site
+when multiple gene copies are present. Inspect the detailed sample-level table.
 
-1. Extract the map's coding unitigs for blaZ, gyrA and parC, retaining internal
-   cluster IDs, all directly adjacent genes and representative edge statistics.
-2. Run nucleotide AMRFinderPlus per assembly with `--organism
-   Staphylococcus_aureus --mutation_all`. The latter distinguishes callable
-   wild-type sites from missing gene/site calls. A missing mutation report is
-   never silently encoded as wild type.
-3. For each gyrA/parC call, translate the reported genomic region and align to
-   its **matching database reference protein**. Map the curated residue position
-   through that alignment, checking reference and observed residues. Ambiguous
-   or unresolved mappings remain unconfirmed.
-4. Search full target-unitig DNA on both strands around the called gene. Report
-   whether it spans the complete recognised codon, plus its co-occurrence with
-   the called allele. Matching genotype distributions alone is not direct site
-   evidence. Multiple-copy site calls are missing for prediction.
+`NO_CALLABLE_KNOWN_SITE` means unassessed, not mutation-free. Catalogue-defined
+mutations and callable wild-type residues are distinguished from other alleles
+and missing calls. Marker columns include catalogue sites even if fixed in this
+cohort. Multiple physical calls at one site are missing for prediction.
 
-`DIRECT_KNOWN_SITE_OVERLAP` says the unitig covers a recognised site; it does not
-say unitig absence uniquely identifies its alternative allele. Review the
-present/absent versus mutant/wild-type counts. No overlap can mean a linked
-marker elsewhere in the gene rather than a recognised resistance variant.
+blaZ/mecA/mecC carriage is separately derived from high-coverage AMRFinder hits
+(90% default). Partial/disrupted hits are missing; no hit in a successful report
+is detection-based absence. `GENE_CARRIAGE_MARKER` labels a blaZ-associated unitig;
+it is not proof of whole-gene detection. `blaz_carriage_agreement.tsv` directly
+tabulates gene/unitig agreement. Expression and MIC effects are not established.
 
-blaZ, mecA and mecC are separately encoded as high-coverage AMRFinder detections (90% default).
-Partial/disrupted detections are missing rather than absent; a complete report
-without a blaZ hit is a detection-based absence call. This is not proof of gene
-expression or a functional MIC effect.
+Source definitions: [NCBI database formats](https://github.com/ncbi/amr/wiki/AMRFinderPlus-database)
+and [AMRFinderPlus results](https://github.com/ncbi/amr/wiki/Interpreting-results).
 
-References: [AMRFinderPlus usage](https://github.com/ncbi/amr/wiki/Running-AMRFinderPlus)
-and [interpretation](https://github.com/ncbi/amr/wiki/Interpreting-results).
+## Prediction models
 
-## Prediction and controls
+Primary models use **censored Gaussian ridge regression on log2 MIC, without
+tree PCs**. Exact MICs contribute Gaussian densities; `<`, `<=`, `>`, `>=` limits
+contribute one-sided probabilities. Limits are never imputed as exact values.
+Unknown signs are excluded. Confirm common MIC units and assay comparability.
+This is a quantitative phenotype model, not KOVAR's binary-response GLMM.
 
-This is a quantitative MIC experiment, **not KOVAR's binary-response test**.
-The model is a Gaussian location-scale model on log2 MIC with ridge-penalised
-genomic features and training-derived tree-PC covariates. It uses exact Gaussian
-densities for `=` MICs and Gaussian tail probabilities for `<`, `<=`, `>`, `>=`.
-Strict/non-strict limits are equivalent for the continuous latent model. Unknown
-or missing signs are excluded. Confirm that source measurements really are MICs
-in consistent units, rather than inhibition-zone diameters.
+Penicillin has two parallel families:
 
-This tree-PC adjustment approximates ancestry; it is **not** a full phylogenetic
-random-effect covariance or a newly validated mixed-model implementation. The
-normal latent distribution and assay comparability are assumptions. Inspect
-scale-boundary/optimisation failures; they are not treated as successful fits.
+| Family | Baseline | Extensions |
+|---|---|---|
+| `blaZ_gene` | Gene detection presence/absence | `_N1`, `_N1_N2`, `_Random_N1`, `_Random_N1_N2` |
+| `blaZ_unitigs` | Target unitig presence/absence | Same four extensions |
 
-Models share the same callable genotype/MIC cohort and outer held-out groups:
+`blaZ_gene_unitigs` additionally tests target-unitig information beyond carriage.
+The primary models do not silently add mecA/mecC to these baselines; their calls
+are retained in the genotype audit for possible separate background analyses.
 
-- **Mean**: training mean/location and scale under the censoring model.
-- **Tree**: tree PCs only.
-- **Background** (penicillin): tree PCs plus mecA/mecC carriage, even when these
-  genes have no displayed map edges. This avoids attributing their omitted
-  predictive information to blaZ neighbours.
-- **Known**: curated target markers plus tree PCs; fluoroquinolones also have
-  separate gyrA-only and parC-only marker comparisons. Penicillin retains mecA/mecC.
-- **Target_unitigs**: known markers plus all map coding target unitigs.
-- **Neighbours**: Target_unitigs plus direct-neighbour coding unitigs.
-- **Random_partners**: the same target baseline plus matched random partners,
-  repeated 100 times. These are anchored target/random-partner comparisons, not
-  unrelated replacement of both members of the pair.
+Fluoroquinolone models compare `gyrA_alleles`, `parC_alleles`, and
+`gyrA_parC_alleles`. The joint baseline receives the same four neighbour/random
+extensions, plus a separate `_unitigs` arm testing gene-associated unitigs beyond
+known allele states. Already included target genes are excluded from neighbours.
+`N1_N2` means first plus second neighbours, not second neighbours alone.
 
-Random partners come from other coding loci in the **frozen map**, outside both
-targets' two-hop neighbourhoods. Their counts match independent added binary
-patterns, with nearest training-fold minor-frequency matching; duplicate and
-complement patterns do not inflate counts. MAF mismatch is reported. This is a
-map-conditioned control pool, not a genome-wide sample or a guarantee that every
-control is physically distal to the target. The map and features are frozen
-using genotype data from this cohort, so this evaluates held-out phenotype
-prediction, not independent end-to-end map discovery.
+All comparisons within an endpoint use the same callable target-marker/MIC
+cohort and folds, including the mean-only benchmark. The separate allele models
+use the joint callable cohort. Fixed/rare markers are reported and filtered within
+training partitions, so a baseline may legitimately reduce to an intercept.
 
-Use existing fastBAPS labels via `CLUSTERS` when available. Otherwise the runner
-uses a disclosed complete-linkage tree partition (10 groups); it does not run or
-claim fastBAPS. Tree PCs, scaling, feature redundancy filtering and ridge tuning
-are fitted on training rows. Inner and outer folds both keep groups together.
-Groups do not guarantee that all between-fold relatedness has been eliminated.
+Random partners come from coding loci in the frozen map outside both targets'
+two-hop neighbourhoods. Each baseline/budget has its own controls, matching the
+number of independent added binary patterns and nearest outer-training-fold MAF.
+Duplicate/complement patterns do not inflate budgets. MAF mismatch and selected
+features are saved. This is a map-conditioned pool, not a genome-wide sample or
+a guarantee of physical distance for every control.
 
-Primary performance is held-out **censored negative log likelihood** (lower is
-better). Exact-MIC RMSE, R2 and within-one-dilution agreement are secondary and
-apply only to exact observations, whose distribution may be selective. Do not
-compare raw NLL across different antibiotic datasets. Neighbour improvement is
-paired against Target_unitigs on the same held-out isolates. The fraction of
-random controls doing at least as well is a descriptive benchmark, not a
-calibrated epistasis P-value. There is no functional interaction claim.
+Outer validation holds out lineage groups. Ridge tuning uses grouped inner CV;
+scaling and redundancy filters use each corresponding training partition. The
+default penalty grid is `.1,1,10,100`. Optional `PCS>0` is a separate ancestry
+sensitivity analysis with training-only PC projection, not the primary run.
 
-## Outputs and restart
+Primary accuracy is held-out censored negative log likelihood (lower is better).
+Exact-MIC RMSE, R2 and within-one-dilution accuracy apply only to exact records.
+Do not compare raw NLL between antibiotics. Improvements are paired by held-out
+fold. Random-control fractions are descriptive, not epistasis P-values. The map
+was frozen using cohort genotypes; this is not independent end-to-end discovery.
 
-- `neighbours.tsv`, `map_summary.json`, `focal_neighbours.{png,svg}`: actual map
-  inventory and readable target-centred view; no whole-network edge removal.
-- `prepared.{json,npz}`, `features.tsv`, `sample_groups.tsv`, `excluded_samples.tsv`: selected
-  coding columns, frozen cohort and ancestry inputs. Full million-column FASTA
-  matrices are not retained in memory or copied into an enormous text table.
-- `amrfinder/SAMPLE/`: raw reports, log and per-sample completion identity; temporary
-  extracted assembly DNA is removed after calling.
-- `unitig_allele_audit.tsv`, `unitig_site_evidence.tsv.gz`, `known_genotypes.tsv`:
-  site overlap, detailed evidence and missingness-aware marker calls.
-- `*_phenotypes.tsv`, `fit_status.tsv`, `performance.tsv`, `predictions.tsv`,
-  `model_features.tsv`, `neighbour_improvement.tsv`, `mic_performance.{png,svg}`: cohort, failure audit,
-  held-out comparisons and editable-text figures.
-- `prediction_checkpoints/`: each endpoint/fold/model/random-set fit is committed
-  separately. Rerun the same command to skip completed work. Increasing the
-  random-set count appends reproducible controls. Changed input/model identities
-  require a new output directory; source discovery files are never rewritten.
+## Outputs, failures and restart
 
-CPU budget is `THREADS` processes with one numerical/AMRFinder thread per worker.
-Purely visual changes do not change the source map. A focal panel is preferable
-to interpreting the full force-directed hairball; the full map remains available
-as supplementary exploratory material.
+Preparation and raw calls remain at `OUT`:
+
+- `prepared.{json,npz}`, `features.tsv`, `sample_groups.tsv`, `excluded_samples.tsv`.
+- `neighbours.tsv`, `map_summary.json`, `focal_neighbours.{png,svg}`.
+- `amrfinder/SAMPLE/`: original reports, logs and restart identities.
+- `allele_recovery/SAMPLE/`: TBLASTN hits/log, cached derived calls and diagnostics;
+  temporary assembly/reference FASTAs are removed after use.
+- `allele_call_diagnostics.tsv`, `unitig_allele_audit.tsv`,
+  `unitig_site_evidence.tsv.gz`, `known_genotypes.tsv`, `genotypes.npz`,
+  `marker_summary.tsv`, `blaz_carriage_agreement.tsv`, `audit_identity.json`.
+
+Each revised prediction has a deterministic directory `OUT/predictions/RUN_ID/`.
+The path is printed and recorded in `OUT/latest_prediction.json`. Existing
+earlier prediction files remain untouched. Changed model/input/dependency/code
+identities select a different prediction directory while retaining upstream
+preparation/call caches. Increasing `RANDOM_SETS` appends deterministic controls.
+
+Prediction outputs:
+
+- `genotype_combinations.tsv`, `training_feature_support.tsv`,
+  `*_phenotypes.tsv`, `*_not_run.json`: genotype/MIC availability and filtering.
+- `performance.tsv`, `predictions.tsv`, `model_features.tsv`,
+  `neighbour_improvement.tsv`, `paired_fold_improvement.tsv`.
+- `fit_status.tsv`, `fit_failures.tsv`, `mic_performance.{png,svg}`.
+- `checkpoints/ENDPOINT/`: atomic per-fold/model/random-set saves.
+
+Only successful checkpoints are skipped; failed checkpoints retry. The optimiser
+allows up to 2,000 iterations per attempt with one numerical restart. Every
+failed inner penalty/fold records the actual reason, feature count and exact-MIC
+count. A failed fit is not evidence of no effect. Scale-boundary or nonconverged
+fits are rejected. Overall performance requires **every outer fold**; successful
+folds alone are diagnostics and must not be interpreted as the full comparison.
+
+`THREADS` sets process workers; numerical libraries and BLAST/AMRFinder use one
+thread per worker. Only the selected-column matrix is loaded, not the complete
+million-column unitig matrix. Real-data allele correctness and convergence still
+need inspection after running; synthetic tests do not establish calibration.

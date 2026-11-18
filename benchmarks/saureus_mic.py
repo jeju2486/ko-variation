@@ -2,7 +2,7 @@
 
 Research helper, not part of discovery. AMRFinderPlus defines published marker
 states; an exact unitig match plus reference-protein alignment establishes site
-overlap. Prediction uses censored Gaussian ridge with training-derived tree PCs,
+overlap. Prediction uses censored Gaussian ridge without tree PCs by default,
 not the binary-response KOVAR test. No bound is imputed as an exact MIC.
 """
 from __future__ import annotations
@@ -37,11 +37,14 @@ REVISION = "saureus-mic-1"
 # Its preparation algorithm is unchanged; accept its LF/CRLF identities only
 # when every input hash, cohort setting and preparation revision still match.
 LEGACY_PREPARATION_CODES = {
+    "9cf17c411d54d5b77954d98a7649e32a6289140a73c024ce205dcbe7ce508f68",
     "252043a3a00e3f0556c0c36446f0f9e8817c2bd554e613ec925c8c048d051fd3",
     "9c0e1ad44fd5d7720597f418cac5ee6a682702067bfcb8cbf3263931fe5059ea",
 }
 ALIASES = {"blaZ": {"blaz", "blapc1"}, "gyrA": {"gyra"}, "parC": {"parc", "grla"}}
 TARGETS = {"penicillin": ["blaZ"], "fluoroquinolone": ["gyrA", "parC"]}
+AUDIT_REVISION = "alleles-2"
+PREDICTION_REVISION = "mic-2"
 
 
 def log(message):
@@ -195,6 +198,22 @@ def compatible_preparation(saved, current):
             {k:v for k,v in current.items() if k!="code"})
 
 
+def neighbourhood_columns(info, mapped):
+    """Enrich the existing matrix metadata; no FASTA or AMRFinder rerun."""
+    _, _, groups, adjacency = mapped
+    info["second_columns"], info["gene_columns"] = {}, {}
+    for gene, clusters in groups.items():
+        info["gene_columns"][gene] = [j for j,u in enumerate(info["loci"])
+                                     if info["locus_gene"][str(u)] in clusters]
+    for endpoint, genes in TARGETS.items():
+        anchors = set().union(*(groups[g] for g in genes))
+        first = set().union(*(adjacency[g] for g in anchors))-anchors
+        second = set().union(*(adjacency[g] for g in first))-anchors-first
+        info["second_columns"][endpoint] = [j for j,u in enumerate(info["loci"])
+                                           if info["locus_gene"][str(u)] in second]
+    return info
+
+
 def prepare(args, mapped):
     from Bio import Phylo
     data, nodes, groups, adjacency = mapped
@@ -207,6 +226,9 @@ def prepare(args, mapped):
     if state.exists():
         info = json.loads(state.read_text())
         if not compatible_preparation(info["identity"],identity): raise ValueError("Prepared inputs/settings changed; choose a new --out")
+        if "second_columns" not in info or "gene_columns" not in info:
+            info = neighbourhood_columns(info, mapped)
+            json_write(state, info)
         log("reuse prepared selected-column matrix")
         return info
     annotation = {}
@@ -304,6 +326,7 @@ def prepare(args, mapped):
         neighbour_columns=neighbour_columns, random_pool=pool, target_dna={str(k):v for k,v in dna.items()},
         target_gene={str(u): next(g for g in groups if annotation[u] in groups[g]) for u in target_loci},
         metadata=[meta[s] for s in retained])
+    info = neighbourhood_columns(info, mapped)
     npz_write(args.out/"prepared.npz", X=X, K=K)
     write_tsv(args.out/"features.tsv", [dict(locus=u,gene=annotation[u],
         label=nodes[annotation[u]].get("label",annotation[u]),
@@ -385,14 +408,120 @@ def call_amrfinder(job):
 
 
 def point_symbol(symbol):
-    match = re.fullmatch(r"(.+)_([A-Z*])(\d+)([A-Z*])", symbol)
-    if match and canonical(match[1]) in {"gyrA", "parC"}:
-        return canonical(match[1]), match[2], int(match[3]), match[4]
+    match = re.fullmatch(r"(.+)_([A-Z*])(\d+)([A-Z*])", symbol.strip())
+    if match:
+        genes = {canonical(g) for g in match[1].split("_")} & {"gyrA", "parC"}
+        if len(genes)==1: return genes.pop(), match[2], int(match[3]), match[4]
     return None
 
 
-def known_matrix(samples, main, calls, min_coverage):
-    symbols = sorted({r["Gene symbol"] for rs in main.values() for r in rs
+def mutation_catalog(path):
+    """NCBI's reference offset is authoritative, not traditional site numbering."""
+    result = []
+    with path.open(encoding="utf-8-sig") as stream:
+        for fields in csv.reader(stream, delimiter="\t"):
+            if len(fields)<5 or fields[0]!="Staphylococcus_aureus": continue
+            parsed = point_symbol(fields[3]) or point_symbol(fields[4])
+            if not parsed: continue
+            gene,wild,position,allele = parsed
+            result.append(dict(gene=gene,wild=wild,position=position,allele=allele,
+                accession=fields[1],reference_position=int(fields[2]),
+                marker=f"{gene}_{wild}{position}{allele}"))
+    if not result: raise ValueError(f"No S. aureus gyrA/parC protein sites in {path}")
+    return result
+
+
+def parsed_calls(rows, catalog):
+    result, seen = [], set()
+    for original in rows:
+        row = {k.strip().lstrip("#"):v for k,v in original.items() if k}
+        symbol = row.get("Gene symbol", row.get("Element symbol", row.get("gene_symbol", "")))
+        parsed = point_symbol(symbol)
+        if not parsed: continue
+        gene,wild,position,allele = parsed
+        offsets = {c["reference_position"] for c in catalog if
+                   (c["gene"],c["wild"],c["position"],c["accession"]) ==
+                   (gene,wild,position,row.get("Accession of closest sequence"))}
+        row.update({"Gene symbol":f"{gene}_{wild}{position}{allele}",
+                    "Original symbol":symbol,"Call source":row.get("Call source","AMRFinder"),
+                    "Reference position":next(iter(offsets)) if len(offsets)==1 else None})
+        # Duplicate database annotations of one physical call are not extra copies.
+        key = tuple(row.get(k) for k in ["Gene symbol","Contig id","Start","Stop","Strand"])
+        if row.get("Contig id") and key in seen: continue
+        seen.add(key); result.append(row)
+    return result
+
+
+def recover_target_calls(job):
+    """Recover missing target genes only, using curated proteins and TBLASTN.
+
+    A single high-coverage/identity locus is required; multiple matching copies
+    remain missing. All inferred residues retain reference/coordinate provenance.
+    """
+    sample,source,missing,catalog,reference,root,executable,identity = job
+    from Bio.Seq import Seq
+    out = sample_directory(root, sample); out.mkdir(parents=True,exist_ok=True)
+    state = out/"recovery.json"
+    key = dict(identity=identity,source_sha256=sha256(source),genes=sorted(missing))
+    if state.exists():
+        old=json.loads(state.read_text())
+        if old["identity"]==key: return old["calls"],old["diagnostics"]
+    dna=genome_dna(source)
+    query,subject,hits = out/"references.faa",out/"assembly.fna",out/"hits.tsv"
+    selected={c["accession"] for c in catalog if c["gene"] in missing}
+    with query.open("w") as stream:
+        for accession in sorted(selected): stream.write(f">{accession}\n{reference[accession]}\n")
+    with subject.open("w") as stream:
+        for name,seq in dna.items(): stream.write(f">{name}\n{seq}\n")
+    try:
+        command=[executable,"-query",str(query),"-subject",str(subject),"-out",str(hits),
+            "-outfmt","6 qseqid sseqid sstart send pident qstart qend qlen bitscore",
+            "-evalue","1e-20","-num_threads","1"]
+        with (out/"tblastn.log").open("w") as stream:
+            subprocess.run(command,stdout=stream,stderr=subprocess.STDOUT,check=True)
+        candidates=defaultdict(list)
+        accession_genes={c["accession"]:c["gene"] for c in catalog}
+        for line in hits.read_text().splitlines():
+            q,contig,a,b,identity_percent,qa,qb,length,bits=line.split("\t")
+            if float(identity_percent)<90 or (int(qb)-int(qa)+1)/int(length)<.9: continue
+            candidates[accession_genes[q]].append((q,contig,int(a),int(b),float(bits)))
+        calls,diagnostics=[],[]
+        for gene in sorted(missing):
+            ranked=sorted(candidates[gene],key=lambda h:-h[-1])
+            loci=[]
+            for hit in ranked:
+                _,contig,a,b,_=hit; lo,hi=sorted((a,b))
+                if not any(contig==h[1] and (a<b)==(h[2]<h[3]) and
+                           max(lo,min(h[2:4]))<=min(hi,max(h[2:4])) for h in loci): loci.append(hit)
+            diagnostics.append(dict(sample=sample,gene=gene,source="reference_alignment",
+                status="UNIQUE_REFERENCE_HIT" if len(loci)==1 else "NO_REFERENCE_HIT" if not loci else "MULTIPLE_REFERENCE_HITS"))
+            if len(loci)!=1: continue
+            accession,contig,a,b,_=loci[0]
+            start,stop=min(a,b)-1,max(a,b)
+            sequence=dna[contig][start:stop]
+            if a>b: sequence=str(Seq(sequence).reverse_complement())
+            protein=str(Seq(sequence[:len(sequence)//3*3]).translate(table=11))
+            mapping=reference_mapping(reference[accession],protein)
+            sites={}
+            for spec in catalog:
+                if spec["gene"]==gene and spec["accession"]==accession:
+                    sites[(spec["wild"],spec["position"],spec["reference_position"])]=spec
+            for (wild,position,offset),spec in sites.items():
+                j=mapping.get(offset-1)
+                if j is None or reference[accession][offset-1]!=wild or protein[j] not in "ACDEFGHIKLMNPQRSTVWY": continue
+                calls.append({"Gene symbol":f"{gene}_{wild}{position}{protein[j]}",
+                    "Element subtype":"POINT","Contig id":contig,"Start":str(start+1),"Stop":str(stop),
+                    "Strand":"+" if a<b else "-","Accession of closest sequence":accession,
+                    "Reference position":offset,"Call source":"reference_alignment"})
+        json_write(state,dict(identity=key,calls=calls,diagnostics=diagnostics))
+        return calls,diagnostics
+    finally:
+        query.unlink(missing_ok=True); subject.unlink(missing_ok=True)
+
+
+def known_matrix(samples, main, calls, min_coverage, markers=None):
+    symbols = sorted(set(markers) if markers is not None else
+                     {r["Gene symbol"] for rs in main.values() for r in rs
                       if r.get("Element subtype")=="POINT" and point_symbol(r["Gene symbol"])})
     carriage = ["blaZ","mecA","mecC"]
     names = [g+"_presence" for g in carriage]+symbols
@@ -452,9 +581,10 @@ def audit_sample(job):
             ref = reference.get(accession)
             alignments[key] = (protein, reference_mapping(ref, protein) if ref else {}, ref)
         protein, mapping, ref = alignments[key]
-        offset = mapping.get(position-1)
-        resolved = (ref is not None and offset is not None and position<=len(ref)
-                    and ref[position-1]==wild and protein[offset]==observed)
+        reference_position=call.get("Reference position",position)
+        offset = mapping.get(reference_position-1) if reference_position else None
+        resolved = (ref is not None and offset is not None and reference_position<=len(ref)
+                    and ref[reference_position-1]==wild and protein[offset]==observed)
         codon_start = (start+3*offset if strand=="+" else stop-3*(offset+1)) if resolved else None
         for locus, sequence in target_dna.items():
             if target_gene[locus]!=gene: continue
@@ -472,6 +602,7 @@ def audit_sample(job):
             hits = matches[local_key]
             rows.append(dict(sample=sample, locus=int(locus), gene=gene,
                 marker=call["Gene symbol"], site=f"{gene}_{wild}{position}",
+                call_source=call.get("Call source","AMRFinder"), reference_position=reference_position,
                 contig=contig, reference_accession=accession,
                 local_exact_matches=len(hits), coordinate_resolved=int(resolved),
                 covers_known_codon=int(resolved and any(a<=codon_start and b>=codon_start+3 for a,b in hits)),
@@ -515,12 +646,15 @@ def allele_audit(args, info):
         raise ValueError(f"AMRProt.fa not found at {reference_file or 'an undetected database directory'}. "
                          f"Database output saved to {args.out/'amrfinder_version.txt'}. "
                          "Set AMRFINDER_DB=/actual/database/directory or --reference-proteins.")
+    catalog_file = args.mutation_catalog or (database/"AMRProt-mutation.tsv" if database else reference_file.with_name("AMRProt-mutation.tsv"))
+    if not catalog_file.is_file(): raise ValueError(f"Curated mutation coordinates missing: {catalog_file}; set --mutation-catalog")
+    catalog = mutation_catalog(catalog_file)
     audit_identity = dict(prepared=info["identity"], amrfinder=version_text,
-                          reference_proteins_sha256=sha256(reference_file), min_gene_coverage=args.min_gene_coverage)
+        reference_proteins_sha256=sha256(reference_file), min_gene_coverage=args.min_gene_coverage,
+        catalog_sha256=sha256(catalog_file),revision=AUDIT_REVISION)
     state = args.out/"audit_identity.json"
     if state.exists():
-        if json.loads(state.read_text())!=audit_identity: raise ValueError("Allele audit identity changed; choose a new --out")
-        if (args.out/"genotypes.npz").exists():
+        if json.loads(state.read_text())==audit_identity and (args.out/"genotypes.npz").exists():
             log("reuse completed allele audit")
             return
     root = args.out/"amrfinder"
@@ -528,18 +662,43 @@ def allele_audit(args, info):
     with ProcessPoolExecutor(max_workers=args.threads) as pool:
         for i,sample in enumerate(pool.map(call_amrfinder, jobs, chunksize=1), 1):
             if i%10==0 or i==len(jobs): log(f"AMRFinder reports {i}/{len(jobs)} saved; per-sample restart enabled")
-    main, calls = {}, {}
+    main, calls, diagnostics = {}, {}, []
     for sample in info["samples"]:
         directory = sample_directory(root, sample)
         main[sample] = list(records(directory/"amr.tsv"))
-        calls[sample] = [r for r in records(directory/"mutations.tsv") if point_symbol(r.get("Gene symbol", ""))]
-    accessions = {r["Accession of closest sequence"] for rs in calls.values() for r in rs}
+        raw=list(records(directory/"mutations.tsv"))
+        calls[sample] = parsed_calls(raw,catalog)
+        diagnostics.append(dict(sample=sample,source="AMRFinder",gene="gyrA/parC",
+            raw_rows=len(raw),parsed_target_rows=len(calls[sample]),
+            status="PARSED" if calls[sample] else "NO_PARSED_TARGET_CALLS",
+            raw_symbol_examples=";".join(sorted({r.get("Gene symbol",r.get("Element symbol","")) for r in raw})[:8])))
+    accessions = ({r["Accession of closest sequence"] for rs in calls.values() for r in rs} |
+                  {c["accession"] for c in catalog})
     reference = {}
     for accession, protein in fasta_records(reference_file):
         for key in set(accession.split("|")) & accessions: reference[key] = protein
     absent = accessions-set(reference)
     if absent: raise ValueError(f"AMRProt.fa does not match AMRFinder reports; missing reference proteins {sorted(absent)}")
-    G,names = known_matrix(info["samples"], main, calls, args.min_gene_coverage)
+    recovery=[]
+    for sample in info["samples"]:
+        present={point_symbol(r["Gene symbol"])[0] for r in calls[sample]}
+        missing={"gyrA","parC"}-present
+        if missing: recovery.append((sample,missing))
+    if recovery:
+        tblastn=shutil.which(args.tblastn) or shutil.which(str(Path(executable).parent/args.tblastn))
+        if not tblastn: raise ValueError("Target calls are missing; install BLAST+ or set --tblastn for curated-reference recovery. Original AMRFinder reports are saved.")
+        jobs=[(s,sources[s],missing,catalog,reference,args.out/"allele_recovery",tblastn,
+               dict(revision=AUDIT_REVISION,catalog=audit_identity["catalog_sha256"],
+                    proteins=audit_identity["reference_proteins_sha256"])) for s,missing in recovery]
+        log(f"recover target alleles from curated reference proteins: {len(jobs)} samples; original AMRFinder calls retained")
+        with ProcessPoolExecutor(max_workers=args.threads) as pool:
+            for i,((sample,_),(extra,notes)) in enumerate(zip(recovery,pool.map(recover_target_calls,jobs,chunksize=1)),1):
+                calls[sample].extend(extra); diagnostics.extend(notes)
+                if i%25==0 or i==len(jobs): log(f"reference allele recovery {i}/{len(jobs)}")
+    write_tsv(args.out/"allele_call_diagnostics.tsv",diagnostics,
+        ["sample","gene","source","status","raw_rows","parsed_target_rows","raw_symbol_examples"])
+    G,names = known_matrix(info["samples"], main, calls, args.min_gene_coverage,
+                           markers={c["marker"] for c in catalog})
     symbols = [name for name in names if point_symbol(name)]
     genotypes = [dict(sample=s, **{name: "" if not np.isfinite(G[i,j]) else int(G[i,j])
                                   for j,name in enumerate(names)}) for i,s in enumerate(info["samples"])]
@@ -566,24 +725,45 @@ def allele_audit(args, info):
                 value[("present" if present else "absent")+"_"+("known_mutant" if resistant else "wildtype" if parsed[1]==parsed[3] else "other_allele")] += 1
                 detail.append(row)
             if i%50==0 or i==len(jobs): log(f"target unitig/site audit {i}/{len(jobs)}")
-    fields = ["sample", "locus", "gene", "marker", "site", "contig", "reference_accession", "local_exact_matches",
+    fields = ["sample", "locus", "gene", "marker", "site", "contig", "reference_accession", "reference_position","call_source","local_exact_matches",
               "coordinate_resolved", "covers_known_codon", "codon_start_1based", "observed_amino_acid", "pseudo_fasta_present"]
     with gzip.open(args.out/"unitig_site_evidence.tsv.gz", "wt", newline="") as stream:
         writer = csv.DictWriter(stream, fields, delimiter="\t"); writer.writeheader(); writer.writerows(detail)
     summaries = []
     for (locus,site), value in sorted(aggregate.items()):
+        direct=value["present_and_covers_known_codon"]>0
+        complete=direct and value["present_and_covers_known_codon"]==value["unitig_present_rows"]
+        interpretation=("VERIFIED_MUTANT_MARKER" if complete and value["present_known_mutant"] and
+            not value["present_wildtype"] and not value["present_other_allele"] else
+            "VERIFIED_WILDTYPE_MARKER" if complete and value["present_wildtype"] and
+            not value["present_known_mutant"] and not value["present_other_allele"] else
+            "MIXED_OR_INCOMPLETE_SITE_OVERLAP" if direct else "GENE_ASSOCIATED_SITE_UNCONFIRMED")
         summaries.append(dict(locus=locus, gene=info["target_gene"][str(locus)], site=site,
             status="DIRECT_KNOWN_SITE_OVERLAP" if value["present_and_covers_known_codon"] else "NO_CONFIRMED_SITE_OVERLAP",
-            **value))
+            marker_interpretation=interpretation, **value))
     for locus in map(int,info["target_dna"]):
         if not any(r["locus"]==locus for r in summaries):
             summaries.append(dict(locus=locus,gene=info["target_gene"][str(locus)],site="",
                 status="GENE_CARRIAGE_MARKER" if info["target_gene"][str(locus)]=="blaZ" else "NO_CALLABLE_KNOWN_SITE"))
     columns = ["locus","gene","site","status"]+sorted({k for r in summaries for k in r}-{"locus","gene","site","status"})
     write_tsv(args.out/"unitig_allele_audit.tsv", summaries, columns)
+    marker_summary=[]
+    for j,name in enumerate(names):
+        values=G[:,j]
+        marker_summary.append(dict(marker=name,present=int(np.sum(values==1)),absent=int(np.sum(values==0)),
+            missing=int(np.sum(~np.isfinite(values))),variable=bool(np.any(values==0) and np.any(values==1))))
+    write_tsv(args.out/"marker_summary.tsv",marker_summary,["marker","present","absent","missing","variable"])
+    agreement=[]
+    for j in info.get("gene_columns",{}).get("blaZ",info["target_columns"]["penicillin"]):
+        values=G[:,names.index("blaZ_presence")]; callable=np.isfinite(values); u=X[:,j]
+        agreement.append(dict(locus=info["loci"][j],gene_present_unitig_present=int(np.sum((values==1)&(u==1))),
+            gene_present_unitig_absent=int(np.sum((values==1)&(u==0))),
+            gene_absent_unitig_present=int(np.sum((values==0)&(u==1))),
+            gene_absent_unitig_absent=int(np.sum((values==0)&(u==0))),gene_missing=int(np.sum(~callable))))
+    write_tsv(args.out/"blaz_carriage_agreement.tsv",agreement,["locus"]+sorted({k for r in agreement for k in r}-{"locus"}))
     npz_write(args.out/"genotypes.npz", G=G, names=np.asarray(names))
     json_write(state, audit_identity)
-    log(f"allele audit saved: {len(symbols)} observed curated mutation features; blaZ gene detection separate")
+    log(f"allele audit saved: {len(symbols)} catalogue mutation features; inspect marker_summary.tsv for observed states")
 
 
 def censored_loss(theta, design, bound, censor, penalty):
@@ -613,10 +793,16 @@ def fit_censored(design, bound, censor, alpha, nuisance):
     init[0] = np.median(bound[censor==0])
     init[-1] = np.log(max(.5,np.std(bound[censor==0])))
     penalty = np.r_[np.zeros(nuisance), np.full(design.shape[1]-nuisance,alpha)]
-    fitted = minimize(censored_loss, init, args=(design,bound,censor,penalty), jac=True,
-        method="L-BFGS-B", bounds=[(None,None)]*design.shape[1]+[(np.log(.05),np.log(32.))],
-        options=dict(maxiter=500,ftol=1e-10,gtol=1e-6))
-    if not fitted.success or not np.isfinite(fitted.fun): raise ValueError("Censored fit failed: "+fitted.message)
+    for attempt in range(2):
+        fitted = minimize(censored_loss, init, args=(design,bound,censor,penalty), jac=True,
+            method="L-BFGS-B", bounds=[(None,None)]*design.shape[1]+[(np.log(.05),np.log(32.))],
+            options=dict(maxiter=2000,ftol=1e-10,gtol=1e-6,maxls=50))
+        if fitted.success and np.isfinite(fitted.fun): break
+        if not np.isfinite(fitted.x).all(): break
+        init=fitted.x
+    if not fitted.success or not np.isfinite(fitted.fun):
+        raise ValueError(f"Censored fit failed: {fitted.message}; iterations={fitted.nit}; "
+                         f"objective={fitted.fun}; max_gradient={np.max(np.abs(fitted.jac))}")
     if abs(fitted.x[-1]-np.log(.05))<1e-5 or abs(fitted.x[-1]-np.log(32.))<1e-5:
         raise ValueError("Residual scale reached a numerical search bound")
     return fitted.x[:-1], float(np.exp(fitted.x[-1]))
@@ -630,6 +816,7 @@ def prediction_loss(bound, censor, mean, sigma):
 
 def tree_axes(K, train, test, count):
     """Training-only kernel PCA, with out-of-sample projection of held-out isolates."""
+    if count==0: return np.empty((len(train),0)),np.empty((len(test),0))
     block = K[np.ix_(train,train)]
     means, grand = block.mean(axis=0), block.mean()
     centered = block-means[None,:]-means[:,None]+grand
@@ -655,6 +842,7 @@ def independent_columns(F, train, candidates, minimum):
     selected, seen = [], set()
     for j in candidates:
         values = F[train,j]
+        if not np.isfinite(values).all(): continue
         if min(values.sum(),len(values)-values.sum())<minimum: continue
         key = pattern_key(values)
         if key not in seen: selected.append(j); seen.add(key)
@@ -707,7 +895,7 @@ def endpoint_data(endpoint):
     if endpoint in _ENDPOINTS: return _ENDPOINTS[endpoint]
     from sklearn.model_selection import GroupKFold
     args,info,F,K,names = _STATE
-    baseline = [j for j,name in enumerate(names) if name in {"blaZ_presence","mecA_presence","mecC_presence"}] if endpoint=="penicillin" else [j for j,name in enumerate(names) if point_symbol(name)]
+    baseline = [j for j,name in enumerate(names) if name=="blaZ_presence"] if endpoint=="penicillin" else [j for j,name in enumerate(names) if point_symbol(name)]
     if not baseline: raise ValueError("No observed curated gyrA/parC mutation features; inspect the allele audit first")
     drug = "benzylpenicillin" if endpoint=="penicillin" else args.quinolone
     column = args.penicillin_column if endpoint=="penicillin" else drug+"_mic"
@@ -725,6 +913,7 @@ def endpoint_data(endpoint):
         if status in {"exact","censored"}:
             indices.append(i); bounds.append(np.log2(number)); censor.append(0 if status=="exact" else -1 if sign.startswith("<") else 1)
         audit.append(dict(sample=info["samples"][i],mic=value,sign=sign,status=status))
+    write_tsv(Path(args.prediction_dir)/f"{endpoint}_phenotypes.tsv",audit,["sample","mic","sign","status"])
     if len(indices)<30 or sum(c==0 for c in censor)<10:
         raise ValueError(f"{drug}: fewer than 30 usable MICs or 10 exact MICs; do not substitute limits as exact values")
     indices = np.array(indices)
@@ -737,37 +926,61 @@ def endpoint_data(endpoint):
     return state
 
 
+def prediction_models(endpoint, info, names):
+    """Explicit baselines; neighbours never silently replace the anchor features."""
+    offset=len(names)
+    target=[offset+j for j in info["target_columns"][endpoint]]
+    first=[offset+j for j in info["neighbour_columns"][endpoint]]
+    both=first+[offset+j for j in info["second_columns"][endpoint]]
+    known=[j for j,name in enumerate(names) if point_symbol(name)]
+    if endpoint=="penicillin":
+        gene=[names.index("blaZ_presence")]
+        families={"blaZ_gene":gene,"blaZ_unitigs":target}
+        models={"blaZ_gene_unitigs":dict(base=gene+target,extra=[],family="blaZ_gene",depth=0)}
+    else:
+        families={"gyrA_parC_alleles":known}
+        models={"gyrA_alleles":dict(base=[j for j in known if point_symbol(names[j])[0]=="gyrA"],extra=[],family="gyrA_alleles",depth=0),
+                "parC_alleles":dict(base=[j for j in known if point_symbol(names[j])[0]=="parC"],extra=[],family="parC_alleles",depth=0),
+                "gyrA_parC_alleles_unitigs":dict(base=known+target,extra=[],family="gyrA_parC_alleles",depth=0)}
+    models["Mean"]=dict(base=[],extra=[],family="Mean",depth=0)
+    for name,base in families.items():
+        models[name]=dict(base=base,extra=[],family=name,depth=0)
+        for suffix,extra,depth in [("N1",first,1),("N1_N2",both,2)]:
+            models[name+"_"+suffix]=dict(base=base,extra=extra,family=name,depth=depth)
+            models[name+"_Random_"+suffix]=dict(base=base,extra=extra,family=name,depth=depth,random=True)
+    return models
+
+
 def prediction_job(job):
     from sklearn.model_selection import GroupKFold
     endpoint,fold,model,repeat = job
     args,info,F,K,names = _STATE
-    directory = args.out/"prediction_checkpoints"/endpoint
+    directory = Path(args.prediction_dir)/"checkpoints"/endpoint
     directory.mkdir(parents=True,exist_ok=True)
     path = directory/f"fold{fold}_{model}_{repeat}.json"
-    if path.exists(): return json.loads(path.read_text())
+    if path.exists():
+        saved=json.loads(path.read_text())
+        if saved["status"]=="OK": return saved
     result = dict(endpoint=endpoint,fold=fold,model=model,repeat=repeat,status="FAILED")
     try:
         state = endpoint_data(endpoint)
         indices,y,censor,groups = (state[k] for k in ["indices","bound","censor","groups"])
         train,test = state["folds"][fold]
         real_train,real_test = indices[train],indices[test]
-        base = state["baseline"]
-        target = [len(names)+j for j in info["target_columns"][endpoint]]
-        neighbours = [len(names)+j for j in info["neighbour_columns"][endpoint]]
-        if model in {"Mean","Tree"}: candidates=[]
-        elif model=="Background": candidates=[j for j in base if names[j]!="blaZ_presence"]
-        elif model=="Known_gyrA": candidates=[j for j in base if canonical(names[j])=="gyrA"]
-        elif model=="Known_parC": candidates=[j for j in base if canonical(names[j])=="parC"]
-        elif model=="Known": candidates=base
-        elif model=="Target_unitigs": candidates=base+target
-        elif model=="Neighbours": candidates=base+target+neighbours
-        elif model=="Random_partners":
-            random,mafdiff = matched_partners(F,real_train,base+target,neighbours,
-                [len(names)+j for j in info["random_pool"]],args.min_count,args.seed+100003*fold+repeat)
-            candidates=base+target+random
+        spec=prediction_models(endpoint,info,names)[model]
+        base,extra=spec["base"],spec["extra"]
+        candidates=base+extra
+        result.update(family=spec["family"],depth=spec["depth"],n_train=len(train),n_test=len(test),
+            n_exact_train=int(np.sum(censor[train]==0)),n_exact_test=int(np.sum(censor[test]==0)),
+            n_baseline_features=len(independent_columns(F,real_train,base,args.min_count)))
+        if spec.get("random"):
+            # A stable family seed gives reproducible controls without test-row access.
+            seed=args.seed+100003*fold+repeat+int(hashlib.sha256(spec["family"].encode()).hexdigest()[:6],16)
+            random,mafdiff = matched_partners(F,real_train,base,extra,
+                [len(names)+j for j in info["random_pool"]],args.min_count,seed)
+            candidates=base+random
             result.update(random_loci=[info["loci"][j-len(names)] for j in random],
                           mean_maf_difference=mafdiff,random_partner_count=len(random))
-        else: raise ValueError(model)
         inner_groups = groups[train]
         if len(set(inner_groups))<2: raise ValueError("No grouped inner validation partition")
         inner = list(GroupKFold(n_splits=min(3,len(set(inner_groups)))).split(train,groups=inner_groups))
@@ -778,16 +991,25 @@ def prediction_job(job):
             if key not in state["axes"]: state["axes"][key]=tree_axes(K,a,b,0 if model=="Mean" else args.pcs)
             design,held,nuisance,_ = model_design(F,a,b,candidates,state["axes"][key],args.min_count)
             blocks.append((design,held,nuisance,train[t],train[v]))
-        losses = []
-        for alpha in args.alphas:
+        losses,failures = [],[]
+        penalties=args.alphas if any(d.shape[1]>n for d,h,n,t,v in blocks) else args.alphas[:1]
+        for alpha in penalties:
             scored=[]
-            try:
-                for design,held,nuisance,t,v in blocks:
+            failed=False
+            for inner_fold,(design,held,nuisance,t,v) in enumerate(blocks):
+                try:
                     beta,sigma = fit_censored(design,y[t],censor[t],alpha,nuisance)
                     scored.extend(prediction_loss(y[v],censor[v],held@beta,sigma))
+                except ValueError as error:
+                    failed=True
+                    failures.append(dict(alpha=alpha,inner_fold=inner_fold,reason=str(error),
+                        n_train=len(t),n_exact=int(np.sum(censor[t]==0)),n_features=design.shape[1]-nuisance))
+            if not failed:
                 losses.append((float(np.mean(scored)),alpha))
-            except ValueError: continue
-        if not losses: raise ValueError("No ridge penalty completed all grouped inner folds")
+        result["inner_failures"]=failures
+        if not losses:
+            raise ValueError("No ridge penalty completed all grouped inner folds: "+
+                             "; ".join(sorted({f["reason"] for f in failures})))
         alpha = min(losses)[1]
         key=(fold,"outer",model=="Mean")
         if key not in state["axes"]: state["axes"][key]=tree_axes(K,real_train,real_test,0 if model=="Mean" else args.pcs)
@@ -817,61 +1039,90 @@ def metrics(predictions):
 
 
 def prediction_report(args, results):
-    summaries, predictions, comparisons, features = [], [], [], []
+    summaries, predictions, comparisons, features, fold_comparisons, failures = [], [], [], [], [], []
     grouped = defaultdict(list)
     for r in results:
         grouped[(r["endpoint"],r["model"],r["repeat"])].append(r)
         for row in r.get("predictions",[]): predictions.append(dict(endpoint=r["endpoint"],model=r["model"],repeat=r["repeat"],fold=r["fold"],**row))
         for name in r.get("selected_features",[]):
             features.append(dict(endpoint=r["endpoint"],model=r["model"],repeat=r["repeat"],fold=r["fold"],feature=name))
+        for failure in r.get("inner_failures",[]):
+            failures.append(dict(endpoint=r["endpoint"],model=r["model"],repeat=r["repeat"],fold=r["fold"],**failure))
     for (endpoint,model,repeat), folds in sorted(grouped.items()):
         success = all(f["status"]=="OK" for f in folds)
         row=dict(endpoint=endpoint,model=model,repeat=repeat,status="OK" if success else "INCOMPLETE",
+                 family=folds[0].get("family",""),depth=folds[0].get("depth",0),
                  failed_folds=";".join(str(f["fold"]) for f in folds if f["status"]!="OK"))
         if success: row.update(metrics([p for f in folds for p in f["predictions"]]))
         summaries.append(row)
     for endpoint in TARGETS:
         selected = [r for r in summaries if r["endpoint"]==endpoint and r["status"]=="OK"]
-        baseline = next((r for r in selected if r["model"]=="Target_unitigs"),None)
-        network = next((r for r in selected if r["model"]=="Neighbours"),None)
-        controls = [r for r in selected if r["model"]=="Random_partners"]
-        if baseline and network:
-            comparisons.append(dict(endpoint=endpoint,delta_nll=baseline["nll"]-network["nll"],
-                delta_rmse_exact=baseline["rmse_exact"]-network["rmse_exact"],valid_random_sets=len(controls),
-                random_fraction_at_least_as_good=(1+sum(r["nll"]<=network["nll"] for r in controls))/(1+len(controls)) if controls else "",
-                interpretation="positive delta favours neighbours; random fraction is a descriptive benchmark, not an epistasis P-value"))
+        families=["blaZ_gene","blaZ_unitigs"] if endpoint=="penicillin" else ["gyrA_parC_alleles"]
+        for family in families:
+            for suffix in ["N1","N1_N2"]:
+                model=family+"_"+suffix
+                baseline=next((r for r in selected if r["model"]==family),None)
+                network=next((r for r in selected if r["model"]==model),None)
+                controls=[r for r in selected if r["model"]==family+"_Random_"+suffix]
+                if baseline and network:
+                    comparisons.append(dict(endpoint=endpoint,family=family,model=model,
+                        delta_nll=baseline["nll"]-network["nll"],
+                        delta_rmse_exact=baseline["rmse_exact"]-network["rmse_exact"],valid_random_sets=len(controls),
+                        requested_random_sets=args.random_sets,
+                        random_fraction_at_least_as_good=(1+sum(r["nll"]<=network["nll"] for r in controls))/(1+len(controls))
+                            if controls and len(controls)==args.random_sets else "",
+                        interpretation="positive delta favours neighbours; random fraction is descriptive, not an epistasis P-value"))
+        # Retain paired fold diagnostics for every extension, including allele-only
+        # versus joint-allele and gene-carriage versus gene-plus-unitig baselines.
+        for r in [r for r in results if r["endpoint"]==endpoint and r["status"]=="OK"]:
+            family=r.get("family")
+            references=[family] if family!=r["model"] else []
+            if r["model"]=="gyrA_parC_alleles": references+=["gyrA_alleles","parC_alleles"]
+            if r["model"]=="blaZ_unitigs": references.append("blaZ_gene")
+            if r["model"].endswith("_N1_N2") and "_Random_" not in r["model"]: references.append(family+"_N1")
+            for reference in references:
+                base=next((b for b in results if b["endpoint"]==endpoint and b["model"]==reference and
+                           b["fold"]==r["fold"] and b["status"]=="OK"),None)
+                if not base: continue
+                a,b=metrics(base["predictions"]),metrics(r["predictions"])
+                fold_comparisons.append(dict(endpoint=endpoint,baseline=reference,model=r["model"],repeat=r["repeat"],fold=r["fold"],
+                    delta_nll=a["nll"]-b["nll"],delta_rmse_exact=a["rmse_exact"]-b["rmse_exact"] if a["rmse_exact"] is not None else "",
+                    interpretation="paired fold diagnostic; interpret overall performance only if every fold completed"))
     for name,rows,first in [("performance",summaries,["endpoint","model","repeat","status"]),
                            ("predictions",predictions,["endpoint","model","repeat","fold","sample"]),
-                           ("neighbour_improvement",comparisons,["endpoint"])]:
+                           ("neighbour_improvement",comparisons,["endpoint","family","model"]),
+                           ("paired_fold_improvement",fold_comparisons,["endpoint","baseline","model","repeat","fold"]),
+                           ("fit_failures",failures,["endpoint","model","repeat","fold","inner_fold","alpha","reason"])]:
         fields=first+sorted({k for r in rows for k in r}-set(first))
         write_tsv(args.out/f"{name}.tsv",rows,fields)
-    write_tsv(args.out/"fit_status.tsv",[{k:v for k,v in r.items() if k not in {"predictions","selected_features","random_loci"}} for r in results],
-              ["endpoint","fold","model","repeat","status","reason","alpha","n_train","n_test","n_genomic_features","random_partner_count","mean_maf_difference"])
+    status=[{k:v for k,v in r.items() if k not in {"predictions","selected_features","random_loci","inner_failures"}} for r in results]
+    first=["endpoint","fold","model","repeat","status","reason","alpha","n_train","n_test","n_genomic_features","random_partner_count","mean_maf_difference"]
+    write_tsv(args.out/"fit_status.tsv",status,first+sorted({k for r in status for k in r}-set(first)))
     write_tsv(args.out/"model_features.tsv",features,["endpoint","model","repeat","fold","feature"])
-    performance_plot(args.out,summaries)
+    performance_plot(args.out,summaries,args.random_sets)
 
 
-def performance_plot(out, rows):
+def performance_plot(out, rows, random_sets=0):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     plt.rcParams["svg.fonttype"]="none"
-    fig,axes=plt.subplots(2,2,figsize=(12,8))
+    fig,axes=plt.subplots(2,2,figsize=(19,12))
     for panel,endpoint in enumerate(TARGETS):
         successful=[r for r in rows if r["endpoint"]==endpoint and r["status"]=="OK"]
-        fixed=[r for r in successful if r["model"]!="Random_partners"]
-        controls=[r for r in successful if r["model"]=="Random_partners"]
+        models=sorted({r["model"] for r in successful})
         for col,measure in enumerate(["nll","rmse_exact"]):
             ax=axes[panel,col]
-            for j,r in enumerate(fixed): ax.plot(j,r[measure],"ko")
-            labels=[r["model"].replace("_","\n") for r in fixed]
-            if controls:
-                ax.boxplot([[r[measure] for r in controls]],positions=[len(fixed)],widths=.5,
-                    boxprops=dict(color="black"),medianprops=dict(color="black"),whiskerprops=dict(color="black"),capprops=dict(color="black"))
-                labels.append("Random\npartners")
-            ax.set_xticks(range(len(labels)),labels,rotation=35,ha="right",fontsize=8)
+            for j,model in enumerate(models):
+                values=[r[measure] for r in successful if r["model"]==model and r.get(measure) is not None]
+                if "_Random_" in model and values:
+                    ax.boxplot([values],positions=[j],widths=.5,vert=False,
+                        boxprops=dict(color="black"),medianprops=dict(color="black"),whiskerprops=dict(color="black"),capprops=dict(color="black"))
+                elif values: ax.plot(values,[j]*len(values),"ko")
+            labels=[m.replace("_"," ")+(f" ({sum(r['model']==m for r in successful)}/{random_sets})" if "_Random_" in m else "") for m in models]
+            ax.set_yticks(range(len(models)),labels,fontsize=8)
             ax.set_title(endpoint)
-            ax.set_ylabel("Held-out censored Gaussian NLL" if measure=="nll" else "Exact-MIC RMSE (log2 units)")
+            ax.set_xlabel("Held-out censored Gaussian NLL" if measure=="nll" else "Exact-MIC RMSE (log2 units)")
             ax.spines[["top","right"]].set_visible(False)
     fig.tight_layout()
     for suffix in ["png","svg"]: fig.savefig(out/f"mic_performance.{suffix}",dpi=300)
@@ -880,40 +1131,71 @@ def performance_plot(out, rows):
 
 def predict(args, info):
     if not (args.out/"audit_identity.json").exists(): raise ValueError("Run the allele audit first")
+    audit_identity=json.loads((args.out/"audit_identity.json").read_text())
+    if audit_identity.get("revision")!=AUDIT_REVISION:
+        raise ValueError("Run audit/all with the revised allele caller before prediction; original AMRFinder reports remain reusable")
+    if "second_columns" not in info or "gene_columns" not in info:
+        raise ValueError("Run prepare/all once to add neighbourhood metadata to the existing matrix; AMRFinder reports remain reusable")
     settings = dict(out=str(args.out),quinolone=args.quinolone,penicillin_column=args.penicillin_column,
         penicillin_sign_column=args.penicillin_sign_column,folds=args.folds,pcs=args.pcs,
         min_count=args.min_count,seed=args.seed,alphas=args.alphas)
     import importlib.metadata
-    identity=dict(settings=settings,revision=REVISION,code=sha256(__file__),
-        audit=json.loads((args.out/"audit_identity.json").read_text()),
+    identity=dict(settings=dict(settings),revision=PREDICTION_REVISION,code=sha256(__file__),
+        prepared_sha256=sha256(args.out/"prepared.json"),genotypes_sha256=sha256(args.out/"genotypes.npz"),
+        audit=audit_identity,
         dependencies={name:importlib.metadata.version(name) for name in ["numpy","scipy","scikit-learn"]})
-    state=args.out/"prediction_identity.json"
-    if state.exists() and json.loads(state.read_text())!=identity: raise ValueError("Prediction settings changed; use a new --out")
+    run_id=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()[:16]
+    prediction_dir=args.out/"predictions"/run_id
+    prediction_dir.mkdir(parents=True,exist_ok=True)
+    settings["prediction_dir"]=str(prediction_dir)
+    state=prediction_dir/"prediction_identity.json"
     json_write(state,identity)
+    json_write(args.out/"latest_prediction.json",dict(path=str(prediction_dir),run_id=run_id,revision=PREDICTION_REVISION))
+    log(f"prediction output: {prediction_dir}; tree PCs={args.pcs}; failed partitions are retried")
     worker_init(settings)
-    jobs=[]
+    jobs,support,combinations=[],[],[]
+    _,_,F,_,names=_STATE
     for endpoint in TARGETS:
         try:
             endpoint_state=endpoint_data(endpoint)
-            write_tsv(args.out/f"{endpoint}_phenotypes.tsv",endpoint_state["audit"],["sample","mic","sign","status"])
-            models=["Mean","Tree","Known","Target_unitigs","Neighbours"]
-            if endpoint=="penicillin": models.insert(2,"Background")
-            if endpoint=="fluoroquinolone": models[2:2]=["Known_gyrA","Known_parC"]
-            for fold in range(len(endpoint_state["folds"])):
-                jobs.extend((endpoint,fold,model,0) for model in models)
-                jobs.extend((endpoint,fold,"Random_partners",repeat) for repeat in range(args.random_sets))
+            models=prediction_models(endpoint,info,names)
+            for fold,(train,test) in enumerate(endpoint_state["folds"]):
+                for model,spec in models.items():
+                    repeats=range(args.random_sets) if spec.get("random") else [0]
+                    jobs.extend((endpoint,fold,model,repeat) for repeat in repeats)
+                real_train=endpoint_state["indices"][train]
+                for j in sorted({j for spec in models.values() for j in spec["base"]+spec["extra"]}):
+                    values=F[real_train,j]; zero,one=int(np.sum(values==0)),int(np.sum(values==1))
+                    support.append(dict(endpoint=endpoint,fold=fold,
+                        feature=names[j] if j<len(names) else "unitig:"+str(info["loci"][j-len(names)]),
+                        absent=zero,present=one,missing=int(np.sum(~np.isfinite(values))),
+                        status="MISSING" if not np.isfinite(values).all() else "FIXED" if min(zero,one)==0 else
+                               "BELOW_MIN_COUNT" if min(zero,one)<args.min_count else "ELIGIBLE_BEFORE_REDUNDANCY_FILTER"))
+            profiles=defaultdict(list)
+            for k,i in enumerate(endpoint_state["indices"]):
+                profile=";".join(names[j] for j in endpoint_state["baseline"] if F[i,j]==1) or "NO_TARGET_MARKER_DETECTED"
+                profiles[profile].append(k)
+            for profile,rows in sorted(profiles.items()):
+                combinations.append(dict(endpoint=endpoint,genotype=profile,n=len(rows),
+                    exact=int(np.sum(endpoint_state["censor"][rows]==0)),
+                    censored=int(np.sum(endpoint_state["censor"][rows]!=0)),
+                    groups=len(set(endpoint_state["groups"][rows]))))
+            (prediction_dir/f"{endpoint}_not_run.json").unlink(missing_ok=True)
             log(f"{endpoint}: {len(endpoint_state['indices'])} callable MICs; {sum(endpoint_state['censor']==0)} exact")
         except ValueError as error:
             log(f"{endpoint}: NOT RUN: {error}")
-            json_write(args.out/f"{endpoint}_not_run.json",dict(reason=str(error)))
+            json_write(prediction_dir/f"{endpoint}_not_run.json",dict(reason=str(error)))
+    write_tsv(prediction_dir/"training_feature_support.tsv",support,["endpoint","fold","feature","absent","present","missing","status"])
+    write_tsv(prediction_dir/"genotype_combinations.tsv",combinations,["endpoint","genotype","n","exact","censored","groups"])
     if not jobs: raise ValueError("Neither endpoint is eligible; inspect *_not_run.json")
     results=[]
     with ProcessPoolExecutor(max_workers=args.threads,initializer=worker_init,initargs=(settings,)) as pool:
         for i,result in enumerate(pool.map(prediction_job,jobs,chunksize=1),1):
             results.append(result)
             if i%10==0 or i==len(jobs): log(f"prediction partitions saved {i}/{len(jobs)}; failed={sum(r['status']!='OK' for r in results)}")
-    prediction_report(args,results)
-    log("prediction finished; inspect fit_status.tsv before interpreting improvement")
+    report_args=argparse.Namespace(**vars(args)); report_args.out=prediction_dir
+    prediction_report(report_args,results)
+    log(f"prediction finished: {prediction_dir}; inspect fit_status.tsv before interpreting improvement")
 
 
 def main(argv=None):
@@ -922,10 +1204,11 @@ def main(argv=None):
     parser.add_argument("--network",type=Path)
     parser.add_argument("--out",type=Path,required=True)
     for name in ["annotation","fasta","unitigs","tree","metadata","sample-map","clusters","locus-map",
-                 "assemblies","gff-dir","amrfinder-db","reference-proteins"]:
+                 "assemblies","gff-dir","amrfinder-db","reference-proteins","mutation-catalog"]:
         parser.add_argument("--"+name,type=Path)
     parser.add_argument("--fasta-columns-are-locus-ids",action="store_true")
     parser.add_argument("--amrfinder",default="amrfinder")
+    parser.add_argument("--tblastn",default="tblastn",help="BLAST+ executable for missing target-call recovery")
     parser.add_argument("--min-gene-coverage",type=float,default=90.)
     parser.add_argument("--quinolone",default="levofloxacin",choices=["levofloxacin","ciprofloxacin","moxifloxacin"])
     parser.add_argument("--penicillin-column",default="benzylpenicillin_mic")
@@ -933,7 +1216,7 @@ def main(argv=None):
     parser.add_argument("--threads",type=int,default=4)
     parser.add_argument("--groups",type=int,default=10,help="Tree partition only when --clusters is absent; not fastBAPS")
     parser.add_argument("--folds",type=int,default=5)
-    parser.add_argument("--pcs",type=int,default=10)
+    parser.add_argument("--pcs",type=int,default=0,help="Optional ancestry sensitivity analysis; primary models use 0")
     parser.add_argument("--random-sets",type=int,default=100)
     parser.add_argument("--min-count",type=int,default=5)
     parser.add_argument("--seed",type=int,default=42)

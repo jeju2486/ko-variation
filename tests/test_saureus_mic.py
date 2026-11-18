@@ -102,6 +102,13 @@ class FocalMicTests(unittest.TestCase):
         np.testing.assert_allclose(before[0],after[0])
         np.testing.assert_allclose(before[1],after[1])
 
+    def test_primary_models_skip_the_tree_eigendecomposition(self):
+        from unittest.mock import patch
+        with patch.object(mic.np.linalg,"eigh",side_effect=AssertionError("No PCs requested")):
+            train,test=mic.tree_axes(np.eye(8),np.arange(5),np.arange(5,8),0)
+        self.assertEqual(train.shape,(5,0))
+        self.assertEqual(test.shape,(3,0))
+
     def test_random_partner_counts_match_independent_added_patterns(self):
         rng=np.random.default_rng(7)
         F=rng.integers(0,2,(80,20)).astype(float)
@@ -140,23 +147,158 @@ class FocalMicTests(unittest.TestCase):
             root=Path(temporary)
             info=dict(samples=[f"s{i}" for i in range(n)],groups=[str(i//20) for i in range(n)],
                 metadata=metadata,loci=list(range(16)),target_columns=dict(penicillin=[0],fluoroquinolone=[1,2]),
-                neighbour_columns=dict(penicillin=[3],fluoroquinolone=[4]),random_pool=list(range(5,16)))
+                neighbour_columns=dict(penicillin=[3],fluoroquinolone=[4]),
+                second_columns=dict(penicillin=[5],fluoroquinolone=[6]),
+                gene_columns=dict(blaZ=[0],gyrA=[1],parC=[2]),random_pool=list(range(7,16)))
             json_write(root/"prepared.json",info)
             npz_write(root/"prepared.npz",X=X,K=np.eye(n))
             npz_write(root/"genotypes.npz",G=G,names=np.array(["blaZ_presence","gyrA_A3V","parC_A3V"]))
-            json_write(root/"audit_identity.json",dict(synthetic=True))
+            json_write(root/"audit_identity.json",dict(synthetic=True,revision=mic.AUDIT_REVISION))
             args=SimpleNamespace(out=root,quinolone="levofloxacin",penicillin_column="benzylpenicillin_mic",
                 penicillin_sign_column="benzylpenicillin_mic_sign",folds=3,pcs=0,min_count=5,seed=42,
                 alphas=[1.],threads=2,random_sets=1)
             mic.predict(args,info)
-            rows=list(mic.records(root/"performance.tsv"))
+            prediction=Path(json.loads((root/"latest_prediction.json").read_text())["path"])
+            rows=list(mic.records(prediction/"performance.tsv"))
             self.assertTrue(rows)
             self.assertTrue(all(r["status"]=="OK" for r in rows))
             self.assertTrue(all(int(r["n"])==n for r in rows))
-            file=root/"prediction_checkpoints/penicillin/fold0_Neighbours_0.json"
+            file=prediction/"checkpoints/penicillin/fold0_blaZ_gene_N1_N2_0.json"
             timestamp=file.stat().st_mtime_ns
             mic.predict(args,info)
             self.assertEqual(file.stat().st_mtime_ns,timestamp)
+            self.assertTrue(any(r["model"]=="blaZ_unitigs_N1_N2" for r in rows))
+            self.assertTrue(any(r["model"]=="gyrA_parC_alleles" for r in rows))
+            self.assertEqual(len(list(mic.records(prediction/"neighbour_improvement.tsv"))),6)
+
+    def test_catalog_offsets_and_prefixed_aliases_do_not_use_traditional_numbering(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"catalog.tsv"
+            path.write_text("Staphylococcus_aureus\tref\t3\tgrlA_A13V\tgrlA_A13V\n")
+            catalog=mic.mutation_catalog(path)
+            call={"Gene symbol":"Staphylococcus_aureus_grlA_A13V","Contig id":"ctg",
+                "Start":"1","Stop":"15","Strand":"+","Accession of closest sequence":"ref"}
+            calls=mic.parsed_calls([call,call],catalog)
+            self.assertEqual(len(calls),1)
+            self.assertEqual(calls[0]["Gene symbol"],"parC_A13V")
+            self.assertEqual(calls[0]["Reference position"],3)
+            genome=Path(temporary)/"genome.fa"; genome.write_text(">ctg\nATGAAAGTTGGTTTT\n")
+            evidence=mic.audit_sample(("sample",genome,calls,{"0":"AAAGTTGGT"},{"0":"parC"},{"ref":"MKAGF"}))
+            self.assertEqual(evidence[0]["covers_known_codon"],1)
+
+    def test_reference_recovery_requires_one_gene_copy_and_resumes(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); source=root/"genome.fa"
+            source.write_text(">ctg\n"+"ATGAAAGTT"+"GGT"*17+"\n")
+            catalog=[dict(gene="gyrA",wild="A",position=13,allele="V",accession="ref",reference_position=3,marker="gyrA_A13V")]
+            reference={"ref":"MKA"+"G"*17}
+            def fake_blast(command,**kwargs):
+                Path(command[command.index("-out")+1]).write_text("ref\tctg\t1\t60\t95\t1\t20\t20\t100\n")
+            job=("s",source,{"gyrA"},catalog,reference,root/"recovery","tblastn",{"test":1})
+            with patch.object(mic.subprocess,"run",side_effect=fake_blast) as run:
+                calls,notes=mic.recover_target_calls(job)
+                self.assertEqual(calls[0]["Gene symbol"],"gyrA_A13V")
+                self.assertEqual(calls[0]["Reference position"],3)
+                self.assertEqual(notes[0]["status"],"UNIQUE_REFERENCE_HIT")
+                self.assertEqual(mic.recover_target_calls(job),(calls,notes))
+                self.assertEqual(run.call_count,1)
+            def duplicated(command,**kwargs):
+                Path(command[command.index("-out")+1]).write_text(
+                    "ref\tctg\t1\t60\t95\t1\t20\t20\t100\nref\tctg2\t1\t60\t95\t1\t20\t20\t100\n")
+            with patch.object(mic.subprocess,"run",side_effect=duplicated):
+                calls,notes=mic.recover_target_calls(("s2",*job[1:]))
+                self.assertEqual(calls,[])
+                self.assertEqual(notes[0]["status"],"MULTIPLE_REFERENCE_HITS")
+
+    def test_full_audit_recovers_missing_calls_and_reuses_original_reports(self):
+        import subprocess
+        import sys
+        from concurrent.futures import ThreadPoolExecutor
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); assemblies=root/"assemblies"; assemblies.mkdir()
+            db=root/"db"; db.mkdir(); out=root/"out"; out.mkdir()
+            (db/"AMRProt.fa").write_text(">refG\nMKA"+"G"*17+"\n>refP\nMKA"+"P"*17+"\n")
+            (db/"AMRProt-mutation.tsv").write_text(
+                "Staphylococcus_aureus\trefG\t3\tgyrA_A13V\tgyrA_A13V\n"
+                "Staphylococcus_aureus\trefP\t3\tparC_A13V\tparC_A13V\n")
+            version=f"Database directory: '{db}'\nDatabase version: synthetic\n"
+            for sample,codon in [("mutant","GTT"),("wild","GCT")]:
+                source=assemblies/f"{sample}.fa"
+                source.write_text(">g\nATGAAA"+codon+"GGT"*17+"\n>p\nATGAAAGCT"+"CCT"*17+"\n")
+                cached=out/"amrfinder"/sample; cached.mkdir(parents=True)
+                mic.json_write(cached/"done.json",dict(sample=sample,source_sha256=mic.sha256(source),amrfinder=version))
+                (cached/"mutations.tsv").write_text("Gene symbol\tElement subtype\n")
+                (cached/"amr.tsv").write_text("Gene symbol\t% Coverage of reference sequence\tMethod\n"+
+                    ("blaZ\t100\tEXACTX\n" if sample=="mutant" else ""))
+            info=dict(identity={"synthetic":True},samples=["mutant","wild"],loci=[0,1,2],
+                target_dna={"0":"AAAGTTGGT","1":"AAAGCTCCT","2":"ATGCGT"},
+                target_gene={"0":"gyrA","1":"parC","2":"blaZ"},
+                target_columns={"penicillin":[2],"fluoroquinolone":[0,1]},gene_columns={"blaZ":[2]})
+            mic.npz_write(out/"prepared.npz",X=np.array([[1,1,1],[0,1,0]]))
+            args=SimpleNamespace(out=out,assemblies=assemblies,gff_dir=None,amrfinder=sys.executable,
+                amrfinder_db=None,reference_proteins=None,mutation_catalog=None,min_gene_coverage=90.,
+                threads=2,tblastn=sys.executable)
+            def run(command,**kwargs):
+                if command[-1]=="-V": return subprocess.CompletedProcess(command,0,version,"")
+                if "-query" not in command: raise AssertionError("Original AMRFinder reports should be reused")
+                Path(command[command.index("-out")+1]).write_text(
+                    "refG\tg\t1\t60\t95\t1\t20\t20\t100\nrefP\tp\t1\t60\t100\t1\t20\t20\t100\n")
+            with patch.object(mic,"ProcessPoolExecutor",ThreadPoolExecutor),patch.object(mic.subprocess,"run",side_effect=run) as external:
+                mic.allele_audit(args,info)
+                initial=external.call_count
+                self.assertEqual(initial,3)  # -V and two targeted recoveries; no AMRFinder rerun.
+                with np.load(out/"genotypes.npz") as f:
+                    names=f["names"].tolist(); G=f["G"]
+                np.testing.assert_equal(G[:,names.index("gyrA_A13V")],[1,0])
+                np.testing.assert_equal(G[:,names.index("parC_A13V")],[0,0])
+                audit=list(mic.records(out/"unitig_allele_audit.tsv"))
+                self.assertTrue(any(r.get("marker_interpretation")=="VERIFIED_MUTANT_MARKER" for r in audit))
+                self.assertTrue(any(r.get("marker_interpretation")=="VERIFIED_WILDTYPE_MARKER" for r in audit))
+                self.assertEqual(len(list(mic.records(out/"blaz_carriage_agreement.tsv"))),1)
+                # Force derived-audit migration; both expensive call layers stay cached.
+                mic.json_write(out/"audit_identity.json",dict(legacy=True))
+                mic.allele_audit(args,info)
+                self.assertEqual(external.call_count,initial+1)
+
+    def test_second_neighbours_are_separate_and_anchor_genes_are_excluded(self):
+        info=dict(loci=list(range(6)),locus_gene={str(i):g for i,g in enumerate(["blaZ","gyrA","parC","n1","n2","pool"])})
+        groups={g:{g} for g in ["blaZ","gyrA","parC"]}
+        adjacency={"blaZ":{"n1"},"n1":{"blaZ","n2"},"n2":{"n1"},"gyrA":{"parC"},"parC":{"gyrA"}}
+        enriched=mic.neighbourhood_columns(info,(None,None,groups,adjacency))
+        self.assertEqual(enriched["second_columns"]["penicillin"],[4])
+        self.assertEqual(enriched["second_columns"]["fluoroquinolone"],[])
+        enriched.update(target_columns={"penicillin":[0],"fluoroquinolone":[1,2]},
+            neighbour_columns={"penicillin":[3],"fluoroquinolone":[]})
+        models=mic.prediction_models("penicillin",enriched,["blaZ_presence"])
+        self.assertEqual(models["blaZ_gene"]["base"],[0])
+        self.assertEqual(models["blaZ_unitigs"]["base"],[1])
+        self.assertEqual(models["blaZ_gene_N1_N2"]["extra"],[4,5])
+
+    def test_failed_checkpoints_retry_and_keep_inner_error_details(self):
+        from unittest.mock import patch
+        rng=np.random.default_rng(51); n=90
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); prediction=root/"prediction"; prediction.mkdir()
+            info=dict(samples=[str(i) for i in range(n)],groups=[str(i//15) for i in range(n)],
+                metadata=[dict(benzylpenicillin_mic=str(2**v),benzylpenicillin_mic_sign="=") for v in rng.normal(size=n)],
+                loci=list(range(5)),target_columns={"penicillin":[0]},neighbour_columns={"penicillin":[1]},
+                second_columns={"penicillin":[2]},random_pool=[3,4])
+            mic.json_write(root/"prepared.json",info)
+            mic.npz_write(root/"prepared.npz",X=rng.integers(0,2,(n,5)),K=np.eye(n))
+            mic.npz_write(root/"genotypes.npz",G=rng.integers(0,2,(n,1)),names=np.array(["blaZ_presence"]))
+            mic.worker_init(dict(out=str(root),prediction_dir=str(prediction),quinolone="levofloxacin",
+                penicillin_column="benzylpenicillin_mic",penicillin_sign_column="benzylpenicillin_mic_sign",
+                folds=3,pcs=0,min_count=5,seed=42,alphas=[1.]))
+            job=("penicillin",0,"blaZ_gene",0)
+            with patch.object(mic,"fit_censored",side_effect=ValueError("specific numerical failure")):
+                failed=mic.prediction_job(job)
+            self.assertEqual(failed["status"],"FAILED")
+            self.assertEqual(len(failed["inner_failures"]),3)
+            self.assertIn("specific numerical failure",failed["reason"])
+            passed=mic.prediction_job(job)
+            self.assertEqual(passed["status"],"OK")
 
     def test_prepare_accepts_pruned_tree_without_renumbering_unitigs(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -16,7 +16,7 @@ THREADS="${THREADS:-4}"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}" MPLBACKEND=Agg
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 args=("$STAGE" --out "$OUT" --threads "$THREADS" --random-sets "${RANDOM_SETS:-100}"
-      --quinolone "${QUINOLONE:-levofloxacin}" --pcs "${PCS:-10}" --folds "${FOLDS:-5}"
+      --quinolone "${QUINOLONE:-levofloxacin}" --pcs "${PCS:-0}" --folds "${FOLDS:-5}"
       --groups "${GROUPS_COUNT:-10}" --seed "${SEED:-42}")
 case "$STAGE" in
   map|prepare|all)
@@ -55,9 +55,10 @@ esac
 if [[ "$STAGE" == audit || "$STAGE" == all ]]; then
   args+=(--assemblies "${ASSEMBLIES:-$ROOT/assemblies}"
          --gff-dir "${GFF_DIR:-$ROOT/panaroo_saureus_output/panaroo_gff}"
-         --amrfinder "${AMRFINDER_EXEC:-amrfinder}")
+         --amrfinder "${AMRFINDER_EXEC:-amrfinder}" --tblastn "${TBLASTN_EXEC:-tblastn}")
   [[ -z "${AMRFINDER_DB:-}" ]] || args+=(--amrfinder-db "$AMRFINDER_DB")
   [[ -z "${REFERENCE_PROTEINS:-}" ]] || args+=(--reference-proteins "$REFERENCE_PROTEINS")
+  [[ -z "${MUTATION_CATALOG:-}" ]] || args+=(--mutation-catalog "$MUTATION_CATALOG")
 fi
 printf 'Stage: %s\nOutput: %s\nCPUs: %s\n' "$STAGE" "$OUT" "$THREADS"
 "$PYTHON" "$REPO/benchmarks/saureus_mic.py" "${args[@]}" "$@"
