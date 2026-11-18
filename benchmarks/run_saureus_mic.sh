@@ -49,8 +49,8 @@ case "$STAGE" in
       [[ -z "${SAMPLE_MAP:-}" ]] || args+=(--sample-map "$SAMPLE_MAP")
     fi
     ;;
-  audit|predict) ;;
-  *) echo 'Stage must be map, prepare, audit, predict or all' >&2; exit 2 ;;
+  audit|predict|pairs) ;;
+  *) echo 'Stage must be map, prepare, audit, predict, pairs or all' >&2; exit 2 ;;
 esac
 if [[ "$STAGE" == audit || "$STAGE" == all ]]; then
   args+=(--assemblies "${ASSEMBLIES:-$ROOT/assemblies}"

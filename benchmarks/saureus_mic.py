@@ -1232,7 +1232,7 @@ def predict(args, info):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage",choices=["map","prepare","audit","predict","all"])
+    parser.add_argument("stage",choices=["map","prepare","audit","predict","pairs","all"])
     parser.add_argument("--network",type=Path)
     parser.add_argument("--out",type=Path,required=True)
     for name in ["annotation","fasta","unitigs","tree","metadata","sample-map","clusters","locus-map",
@@ -1253,6 +1253,7 @@ def main(argv=None):
     parser.add_argument("--min-count",type=int,default=5)
     parser.add_argument("--seed",type=int,default=42)
     parser.add_argument("--alphas",type=float,nargs="+",default=[.1,1.,10.,100.])
+    parser.add_argument("--pair-alpha",type=float,default=10.,help="Fixed ridge penalty for the pairs stage")
     args=parser.parse_args(argv)
     if min(args.threads,args.folds,args.groups,args.min_count)<1 or args.folds<3 or args.pcs<0 or args.random_sets<0 or min(args.alphas)<=0:
         parser.error("Need positive CPU/group/count/penalty settings, >=3 folds, nonnegative PCs/random sets")
@@ -1268,6 +1269,11 @@ def main(argv=None):
         info=json.loads((args.out/"prepared.json").read_text())
     if args.stage in {"audit","all"}: allele_audit(args,info)
     if args.stage in {"predict","all"}: predict(args,info)
+    if args.stage == "pairs":
+        if not math.isfinite(args.pair_alpha) or args.pair_alpha <= 0:
+            parser.error("--pair-alpha must be finite and positive")
+        from benchmarks.saureus_mic_pairs import run
+        run(args)
 
 
 if __name__=="__main__":

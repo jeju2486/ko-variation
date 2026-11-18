@@ -262,3 +262,7 @@ before reusing numbers or caches; proposals are distinguished from conclusions.
     reproducibility materials on `codex/downstream-resume-progress`. Preserve
     shared utilities needed by general annotation/network tools. This is a
     deferred to-do only: no script edits or branch merges are authorized now.
+11. [ ] Consider AlphaFold 3 for candidate pairs with a plausible direct protein
+    contact. Resolve unitigs to full annotated coding sequences from carrier
+    assemblies, check mapping ambiguity, compare predicted interfaces with
+    controls and report structural confidence separately from MIC interaction.

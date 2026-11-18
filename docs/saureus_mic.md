@@ -42,10 +42,49 @@ locates the installed database, including quoted paths. It must contain
 BLAST+ is needed only when target calls require recovery. To preserve raw-report
 reuse, use the same installed database version as the original run.
 
-Stages: `map`, `prepare`, `audit`, `predict`, `all`. After an initial `all` with
+Stages: `map`, `prepare`, `audit`, `predict`, `pairs`, `all`. After an initial `all` with
 the new script, `predict` alone reuses the updated allele and preparation files.
 `audit` alone rebuilds derived calls when the audit revision changes, without
 invalidating unchanged raw AMRFinder reports.
+
+## Four-cell blaZ analysis
+
+Run this separately after the completed preparation and allele audit:
+
+```bash
+THREADS=4 RANDOM_SETS=100 bash ko-variation/benchmarks/run_saureus_mic.sh pairs
+```
+
+This uses the benzylpenicillin cohort and lineage splits from the existing MIC
+workflow. A is blaZ gene carriage and B is one coding unitig from a first neighbour
+of blaZ. The two characters in each cell give A then B. For each pair it fits an
+A-only baseline, an additive A+B model and an A+B+A×B model. The fixed ridge penalty
+is 10 on training-standardized features for all three models (`--pair-alpha` to
+override). The fits use the censored likelihood with an unpenalized intercept.
+Additive fits require both blaZ states and enough isolates on each side of at least
+one within-blaZ comparison. Interaction fits require at least five training
+isolates in each cell by default (`--min-count`). The cell counts also show how many
+lineages contain both neighbour states within the same blaZ state.
+
+For each first neighbour and fold, choose distinct random unitig patterns from
+the existing control pool with the same training-cell eligibility. Rank by the
+average absolute difference in unitig prevalence across training
+(blaZ state, lineage) strata. Lineages are weighted by size within a blaZ state,
+and both blaZ states receive equal weight. A distance of 0.05 means an average
+difference of five percentage points. Control identities can vary by fold.
+Their relative performance is a descriptive reference.
+
+Find the output path in `OUT/latest_pair_analysis.json`. Start with
+`observed_cells.tsv` (counts, censoring and lineage overlap) and
+`random_comparison.tsv` (overall comparison against blaZ and the matched
+controls). `fold_cells.tsv`, `pair_fit_status.tsv` and `random_matches.tsv` show
+fold-specific support, fitted effects and control match distances.
+`pair_scores.tsv` pools each complete model over the held-out isolates, including
+separate scores for 00, 01, 10 and 11. Positive `delta_nll` favors the pair
+over blaZ alone. `fold_scores.tsv` retains diagnostics when only some folds are
+estimable. Random cell-specific scores use the random unitig's own cell
+assignments. Overall neighbour and random scores use the same held-out cohort.
+Rerunning with the same settings resumes from the saved folds.
 
 ## Inputs and configuration
 
