@@ -266,3 +266,12 @@ before reusing numbers or caches; proposals are distinguished from conclusions.
     contact. Resolve unitigs to full annotated coding sequences from carrier
     assemblies, check mapping ambiguity, compare predicted interfaces with
     controls and report structural confidence separately from MIC interaction.
+12. [ ] Make a supplementary SVG/PNG figure from the existing blaZ four-cell
+    analysis of first neighbours. Show counts of exact and censored MICs and
+    lineage support in all four cells, highlighting discordant 01 and 10
+    (blaZ state first). For representative unitig 449486, plot held-out
+    censored NLL gains over blaZ alone by fold alongside matched random
+    controls and annotate sparse cells; retain the 50-unitig overview for
+    context. Use the frozen `observed_cells.tsv`, `fold_scores.tsv`,
+    `random_comparison.tsv` and `random_matches.tsv`. Label the fixed-penalty
+    comparison and keep predictive gains distinct from interaction evidence.
