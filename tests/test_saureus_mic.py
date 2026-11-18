@@ -229,9 +229,15 @@ class FocalMicTests(unittest.TestCase):
                 source.write_text(">g\nATGAAA"+codon+"GGT"*17+"\n>p\nATGAAAGCT"+"CCT"*17+"\n")
                 cached=out/"amrfinder"/sample; cached.mkdir(parents=True)
                 mic.json_write(cached/"done.json",dict(sample=sample,source_sha256=mic.sha256(source),amrfinder=version))
-                (cached/"mutations.tsv").write_text("Gene symbol\tElement subtype\n")
-                (cached/"amr.tsv").write_text("Gene symbol\t% Coverage of reference sequence\tMethod\n"+
-                    ("blaZ\t100\tEXACTX\n" if sample=="mutant" else ""))
+                if sample=="mutant":
+                    (cached/"mutations.tsv").write_text(
+                        "Contig id\tStart\tStop\tStrand\tElement symbol\tSubtype\tClosest reference accession\n"
+                        "g\t1\t60\t+\tgyrA_A13V\tPOINT\trefG\n")
+                    (cached/"amr.tsv").write_text("Element symbol\t% Coverage of reference\tMethod\nblaZ\t100\tEXACTX\n")
+                else:
+                    (cached/"mutations.tsv").write_text(
+                        "Contig id\tStart\tStop\tStrand\tGene symbol\tElement subtype\tAccession of closest sequence\n")
+                    (cached/"amr.tsv").write_text("Gene symbol\t% Coverage of reference sequence\tMethod\n")
             info=dict(identity={"synthetic":True},samples=["mutant","wild"],loci=[0,1,2],
                 target_dna={"0":"AAAGTTGGT","1":"AAAGCTCCT","2":"ATGCGT"},
                 target_gene={"0":"gyrA","1":"parC","2":"blaZ"},
@@ -243,8 +249,11 @@ class FocalMicTests(unittest.TestCase):
             def run(command,**kwargs):
                 if command[-1]=="-V": return subprocess.CompletedProcess(command,0,version,"")
                 if "-query" not in command: raise AssertionError("Original AMRFinder reports should be reused")
-                Path(command[command.index("-out")+1]).write_text(
-                    "refG\tg\t1\t60\t95\t1\t20\t20\t100\nrefP\tp\t1\t60\t100\t1\t20\t20\t100\n")
+                query = Path(command[command.index("-query")+1]).read_text()
+                hits = "refP\tp\t1\t60\t100\t1\t20\t20\t100\n"
+                if ">refG\n" in query:
+                    hits += "refG\tg\t1\t60\t95\t1\t20\t20\t100\n"
+                Path(command[command.index("-out")+1]).write_text(hits)
             with patch.object(mic,"ProcessPoolExecutor",ThreadPoolExecutor),patch.object(mic.subprocess,"run",side_effect=run) as external:
                 mic.allele_audit(args,info)
                 initial=external.call_count
@@ -253,9 +262,12 @@ class FocalMicTests(unittest.TestCase):
                     names=f["names"].tolist(); G=f["G"]
                 np.testing.assert_equal(G[:,names.index("gyrA_A13V")],[1,0])
                 np.testing.assert_equal(G[:,names.index("parC_A13V")],[0,0])
+                np.testing.assert_equal(G[:,names.index("blaZ_presence")],[1,0])
                 audit=list(mic.records(out/"unitig_allele_audit.tsv"))
                 self.assertTrue(any(r.get("marker_interpretation")=="VERIFIED_MUTANT_MARKER" for r in audit))
                 self.assertTrue(any(r.get("marker_interpretation")=="VERIFIED_WILDTYPE_MARKER" for r in audit))
+                direct = [r for r in mic.records(out/"unitig_site_evidence.tsv.gz") if r["call_source"]=="AMRFinder"]
+                self.assertEqual([(r["reference_accession"],r["coordinate_resolved"]) for r in direct],[("refG","1")])
                 self.assertEqual(len(list(mic.records(out/"blaz_carriage_agreement.tsv"))),1)
                 # Force derived-audit migration; both expensive call layers stay cached.
                 mic.json_write(out/"audit_identity.json",dict(legacy=True))

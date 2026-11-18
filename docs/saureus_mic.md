@@ -87,8 +87,11 @@ the disclosed complete-linkage patristic partition is used; this is not fastBAPS
 
 1. Read target coding unitigs and full assembly DNA. `parC`/`grlA` are aliases.
 2. Retain raw nucleotide AMRFinder reports and `--mutation_all` results, including
-   wild-type calls. Normalise gene aliases and supported report headers; collapse
-   repeated annotations of the same physical call. Distinct copies stay ambiguous.
+   wild-type calls. Accept both `Gene symbol` / `Accession of closest sequence`
+   and `Element symbol` / `Closest reference accession` headers. Carriage reports
+   accept `% Coverage of reference sequence` or `% Coverage of reference`.
+   Normalise gene aliases and collapse repeated annotations of the same physical
+   call. Distinct copies stay ambiguous.
 3. Read the installed **S. aureus** mutation catalogue. Its reference-protein
    offset can differ from the traditional residue number in a mutation symbol.
 4. If AMRFinder yields no parsed calls for a target gene, search the catalogue's

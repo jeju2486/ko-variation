@@ -43,7 +43,7 @@ LEGACY_PREPARATION_CODES = {
 }
 ALIASES = {"blaZ": {"blaz", "blapc1"}, "gyrA": {"gyra"}, "parC": {"parc", "grla"}}
 TARGETS = {"penicillin": ["blaZ"], "fluoroquinolone": ["gyrA", "parC"]}
-AUDIT_REVISION = "alleles-2"
+AUDIT_REVISION = "alleles-3"
 PREDICTION_REVISION = "mic-2"
 
 
@@ -61,6 +61,30 @@ def records(path):
     opener = gzip.open if str(path).endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8-sig", newline="") as stream:
         yield from csv.DictReader(stream, delimiter="\t")
+
+
+def amrfinder_records(path, *, mutations=False):
+    """Normalize saved AMRFinderPlus reports before reading calls or carriage."""
+    aliases = {"Element symbol": "Gene symbol", "gene_symbol": "Gene symbol",
+               "Subtype": "Element subtype",
+               "% Coverage of reference": "% Coverage of reference sequence",
+               "Closest reference accession": "Accession of closest sequence"}
+    required = {"Gene symbol"}
+    if mutations:
+        required.update({"Contig id", "Start", "Stop", "Strand", "Accession of closest sequence"})
+    else:
+        required.update({"% Coverage of reference sequence", "Method"})
+    with path.open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        headers = reader.fieldnames or []
+        cleaned = [name.strip().lstrip("#").strip() for name in headers]
+        names = [aliases.get(name, name) for name in cleaned]
+        missing = required - set(names)
+        if missing:
+            raise ValueError(f"{path}: missing AMRFinderPlus columns {sorted(missing)}; report headers: {headers}")
+        reader.fieldnames = names
+        for row in reader:
+            yield row
 
 
 def load_map(path):
@@ -434,8 +458,8 @@ def mutation_catalog(path):
 def parsed_calls(rows, catalog):
     result, seen = [], set()
     for original in rows:
-        row = {k.strip().lstrip("#"):v for k,v in original.items() if k}
-        symbol = row.get("Gene symbol", row.get("Element symbol", row.get("gene_symbol", "")))
+        row = original.copy()
+        symbol = row.get("Gene symbol") or ""
         parsed = point_symbol(symbol)
         if not parsed: continue
         gene,wild,position,allele = parsed
@@ -529,8 +553,15 @@ def known_matrix(samples, main, calls, min_coverage, markers=None):
     for i,sample in enumerate(samples):
         for j,gene in enumerate(carriage):
             hits = [r for r in main[sample] if canonical(r.get("Gene symbol", ""))==gene]
-            intact = [r for r in hits if float(r.get("% Coverage of reference sequence",0))>=min_coverage
-                      and not re.search("PARTIAL|INTERNAL_STOP|FRAME", r.get("Method", ""))]
+            intact = []
+            for hit in hits:
+                coverage = hit.get("% Coverage of reference sequence") or ""
+                try:
+                    sufficient = float(coverage) >= min_coverage
+                except ValueError:
+                    sufficient = False
+                if sufficient and not re.search("PARTIAL|INTERNAL_STOP|FRAME", hit.get("Method") or ""):
+                    intact.append(hit)
             G[i,j] = 1. if intact else np.nan if hits else 0.
         by_site = defaultdict(list)
         for r in calls[sample]:
@@ -665,15 +696,16 @@ def allele_audit(args, info):
     main, calls, diagnostics = {}, {}, []
     for sample in info["samples"]:
         directory = sample_directory(root, sample)
-        main[sample] = list(records(directory/"amr.tsv"))
-        raw=list(records(directory/"mutations.tsv"))
+        main[sample] = list(amrfinder_records(directory/"amr.tsv"))
+        raw = list(amrfinder_records(directory/"mutations.tsv", mutations=True))
         calls[sample] = parsed_calls(raw,catalog)
         diagnostics.append(dict(sample=sample,source="AMRFinder",gene="gyrA/parC",
             raw_rows=len(raw),parsed_target_rows=len(calls[sample]),
             status="PARSED" if calls[sample] else "NO_PARSED_TARGET_CALLS",
-            raw_symbol_examples=";".join(sorted({r.get("Gene symbol",r.get("Element symbol","")) for r in raw})[:8])))
+            raw_symbol_examples=";".join(sorted({r["Gene symbol"] for r in raw if r["Gene symbol"]})[:8])))
     accessions = ({r["Accession of closest sequence"] for rs in calls.values() for r in rs} |
                   {c["accession"] for c in catalog})
+    accessions = {a for a in accessions if a and a.strip().upper() not in {"", "NA", "N/A", "-"}}
     reference = {}
     for accession, protein in fasta_records(reference_file):
         for key in set(accession.split("|")) & accessions: reference[key] = protein
