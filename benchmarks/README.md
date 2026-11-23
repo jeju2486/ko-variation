@@ -46,7 +46,8 @@ distance or beta. Install the tree extra for Numba.
 ```bash
 python benchmarks/cluster_score_benchmark.py \
   --run /path/to/discovery/results --out /path/to/cluster-score-benchmark \
-  --responses 64 --clusters-per-response 512 --reference-block 256 --batch-size 1024
+  --responses 64 --clusters-per-response 512 --reference-block 256 --batch-size 128 \
+  --repeats 3 --early-check-interval 16
 ```
 
 The coarse workload replays representative pairs. Member expansion tests the
@@ -60,6 +61,16 @@ the measured prune fraction is specific to this slice.
 - `fused_tree` precomputes response-specific tree coefficients and accumulates
   contrast norms without allocating a whitened matrix. It classifies score
   statistics directly and skips conversion to individual p-values.
+- `fused_rebuild` uses the same fused kernel and block width, with coefficients
+  rebuilt for every block. Compare `coefficient_setups` and timing against
+  `fused_tree` to isolate reuse across batches.
+- `zero_tau_shortcut` uses the closed-form variance for binary predictors with
+  an intercept and exactly zero fitted tau. It uses the fused tree scorer when
+  tau is positive. `zero_tau_responses` and `zero_tau_pairs` count the sampled
+  work eligible for this shortcut.
+- `early_stop_tree` drops a predictor column once the squared contrasts already
+  accumulated put its largest possible statistic below both cutoffs. It checks
+  at bounded intervals and reports the fraction of contrast terms avoided.
 - `weighted_bound` uses one matrix product for the numerator and weighted
   prevalence, then applies a variance lower bound before exact tree scoring.
 - `cluster_bound` scores anchors in a batch and bounds changes to the numerator
@@ -69,9 +80,11 @@ the measured prune fraction is specific to this slice.
 `selection.json` can be replayed with `--selection` and a new output directory.
 `response_results.tsv` records timings, pruned counts and discrepancies with the
 exact reference. `summary.json` aggregates matched methods by workload and null
-mode. Common input loading, eligibility and cluster preparation time are
+mode. Timings use the median across repeats for each response and method.
+Common input loading, eligibility and cluster preparation time are
 reported separately. The reported speedups are for scoring and bounds on a
 single worker, excluding production queueing and SQLite writes. Results are
 written before a comparison mismatch returns a nonzero exit status.
-For the bound arms, `speedup_vs_fused` isolates the time saved over the fused
-scorer on the same workload and saved tree nulls.
+`speedup_vs_fused` compares each variant with the fused scorer on the same
+workload and saved tree nulls. For `fused_rebuild`, use its reciprocal or
+compare the two times to read the speedup from caching.

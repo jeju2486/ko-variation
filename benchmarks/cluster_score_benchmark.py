@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+from statistics import median
 import sys
 import time
 from collections import defaultdict
@@ -162,6 +163,49 @@ def contrast_norms(left, right, tip, fractions_a, fractions_b, scale, root_scale
     return norms
 
 
+@njit(cache=True)
+def contrast_norms_until(left, right, tip, fractions_a, fractions_b, scale, root_scale,
+                         data, limit, check_interval):
+    width = data.shape[1]
+    means = np.empty((len(tip), width))
+    norms = np.zeros(width)
+    stopped = np.zeros(width, dtype=np.bool_)
+    active = np.arange(width)
+    remaining, terms, since_check = width, 0, 0
+    for node in range(len(tip)):
+        if tip[node] >= 0:
+            for pos in range(remaining):
+                j = active[pos]
+                means[node, j] = data[tip[node], j]
+            continue
+        a, b = left[node], right[node]
+        for pos in range(remaining):
+            j = active[pos]
+            z = (means[a, j] - means[b, j]) / scale[node]
+            norms[j] += z * z
+            means[node, j] = fractions_a[node] * means[a, j] + fractions_b[node] * means[b, j]
+        terms += remaining
+        since_check += 1
+        if since_check == check_interval:
+            kept = 0
+            for pos in range(remaining):
+                j = active[pos]
+                if math.isfinite(norms[j]) and norms[j] > limit[j]:
+                    stopped[j] = True
+                else:
+                    active[kept] = j
+                    kept += 1
+            remaining = kept
+            if not remaining:
+                return norms, stopped, terms
+            since_check = 0
+    for pos in range(remaining):
+        j = active[pos]
+        z = means[-1, j] / root_scale
+        norms[j] += z * z
+    return norms, stopped, terms + remaining
+
+
 class TreeScore:
     def __init__(self, cache):
         tree = cache["decomp"].tree
@@ -171,11 +215,37 @@ class TreeScore:
         self.design, self.inverse_design, self.nuisance = (cache[k] for k in ("C", "Sinv_C", "M_inv"))
         self.residual = cache["y"] - cache["mu"]
 
-    def __call__(self, X):
+    def project(self, X):
         coefficient = self.nuisance @ (self.inverse_design.T @ X)
-        projected = np.ascontiguousarray(X - self.design @ coefficient)
-        variance = contrast_norms(*self.tree_indices, *self.coefficients, projected)
+        return np.ascontiguousarray(X - self.design @ coefficient)
+
+    def __call__(self, X):
+        variance = contrast_norms(*self.tree_indices, *self.coefficients, self.project(X))
         return X.T @ self.residual, variance
+
+    def early_stop(self, X, cutoff, interval):
+        u = X.T @ self.residual
+        # A partial norm lower-bounds the final variance. Leave slack around
+        # the classification boundary and the minimum usable variance.
+        upper_u = np.abs(u) + 1e-9 * np.maximum(1., np.abs(u))
+        limit = np.maximum(upper_u ** 2 / cutoff, 1e-12)
+        limit += 1e-9 * np.maximum(1., limit)
+        variance, stopped, terms = contrast_norms_until(
+            *self.tree_indices, *self.coefficients, self.project(X), limit, interval)
+        variance[stopped] = np.nan
+        return u, variance, stopped, terms
+
+
+class ZeroTauScore:
+    def __init__(self, cache):
+        self.weights = cache["weights"]
+        self.total_weight = self.weights.sum()
+        self.vectors = np.column_stack((cache["y"] - cache["mu"], self.weights))
+
+    def __call__(self, X):
+        u, present_weight = (X.T @ self.vectors).T
+        variance = present_weight * (1. - present_weight / self.total_weight)
+        return u, variance
 
 
 def reference(cache, X):
@@ -234,11 +304,63 @@ def classify(u, v, eligible, gate, final, skipped):
     return route, np.where(eligible, decided, -2), statistic
 
 
+def run_method(method, width, cache, X, groups, eligible, args, gate, final, largest_eigenvalue):
+    started = time.perf_counter()
+    tree = hasattr(cache["decomp"], "score_variance")
+    setups = 0
+    if method == "fused_rebuild":
+        scorer = lambda x: TreeScore(cache)(x)
+        setups = math.ceil(X.shape[1] / width)
+    elif method == "zero_tau_shortcut" and cache["tau"] == 0.:
+        scorer = ZeroTauScore(cache)
+    elif tree and method not in ("current_block", "wide_block", "single_pair"):
+        scorer = TreeScore(cache)
+        setups = 1
+    else:
+        scorer = lambda x: reference(cache, x)
+
+    u, v = np.full(X.shape[1], np.nan), np.full(X.shape[1], np.nan)
+    skipped = np.zeros(X.shape[1], dtype=bool)
+    ids = np.arange(X.shape[1])
+    scored = ids
+    clusters_pruned = terms = possible_terms = 0
+    cutoff = min(gate, final)
+    if method == "weighted_bound":
+        skipped = weighted_rejections(cache, X, largest_eigenvalue, cutoff)
+        scored = ids[~skipped]
+    if method == "cluster_bound" and groups:
+        anchors = np.array([group[0] for group in groups])
+        score_blocks(scorer, X, anchors, width, u, v)
+        residual = cache["y"] - cache["mu"]
+        for first, last, variable, radius in groups:
+            upper = cluster_upper(u[first], v[first], residual, cache["weights"], variable, radius)
+            if upper < cutoff:
+                skipped[first + 1:last] = True
+                clusters_pruned += 1
+        remaining = ~skipped
+        remaining[anchors] = False
+        scored = ids[remaining]
+    if method == "early_stop_tree":
+        possible_terms = X.size
+        for start in range(0, len(ids), width):
+            batch = ids[start:start + width]
+            u[batch], v[batch], skipped[batch], done = scorer.early_stop(X[:, batch], cutoff, args.early_check_interval)
+            terms += done
+    else:
+        score_blocks(scorer, X, scored, width, u, v)
+    result = classify(u, v, eligible, gate, final, skipped)
+    seconds = time.perf_counter() - started
+    return result, dict(seconds=seconds, pairs=X.shape[1], pruned_pairs=int(skipped.sum()),
+                        pruned_clusters=clusters_pruned, significant=int((result[1] == 1).sum()),
+                        coefficient_setups=setups, tree_terms=terms, possible_tree_terms=possible_terms)
+
+
 def compare_methods(cache, X, groups, eligible, args, gate, final, largest_eigenvalue, warm, use_bounds):
     methods = [("current_block", args.reference_block), ("wide_block", args.batch_size)]
     tree = hasattr(cache["decomp"], "score_variance")
     if tree:
-        methods.extend((("fused_tree", args.batch_size), ("weighted_bound", args.batch_size)))
+        methods.extend((name, args.batch_size) for name in (
+            "fused_tree", "fused_rebuild", "zero_tau_shortcut", "early_stop_tree", "weighted_bound"))
     if use_bounds:
         methods.append(("cluster_bound", args.batch_size))
     if args.scalar:
@@ -248,44 +370,21 @@ def compare_methods(cache, X, groups, eligible, args, gate, final, largest_eigen
     if warm:
         reference(cache, X[:, :1])
         if tree:
-            TreeScore(cache)(X[:, :1])
-    ids = np.arange(X.shape[1])
-    scores = {}
-    report = {}
-    for method, width in methods:
-        started = time.perf_counter()
-        scorer = (TreeScore(cache) if tree and method in
-                  ("fused_tree", "fused_single_pair", "weighted_bound", "cluster_bound")
-                  else lambda x: reference(cache, x))
-        u, v = np.full(X.shape[1], np.nan), np.full(X.shape[1], np.nan)
-        skipped = np.zeros(X.shape[1], dtype=bool)
-        scored = ids
-        clusters_pruned = 0
-        cutoff = min(gate, final)
-        if method == "weighted_bound":
-            skipped = weighted_rejections(cache, X, largest_eigenvalue, cutoff)
-            scored = ids[~skipped]
-        if method == "cluster_bound" and groups:
-            anchors = np.array([group[0] for group in groups])
-            score_blocks(scorer, X, anchors, width, u, v)
-            residual = cache["y"] - cache["mu"]
-            for first, last, variable, radius in groups:
-                upper = cluster_upper(u[first], v[first], residual, cache["weights"], variable, radius)
-                if upper < cutoff:
-                    skipped[first + 1:last] = True
-                    clusters_pruned += 1
-            remaining = ~skipped
-            remaining[anchors] = False
-            scored = ids[remaining]
-        score_blocks(scorer, X, scored, width, u, v)
-        result = classify(u, v, eligible, gate, final, skipped)
-        seconds = time.perf_counter() - started
-        scores[method] = result
-        report[method] = dict(seconds=seconds, pairs=X.shape[1], pruned_pairs=int(skipped.sum()),
-                              pruned_clusters=clusters_pruned, significant=int((result[1] == 1).sum()))
+            scorer = TreeScore(cache)
+            scorer(X[:, :1])
+            scorer.early_stop(X[:, :1], min(gate, final), args.early_check_interval)
+    scores, report = {}, {}
+    timings = defaultdict(list)
+    for repeat in range(args.repeats):
+        order = methods if repeat % 2 == 0 else reversed(methods)
+        for method, width in order:
+            result, row = run_method(method, width, cache, X, groups, eligible, args, gate, final, largest_eigenvalue)
+            timings[method].append(row["seconds"])
+            scores[method], report[method] = result, row
     route, final_decisions, statistic = scores["current_block"]
     for method, (r, f, t) in scores.items():
         values = report[method]
+        values["seconds"] = median(timings[method])
         compared = np.isfinite(t)
         values.update(gate_mismatches=int((route != r).sum()), final_mismatches=int((final_decisions != f).sum()),
                       statistic_mismatches=int((~np.isclose(t[compared], statistic[compared],
@@ -360,7 +459,7 @@ def benchmark(args):
             results = compare_methods(cache, X, groups, eligible, args, gate, final, largest_eigenvalue,
                                       mode not in warmed, label == "member_expansion")
             warmed.add(mode)
-            rows.extend(dict(response=response, workload=label, null_mode=mode, method=method,
+            rows.extend(dict(response=response, workload=label, null_mode=mode, tau=cache["tau"], method=method,
                              clusters=len(job["groups"]), non_singletons=len(groups), **values)
                         for method, values in results.items())
             started = time.perf_counter()
@@ -375,8 +474,14 @@ def benchmark(args):
     for row in rows:
         key = row["workload"], row["null_mode"], row["method"]
         for field in ("seconds", "pairs", "clusters", "non_singletons", "pruned_pairs", "pruned_clusters",
-                      "significant", "gate_mismatches", "final_mismatches", "statistic_mismatches"):
+                      "significant", "gate_mismatches", "final_mismatches", "statistic_mismatches",
+                      "coefficient_setups", "tree_terms", "possible_tree_terms"):
             totals[key][field] += row[field]
+        if row["null_mode"] == "tree":
+            zero_tau = row["tau"] == 0.
+            totals[key]["tree_responses"] += 1
+            totals[key]["zero_tau_responses"] += int(zero_tau)
+            totals[key]["zero_tau_pairs"] += row["pairs"] if zero_tau else 0
     summary = []
     for (workload, mode, method), values in sorted(totals.items()):
         baseline = totals[workload, mode, "current_block"]
@@ -384,16 +489,23 @@ def benchmark(args):
                       pruned_fraction=values["pruned_pairs"] / values["pairs"],
                       speedup=baseline["seconds"] / values["seconds"])
         fused = totals.get((workload, mode, "fused_tree"))
-        if fused and method in ("weighted_bound", "cluster_bound"):
+        if fused and method in ("weighted_bound", "cluster_bound", "early_stop_tree", "zero_tau_shortcut", "fused_rebuild"):
             result["speedup_vs_fused"] = fused["seconds"] / values["seconds"]
+        if values["possible_tree_terms"]:
+            result["tree_terms_saved_fraction"] = 1. - values["tree_terms"] / values["possible_tree_terms"]
         summary.append(result)
     atomic_json(args.out / "summary.json", dict(samples=info["n"], family=family, gate=gate, final=final,
                 reference_block=args.reference_block, batch_size=args.batch_size, blas_threads=args.blas_threads,
+                repeats=args.repeats, early_check_interval=args.early_check_interval,
                 benchmark_sha256=digest(Path(__file__)),
                 numpy=np.__version__, scipy=scipy.__version__, failed_responses=failed, **timing, methods=summary))
     for row in summary:
+        terms = f"; {row['tree_terms_saved_fraction']:.1%} contrast terms skipped" if "tree_terms_saved_fraction" in row else ""
         print(f"{row['workload']} / {row['null_mode']} / {row['method']}: "
-              f"{row['seconds']:.3f}s; {row['speedup']:.2f}x; {row['pruned_fraction']:.1%} pruned")
+              f"{row['seconds']:.3f}s; {row['speedup']:.2f}x; {row['pruned_fraction']:.1%} pruned{terms}")
+        if row["null_mode"] == "tree" and row["method"] == "zero_tau_shortcut":
+            print(f"  Exact zero tau: {row['zero_tau_responses']:,}/{row['tree_responses']:,} tree responses, "
+                  f"{row['zero_tau_pairs']:,}/{row['pairs']:,} sampled pairs")
     return int(any(row[key] for row in summary for key in ("gate_mismatches", "final_mismatches", "statistic_mismatches")))
 
 
@@ -407,11 +519,15 @@ def main():
     parser.add_argument("--clusters-per-response", type=int, default=96)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--reference-block", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--early-check-interval", type=int, default=16,
+                        help="Check for rejection after this many tree contrasts")
+    parser.add_argument("--repeats", type=int, default=3, help="Use median score time per response")
     parser.add_argument("--blas-threads", type=int, default=1)
     parser.add_argument("--scalar", action="store_true", help="Also time one predictor per call")
     args = parser.parse_args()
-    if min(args.responses, args.clusters_per_response, args.reference_block, args.batch_size, args.blas_threads) < 1:
+    if min(args.responses, args.clusters_per_response, args.reference_block, args.batch_size,
+           args.early_check_interval, args.repeats, args.blas_threads) < 1:
         parser.error("Counts and block sizes must be positive")
     with threadpool_limits(limits=args.blas_threads):
         return benchmark(args)
