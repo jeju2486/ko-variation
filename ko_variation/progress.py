@@ -177,6 +177,16 @@ def main():
             report['pair_counts_by_final_state']=dict(db.execute('SELECT final,count(*) FROM decisions GROUP BY final'))
             report['pair_states_note']='1 significant; -1 nonsignificant; 0 unresolved; -2 final-ineligible (may still be scored as a proxy).'
             report['pair_counts_by_status']=dict(db.execute('SELECT status,count(*) FROM decisions GROUP BY status'))
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='compact_rejections' AND type='table'").fetchone():
+                compact, ineligible = db.execute(
+                    "SELECT count(*),count(CASE WHEN final=-2 THEN 1 END) FROM compact_rejections").fetchone()
+                states = report['pair_counts_by_final_state']
+                for state, count in ((-2, ineligible), (-1, compact - ineligible)):
+                    if count:
+                        states[state] = states.get(state, 0) + count
+                report['queried_pairs'] += compact
+                if compact:
+                    report['pair_counts_by_status']['COMPACT_COARSE_REJECTION'] = compact
             report['traversal_tasks_by_done']=dict(db.execute('SELECT done,count(*) FROM tasks GROUP BY done'))
         cursor=report['meta'].get('root_cursor')
         if cursor:

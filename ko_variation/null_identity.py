@@ -1,6 +1,7 @@
 """Compatibility fingerprint for persistent nulls, excluding score-only code."""
 import ast
 import hashlib
+import json
 from pathlib import Path
 
 LEGACY_GLMM_HASHES = {
@@ -89,6 +90,42 @@ def _same_refactored_run(previous, expected):
     return old_unchanged == new_unchanged and dict(previous, code=current_code) == expected
 
 
+# Full v0.9.4 production and development source manifests (LF and CRLF).
+_TILED_PREDECESSORS = {
+    "252c294dd83a2d544b8e070d4ecfe45dcd54739f3722cfb3b5f13d4b73be3d80",
+    "a756ef907e9537c267631b8fd3dc6c70f91f3b43e2c7b21665658f90cdf1ccc2",
+    "9086e70d6f319a18c0aa9d74f6ca6d6191890afac352a381bbec605b1c4c9164",
+    "4933c8d8e175e7cceb27ac215f1081046967478cb8f75fbb8c60bfd86709508e",
+}
+_TILED_SOURCE = "59bd2ef8adec18d8f952ac3f1967ec1d41877483f27115e47ab395f932728ffc"
+
+
+def _source_manifest_hash(code):
+    return hashlib.sha256(json.dumps(code, sort_keys=True).encode()).hexdigest()
+
+
+def _same_tiled_run(previous, expected):
+    if (previous.get("version"), previous.get("execution_revision")) != ("0.9.4", "tree-null-1"):
+        return False
+    if expected.get("execution_revision") != "tiled-tree-1":
+        return False
+    if _source_manifest_hash(previous.get("code", {})) not in _TILED_PREDECESSORS:
+        return False
+    current = expected.get("code", {})
+    normalized = {}
+    for name, fingerprint in current.items():
+        if name == "null_identity.py":
+            continue
+        content = Path(__file__).with_name(name).read_bytes()
+        if hashlib.sha256(content).hexdigest() != fingerprint:
+            return False
+        normalized[name] = hashlib.sha256(content.replace(b"\r\n", b"\n")).hexdigest()
+    if _source_manifest_hash(normalized) != _TILED_SOURCE:
+        return False
+    return dict(previous, version=expected["version"], execution_revision=expected["execution_revision"],
+                code=current) == expected
+
+
 def check_identity(previous, expected):
     """Return whether a compatible manifest needs rewriting."""
     if previous == expected:
@@ -100,7 +137,7 @@ def check_identity(previous, expected):
         metadata_only['code']=code
         if metadata_only==expected:
             return True
-        if _same_refactored_run(previous, expected):
+        if _same_refactored_run(previous, expected) or _same_tiled_run(previous, expected):
             return True
     if previous.get('settings') != expected.get('settings'):
         raise ValueError('Scientific settings changed; use a new output')

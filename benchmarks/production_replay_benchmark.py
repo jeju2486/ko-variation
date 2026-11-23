@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
-from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
@@ -23,7 +22,7 @@ guard_blas_environment(default_threads=1)
 import numpy as np
 from scipy.stats import chi2
 
-from benchmarks.cluster_score_benchmark import TreeScore, ZeroTauScore, classify
+from ko_variation.tree_score import TreeScore, ZeroTauScore, classify
 from ko_variation import coarse_screen, discovery_nulls, discovery_score as kernels, discovery_search
 from ko_variation.discovery_execution import ResponsePool, batches, bounded_map, merge_metrics
 from ko_variation.discovery_store import atomic_json, connect, digest, get_meta, schema, set_meta
@@ -185,34 +184,6 @@ def evaluate_with_compact(db, pairs, pool, args, screening=False, *, return_mapp
     return saved if return_mapping else [saved[key] for key in requested]
 
 
-@dataclass
-class Window:
-    blocks: list
-    active: list
-    next_right: int
-
-
-def next_window(db, arrays, capacity, workers):
-    roots, pairs, offsets = arrays
-    active = get_meta(db, "pc_coarse_columns", [])
-    next_right = get_meta(db, "pc_coarse_next", 1)
-    quantum = max(1, min(256, capacity // max(1, workers)))
-    blocks = []
-    while len(blocks) < capacity:
-        while len(active) < workers and next_right < len(roots):
-            if offsets[next_right] < offsets[next_right + 1]:
-                active.append([next_right, int(offsets[next_right])])
-            next_right += 1
-        if not active:
-            break
-        right, position = active.pop(0)
-        stop = min(int(offsets[right + 1]), position + quantum, position + capacity - len(blocks))
-        blocks.extend(tuple(sorted((int(roots[a]), int(roots[b])))) for a, b in pairs[position:stop])
-        if stop < offsets[right + 1]:
-            active.append([right, stop])
-    return Window(blocks, active, next_right)
-
-
 def tile_scores(db, pairs, pool, args):
     grouped = {}
     for u, v in pairs:
@@ -246,19 +217,18 @@ class TileAdmission:
         total = len(arrays[1])
         if offset >= total:
             return [], True
-        window = next_window(db, arrays, capacity, workers)
-        if not window.blocks:
+        blocks, offset, active, next_right = coarse_screen.candidate_window(db, arrays, capacity, workers)
+        if not blocks:
             raise ValueError("Candidate cursor ended before the selected interval was exhausted")
         pruned = set()
         if self.eligibility:
-            summary = self.eligibility.summaries(window.blocks)
-            pruned = {pair for pair in window.blocks if self.eligibility.impossible(*pair, summary)}
+            summary = self.eligibility.summaries(blocks)
+            pruned = {pair for pair in blocks if self.eligibility.impossible(*pair, summary)}
         tested = {tuple(sorted((self.reps[a], self.reps[b]))): (a, b)
-                  for a, b in window.blocks if (a, b) not in pruned}
+                  for a, b in blocks if (a, b) not in pruned}
         rows, metrics = tile_scores(db, tested, self.pool, self.args)
         survivors = [tested[u, v] for u, v, gate, *_ in rows if gate != -1]
         rejected = len(tested) - len(survivors)
-        offset += len(window.blocks)
         if self.interrupt == "before":
             raise InterruptedReplay("before tile commit")
         writing = time.perf_counter()
@@ -270,10 +240,7 @@ class TileAdmission:
             db.executemany("INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?)", rows)
             db.executemany("INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)", sorted(survivors))
             set_meta(db, "queried_pairs_count", get_meta(db, "queried_pairs_count", 0) + len(tested))
-            set_meta(db, "pc_coarse_cursor", offset)
-            set_meta(db, "pc_coarse_columns", window.active)
-            set_meta(db, "pc_coarse_next", window.next_right)
-            set_meta(db, "coarse_scheduled_count", offset)
+            coarse_screen.save_candidate_cursor(db, offset, active, next_right)
             saved = get_meta(db, "hierarchy_metrics", {})
             merge_metrics(saved, dict(eligibility_pruned_cross_blocks=len(pruned), representative_pruned_blocks=rejected))
             set_meta(db, "hierarchy_metrics", saved)
@@ -307,7 +274,7 @@ def source_inputs(cli):
     array = selected[cli.start:end]
     arrays = roots, array, np.clip(offsets, cli.start, end) - cli.start
     identity = dict(source_run=digest(run_manifest), prepared=digest(work / "prepared.json"),
-                    benchmark=digest(Path(__file__)), scorer=digest(Path(__file__).with_name("cluster_score_benchmark.py")),
+                    benchmark=digest(Path(__file__)), scorer=digest(Path(kernels.__file__).with_name("tree_score.py")),
                     start=cli.start, end=end, threads=cli.threads, memory_gb=cli.memory_gb,
                     batch_size=cli.batch_size, early_check_interval=cli.early_check_interval, zero_tau=cli.zero_tau)
     return work, info, settings, screen, arrays, identity
@@ -334,8 +301,6 @@ def create_seed(out, source_work, data, arrays, screen):
             db.execute("INSERT INTO null_aliases SELECT * FROM source.null_aliases")
             for pid, present in db.execute("SELECT id,present FROM source.patterns"):
                 presence[pid] = present
-            db.execute("""CREATE TABLE compact_rejections(
-                          u INTEGER,v INTEGER,final INTEGER,PRIMARY KEY(u,v)) WITHOUT ROWID""")
             set_meta(db, "search_initialized", True)
             set_meta(db, "coarse_screen_summary", dict(screen, selected_pairs=len(arrays[1])))
             set_meta(db, "queried_pairs_count", 0)

@@ -64,6 +64,8 @@ def schema(db):
       radius INTEGER,eligible_members INTEGER,PRIMARY KEY(node,min_cell)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS decisions(u INTEGER,v INTEGER,gate INTEGER,final INTEGER,
       t_low REAL,t_high REAL,p REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS compact_rejections(u INTEGER,v INTEGER,final INTEGER,
+      PRIMARY KEY(u,v)) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS discovery_hits ON decisions(final,u,v);
     CREATE TABLE IF NOT EXISTS external_nulls(pid INTEGER PRIMARY KEY,path TEXT);
     CREATE TABLE IF NOT EXISTS null_aliases(pid INTEGER PRIMARY KEY,canonical INTEGER);

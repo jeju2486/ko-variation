@@ -7,6 +7,13 @@ before reusing numbers or caches; proposals are distinguished from conclusions.
 
 ## P0 -- release, accepted calculation and immediate next step
 
+- Development v0.9.5 adds bounded tiled admission for tree-backed PC
+  hierarchy search, cached batched tree scores with early rejection, and
+  compact coarse misses. PC selection and the testing family are unchanged.
+  The saved Klebsiella replay measured 1.29x faster search on 100,000 coarse
+  candidates with matching decisions. Full-run speed remains to be measured.
+  Compatible v0.9.4 runs keep their fitted nulls and position when resumed.
+
 - Development discovery layout: `discovery.py` owns stage order and prefit,
   `discovery_search.py` owns hierarchy and eligibility, and
   `discovery_store.py` owns input preparation and SQLite metadata.

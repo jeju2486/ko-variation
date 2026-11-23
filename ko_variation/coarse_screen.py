@@ -214,11 +214,11 @@ def open_candidates(work, count):
     return roots,pairs,offsets
 
 
-def candidate_tasks(db, arrays, capacity, workers=1):
+def candidate_window(db, arrays, capacity, workers):
     roots,pairs,offsets=arrays
     offset=get_meta(db,'pc_coarse_cursor',0)
-    total=len(pairs)
-    if offset>=total: return [],True
+    if offset >= len(pairs):
+        return [], offset, [], len(roots)
     active=get_meta(db,'pc_coarse_columns',[])
     next_right=get_meta(db,'pc_coarse_next',1)
     quantum=max(1,min(256,capacity//max(1,workers)))
@@ -233,10 +233,20 @@ def candidate_tasks(db, arrays, capacity, workers=1):
         stop=min(int(offsets[right+1]),position+quantum,position+capacity-len(tasks))
         tasks.extend(tuple(sorted((int(roots[a]),int(roots[b])))) for a,b in pairs[position:stop])
         if stop<offsets[right+1]: active.append([right,stop])
-    with db:
-        db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',tasks)
-        set_meta(db,'pc_coarse_cursor',offset+len(tasks))
-        set_meta(db,'pc_coarse_columns',active)
-        set_meta(db,'pc_coarse_next',next_right)
-        set_meta(db,'coarse_scheduled_count',offset+len(tasks))
-    return tasks,offset+len(tasks)>=total
+    return tasks, offset + len(tasks), active, next_right
+
+
+def save_candidate_cursor(db, offset, active, next_right):
+    set_meta(db, 'pc_coarse_cursor', offset)
+    set_meta(db, 'pc_coarse_columns', active)
+    set_meta(db, 'pc_coarse_next', next_right)
+    set_meta(db, 'coarse_scheduled_count', offset)
+
+
+def candidate_tasks(db, arrays, capacity, workers=1):
+    tasks, offset, active, next_right = candidate_window(db, arrays, capacity, workers)
+    if tasks:
+        with db:
+            db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)', tasks)
+            save_candidate_cursor(db, offset, active, next_right)
+    return tasks, offset >= len(arrays[1])

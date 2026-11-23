@@ -194,6 +194,38 @@ def make_hierarchy(db, info, pool, args):
         set_meta(db, "hierarchy_complete", True)
 
 
+def score_jobs(db, pairs, args, screening):
+    grouped = {}
+    for u, v in pairs:
+        grouped.setdefault(v, []).append(u)
+    external = {}
+    if getattr(args, "_has_external_nulls", True):
+        for block in batches(sorted(grouped), 400):
+            marks = ",".join("?" for _ in block)
+            external.update(db.execute(f"SELECT pid,path FROM external_nulls WHERE pid IN ({marks})", block))
+            external.update(db.execute("SELECT a.pid,e.path FROM null_aliases a "
+                f"JOIN external_nulls e ON a.canonical=e.pid WHERE a.pid IN ({marks})", block))
+    return ((v, us, external.get(v), screening) for v, us in grouped.items())
+
+
+def queried_count(db):
+    count = get_meta(db, "queried_pairs_count")
+    if count is None:
+        count = db.execute("SELECT (SELECT count(*) FROM decisions) + "
+                           "(SELECT count(*) FROM compact_rejections)").fetchone()[0]
+    return count
+
+
+def save_worker_profile(db, totals, states):
+    saved = get_meta(db, "runtime_totals", {})
+    merge_metrics(saved, totals)
+    set_meta(db, "runtime_totals", saved)
+    if states:
+        current = get_meta(db, "worker_state", {})
+        current.update(states)
+        set_meta(db, "worker_state", current)
+
+
 def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
     """Bulk-read decisions, coalesce responses, and commit bounded result blocks."""
     started=time.perf_counter()
@@ -205,8 +237,10 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
     for block in batches(requested,400):
         values=','.join(['(?,?)']*len(block))
         query=(f'WITH requested(u,v) AS (VALUES {values}) '
-               'SELECT r.u,r.v,d.gate,d.final,d.status FROM requested r '
-               'LEFT JOIN decisions d ON d.u=r.u AND d.v=r.v')
+               'SELECT r.u,r.v,COALESCE(d.gate,CASE WHEN c.u IS NOT NULL THEN -1 END),'
+               "COALESCE(d.final,c.final),COALESCE(d.status,CASE WHEN c.u IS NOT NULL THEN 'COMPACT' END) "
+               'FROM requested r LEFT JOIN decisions d ON d.u=r.u AND d.v=r.v '
+               'LEFT JOIN compact_rejections c ON c.u=r.u AND c.v=r.v')
         rows={(u,v):(gate,final,status) for u,v,gate,final,status in db.execute(query,[x for pair in block for x in pair])}
         for pair in block:
             gate,final,status=rows[pair]
@@ -216,13 +250,7 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
                     new_pairs.add(pair)
             else:
                 known[pair]=(gate,final)
-    external={}
-    responses=sorted({v for _,v in missing})
-    for block in batches(responses if getattr(args,'_has_external_nulls',True) else [],400):
-        marks=','.join('?' for _ in block)
-        external.update(db.execute(f'SELECT pid,path FROM external_nulls WHERE pid IN ({marks})',block))
-        external.update(db.execute(f'SELECT a.pid,e.path FROM null_aliases a JOIN external_nulls e '
-                                   f'ON e.pid=a.canonical WHERE a.pid IN ({marks})',block))
+    jobs = score_jobs(db, missing, args, screening)
     totals=dict(driver_db_read_seconds=time.perf_counter()-read_started)
     pending=[]
     models=[]
@@ -231,9 +259,7 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
             return
         write_started=time.perf_counter()
         with db:
-            count=get_meta(db,"queried_pairs_count")
-            if count is None:
-                count=db.execute('SELECT count(*) FROM decisions').fetchone()[0]
+            count=queried_count(db)
             db.executemany('INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?,?,?)',pending)
             count+=sum((row[0],row[1]) in new_pairs for row in pending)
             set_meta(db,"queried_pairs_count",count)
@@ -241,11 +267,8 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
         models.clear()
         pending.clear()
         merge_metrics(totals,dict(driver_db_write_seconds=time.perf_counter()-write_started))
-    def jobs():
-        for response,group in itertools.groupby(missing,key=lambda pair:pair[1]):
-            yield response,[pair[0] for pair in group],external.get(response),screening
     states={}
-    for payload in bounded_map(pool,kernels.score_profiled,jobs(),args.threads,ordered=False, response_index=0):
+    for payload in bounded_map(pool,kernels.score_profiled,jobs,args.threads,ordered=False, response_index=0):
         result=payload['rows']
         models.extend(payload.get('inventory',[]))
         merge_metrics(totals,payload['metrics'])
@@ -258,13 +281,7 @@ def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
     flush()
     merge_metrics(totals,dict(coordinator_batch_wall_seconds=time.perf_counter()-started))
     with db:
-        saved=get_meta(db,'runtime_totals',{})
-        merge_metrics(saved,totals)
-        set_meta(db,'runtime_totals',saved)
-        if states:
-            current=get_meta(db,'worker_state',{})
-            current.update(states)
-            set_meta(db,'worker_state',current)
+        save_worker_profile(db, totals, states)
     return known if return_mapping else [known[pair] for pair in requested]
 
 
@@ -328,6 +345,56 @@ def coarse_tasks(db, roots, ordered, capacity, old_position=None, workers=1):
     return fresh,next_right>=n and not active
 
 
+def admit_coarse_tile(db, arrays, capacity, reps, pool, args, eligibility):
+    blocks, offset, active, next_right = coarse_screen.candidate_window(db, arrays, capacity, args.threads)
+    done = offset >= len(arrays[1])
+    if not blocks:
+        if not done:
+            raise ValueError("PC candidate cursor ended before the selected pairs were processed")
+        return [], True
+    started = time.perf_counter()
+    summaries = eligibility.summaries(blocks) if eligibility else {}
+    tested = {tuple(sorted((reps[a], reps[b]))): (a, b) for a, b in blocks
+              if eligibility is None or not eligibility.impossible(a, b, summaries)}
+    decisions, negatives, survivors, inventory = [], [], [], []
+    totals, states = {}, {}
+    jobs = score_jobs(db, sorted(tested, key=lambda pair: (pair[1], pair[0])), args, True)
+    for payload in bounded_map(pool, kernels.score_profiled, jobs, args.threads,
+                               ordered=False, response_index=0):
+        merge_metrics(totals, payload["metrics"])
+        inventory.extend(payload["inventory"])
+        if payload["worker_state"]:
+            states[str(payload["worker_state"]["pid"])] = payload["worker_state"]
+        for row in payload["rows"]:
+            u, v, gate, final = row[:4]
+            if gate == -1:
+                negatives.append((u, v, final))
+            else:
+                decisions.append(row)
+                survivors.append(tested[u, v])
+    survivors.sort()
+    # Commit the tile and its cursor together, including when every block was rejected.
+    writing = time.perf_counter()
+    with db:
+        count = queried_count(db)
+        db.executemany("INSERT INTO compact_rejections VALUES (?,?,?)", negatives)
+        db.executemany("INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?)", decisions)
+        db.executemany("INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)", survivors)
+        nulls.record_models(db, inventory)
+        set_meta(db, "queried_pairs_count", count + len(tested))
+        coarse_screen.save_candidate_cursor(db, offset, active, next_right)
+        hierarchy = get_meta(db, "hierarchy_metrics", {})
+        merge_metrics(hierarchy, dict(eligibility_pruned_cross_blocks=len(blocks)-len(tested),
+                                      representative_pruned_blocks=len(negatives)))
+        set_meta(db, "hierarchy_metrics", hierarchy)
+        merge_metrics(totals, dict(coarse_tiles=1, coarse_tile_candidates=len(blocks),
+                                  compact_rejections=len(negatives),
+                                  driver_db_write_seconds=time.perf_counter()-writing,
+                                  coordinator_batch_wall_seconds=time.perf_counter()-started))
+        save_worker_profile(db, totals, states)
+    return survivors, done
+
+
 def search(db, info, pool, args):
     if get_meta(db,'search_complete'):
         return
@@ -376,13 +443,18 @@ def search(db, info, pool, args):
                 db.execute('INSERT OR IGNORE INTO tasks SELECT id,id,0 FROM nodes WHERE parent=0 AND size>1')
                 set_meta(db,'root_cursor',[0,1])
                 set_meta(db,'search_initialized',True)
-        roots=[row[0] for row in db.execute('SELECT id FROM nodes WHERE parent=0 ORDER BY id')]
-        ordered=[row[0] for row in db.execute('SELECT n.id FROM nodes n JOIN reps r ON r.node=n.id '
-                                             'WHERE n.parent=0 GROUP BY n.id ORDER BY max(r.pid),n.id')]
-        old_position={node:i for i,node in enumerate(roots)}
         filtered=getattr(args,'coarse_screen','none')=='pc'
-        arrays=coarse_screen.open_candidates(Path(args.tmp_dir) if args.tmp_dir else args.out/'.kovar_work',
-            get_meta(db,'coarse_screen_summary')['selected_pairs']) if filtered else None
+        tiled=filtered and getattr(args, '_tiled_coarse', False)
+        if filtered:
+            arrays=coarse_screen.open_candidates(Path(args.tmp_dir) if args.tmp_dir else args.out/'.kovar_work',
+                get_meta(db,'coarse_screen_summary')['selected_pairs'])
+            if tiled:
+                root_reps=dict(db.execute('SELECT r.node,r.pid FROM reps r JOIN nodes n ON n.id=r.node WHERE n.parent=0'))
+        else:
+            roots=[row[0] for row in db.execute('SELECT id FROM nodes WHERE parent=0 ORDER BY id')]
+            ordered=[row[0] for row in db.execute('SELECT n.id FROM nodes n JOIN reps r ON r.node=n.id '
+                                                 'WHERE n.parent=0 GROUP BY n.id ORDER BY max(r.pid),n.id')]
+            old_position={node:i for i,node in enumerate(roots)}
         while True:
             # Reserve at least 3/4 of each frontier for queued refinements and
             # at most 1/4 for fresh coarse comparisons. Neither waits for the
@@ -390,7 +462,9 @@ def search(db, info, pool, args):
             quota=max(1,frontier//4)
             tasks=db.execute('SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT ?',
                              (max(1,frontier-quota),)).fetchall()
-            if filtered:
+            if tiled:
+                fresh,coarse_done=admit_coarse_tile(db, arrays, frontier-len(tasks), root_reps, pool, args, eligibility)
+            elif filtered:
                 fresh,coarse_done=coarse_screen.candidate_tasks(db,arrays,frontier-len(tasks),args.threads)
             else:
                 fresh,coarse_done=coarse_tasks(db,roots,ordered,frontier-len(tasks),old_position,args.threads)

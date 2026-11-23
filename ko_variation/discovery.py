@@ -29,7 +29,7 @@ from .discovery_store import (atomic_json, connect, digest, get_meta, import_ben
                               localize_graph_paths, prepare, prepare_pangwes, schema, set_meta,
                               write_gzip)
 from .discovery_execution import ResponsePool, batches, bounded_map, merge_metrics, process_pool
-from .discovery_search import make_hierarchy, search
+from .discovery_search import make_hierarchy, queried_count, search
 from . import discovery_nulls as nulls
 from . import coarse_screen
 from .memory_budget import detect_budget, plan_workers
@@ -135,7 +135,7 @@ def identity(args):
     inputs = {k: digest(getattr(args, k)) for k in ("fasta", "tree", "exclude_samples") if getattr(args, k)}
     code = {name: digest(Path(__file__).with_name(name)) for name in
             ("discovery.py", "discovery_store.py", "discovery_score.py", "discovery_execution.py", "memory_budget.py",
-             "discovery_search.py", "discovery_nulls.py", "coarse_screen.py", "null_identity.py", "glmm.py", "kinship.py", "tree_null.py")}
+             "discovery_search.py", "discovery_nulls.py", "coarse_screen.py", "null_identity.py", "glmm.py", "kinship.py", "tree_null.py", "tree_score.py")}
     return dict(version=__version__, execution_revision=__discovery_revision__,inputs=inputs, settings=settings, code=code,
                 numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
 
@@ -461,6 +461,11 @@ def export(db, info, work, args, total_seconds):
         ["u","v","predictor_pattern","response_pattern","significance","p_exact","p_lower","p_upper",
          "min_distance","connected_genomes","distance_status","beta","beta_status"],rows())
     counts = {str(state):count for state,count in db.execute("SELECT final,count(*) FROM decisions GROUP BY final")}
+    compact_count, compact_ineligible = db.execute(
+        "SELECT count(*),count(CASE WHEN final=-2 THEN 1 END) FROM compact_rejections").fetchone()
+    for state, count in (("-2", compact_ineligible), ("-1", compact_count - compact_ineligible)):
+        if count:
+            counts[state] = counts.get(state, 0) + count
     family = args.bonferroni_tests or math.comb(info["patterns"],2)
     summary = dict(version=__version__,execution_revision=__discovery_revision__,work_directory=str(work.resolve()),
         samples=info["n"],excluded_samples=info["excluded"],original_unitigs=info["loci"],
@@ -489,10 +494,26 @@ def export(db, info, work, args, total_seconds):
     summary['block_eligibility_pruning']='necessary marginal counts and anchor-radius Hamming bounds; categories retained'
     summary['memory_budget']=getattr(args,'_memory_info',None)
     summary['execution_plan']=getattr(args,'_plan',None)
+    summary['compact_coarse_rejections']=compact_count
     summary['coarse_screen']=get_meta(db,'coarse_screen_summary')
     summary['distance_threshold_history']=get_meta(db,'distance_threshold_history',[])
     summary['reused_prepared_from']=get_meta(db,'reused_prepared_from')
     atomic_json(args.out/"run_summary.json",summary)
+
+
+def prepare_presence_counts(db, work, info):
+    target = work / "pattern_presence.npy"
+    expected = get_meta(db, "pattern_presence_sha256")
+    if expected and target.is_file() and digest(target) == expected:
+        return
+    counts = np.full(info["patterns"], -1, dtype=np.int32)
+    for pid, count in db.execute("SELECT id,present FROM patterns"):
+        counts[pid] = count
+    if np.any(counts < 0):
+        raise ValueError("Incomplete pattern counts in checkpoint")
+    coarse_screen.array_file(target, counts)
+    with db:
+        set_meta(db, "pattern_presence_sha256", digest(target))
 
 
 def main(argv=None):
@@ -553,7 +574,7 @@ def main(argv=None):
             schema(db)
             if get_meta(db,'queried_pairs_count') is None:
                 with db:
-                    set_meta(db,'queried_pairs_count',db.execute('SELECT count(*) FROM decisions').fetchone()[0])
+                    set_meta(db,'queried_pairs_count',queried_count(db))
             with threadpool_limits(limits=args.threads):
                 if args.reuse_prepared_from:
                     from .discovery_store import reuse_prepared
@@ -612,6 +633,12 @@ def main(argv=None):
                     return 0
             if args.prefit_nulls=='all':
                 settings['require_cached_nulls']=True
+            args._tiled_coarse = (args.search == "hierarchy" and args.coarse_screen == "pc"
+                                  and args.null_backend == "tree" and not args.exact)
+            if args._tiled_coarse and not get_meta(db, "search_complete"):
+                prepare_presence_counts(db, work, info)
+                settings["fast_tree_scores"] = True
+                print("[KOVAR] PC hierarchy: tiled coarse admission and early tree-score rejection", flush=True)
             with db:
                 set_meta(db,'worker_state',{})
                 set_meta(db,'active_stage','pair_search')
@@ -625,6 +652,7 @@ def main(argv=None):
                 search(db,info,pool,args)
             # Release every score-worker cache before the external graph tool
             # gets its own memory budget. Refit workers start lazily afterwards.
+            settings.pop('fast_tree_scores', None)
             if args.unitig_distance:
                 with db: set_meta(db,'active_stage','distance_and_beta')
                 with ResponsePool(args.threads,kernels.initialize,(str(work),info,settings)) as pool:

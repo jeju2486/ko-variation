@@ -12,6 +12,7 @@ from pathlib import Path
 import time
 
 import numpy as np
+from scipy.stats import chi2
 from threadpoolctl import threadpool_limits
 
 from .discovery_store import digest, open_patterns
@@ -40,6 +41,13 @@ def initialize(work, info, settings):
         from .tree_null import TreeAlgebra
         with np.load(work/'tree.npz',allow_pickle=False) as arrays:
             _STATE['tree']=TreeAlgebra(*(arrays[k] for k in ('left','right','tip','length')))
+    if settings.get("fast_tree_scores"):
+        from . import tree_score
+        score_limit = cache_limit // 4
+        _STATE.update(tree_score=tree_score, score_cache=ByteLRU(score_limit),
+                      presence=np.load(work/"pattern_presence.npy", mmap_mode="r"))
+        _STATE["cache_limit"] -= score_limit
+        _STATE["nulls"].limit -= score_limit
     _STATE["canonical"] = null_cache.open_aliases(work)
 
 
@@ -73,8 +81,12 @@ def pressure_guard():
         workers=max(1,settings.get('workers',1)) if settings.get('monitor') else 1
         excess=max(1,int((usage-target)/workers))
         before=cache.bytes
+        score_cache=s.get("score_cache")
+        if score_cache:
+            before+=score_cache.bytes
+            score_cache.trim(max(0,score_cache.bytes-excess))
         cache.trim(max(0,cache.bytes-max(excess,int(.1*cache.bytes))))
-        if before-cache.bytes>=16*MIB and now-s.get('last_allocator_trim',0)>30:
+        if before-cache.bytes-(score_cache.bytes if score_cache else 0)>=16*MIB and now-s.get('last_allocator_trim',0)>30:
             # Evicted NumPy allocations can remain in glibc arenas. Returning
             # those free pages avoids mistaking allocator retention for live
             # cache pressure. Unsupported platforms simply skip this hint.
@@ -89,7 +101,9 @@ def pressure_guard():
             except (AttributeError,OSError):
                 pass
         metric("memory_pressure_events")
-    elif cache.limit<s["cache_limit"]:
+    elif cache.limit<s["cache_limit"] or "score_cache" in s:
+        if "score_cache" in s:
+            s["score_cache"].limit=settings["cache_bytes_per_worker"]//4
         workers=max(1,settings.get('workers',1)) if settings.get('monitor') else 1
         headroom=max(0,int((target-usage)/workers))
         cache.limit=min(s["cache_limit"],cache.bytes+headroom)
@@ -414,27 +428,107 @@ def adaptive_statistics(X, cache, criticals, ranks=(0, 8, 16, 32, 64, 128)):
     return lo, hi, exact_p, statuses
 
 
+def _fast_tree_rows(X, cache, response, predictors, eligible, gate, final):
+    started = time.perf_counter()
+    tree_score, scorers = _STATE["tree_score"], _STATE["score_cache"]
+    scorer_key = ("scorer", response)
+    if scorer_key in scorers:
+        scorer = scorers.get(scorer_key)
+        metric("tree_coefficient_cache_hits")
+    else:
+        scorer = (tree_score.ZeroTauScore(cache) if cache["tau"] == 0.
+                  else tree_score.TreeScore(cache))
+        scorers.put(scorer_key, scorer, 512 + 112 * X.shape[0])
+        metric("tree_coefficient_setups")
+    cutoff = min(gate, final)
+    if isinstance(scorer, tree_score.ZeroTauScore):
+        u, v = scorer(X)
+        stopped = np.zeros(X.shape[1], dtype=bool)
+        terms = 0
+        metric("zero_tau_pairs", X.shape[1])
+    else:
+        u, v, stopped, terms = scorer.early_stop(X, cutoff, 16)
+    routing, decision, statistic = tree_score.classify(u, v, eligible, gate, final, stopped)
+    compute_p = (decision == 1) & np.isfinite(statistic)
+    p_values = np.full(len(predictors), np.nan)
+    p_values[compute_p] = chi2.sf(statistic[compute_p], 1)
+    # Preserve the reference's statuses and decisions around numerical boundaries.
+    verify = (~stopped & ((v <= 2e-12) | ~np.isfinite(statistic) |
+              np.isclose(statistic, gate, rtol=1e-9, atol=1e-12) |
+              np.isclose(statistic, final, rtol=1e-9, atol=1e-12)))
+    indices = np.flatnonzero(verify)
+    reference = dict(zip(indices, score_predictor_block(X[:, indices], cache,
+                                                       compute_spa_adjustment=False))) if len(indices) else {}
+    rows = []
+    for i, pid in enumerate(predictors):
+        route, state = int(routing[i]), int(decision[i])
+        p = float(p_values[i]) if np.isfinite(p_values[i]) else None
+        flag = "OK"
+        if i in reference:
+            result = reference[i]
+            flag = result.status
+            if flag == "OK":
+                low = high = result.score_z**2
+                route = 1 if low >= gate else -1
+                state = (1 if low >= final else -1) if eligible[i] else -2
+                p = float(result.p_score) if state == 1 else None
+            else:
+                low, high = 0., None
+                route, state = 0, 0 if eligible[i] else -2
+        elif stopped[i]:
+            low, high, flag = 0., cutoff, "BOUNDED"
+        else:
+            low = high = float(statistic[i])
+        rows.append((int(pid), response, route, state, low, high, p, flag))
+    early = int(stopped.sum())
+    metric("tree_terms", terms)
+    metric("possible_tree_terms", X.size)
+    metric("early_stopped_pairs", early)
+    metric("bound_decided_pairs", early)
+    metric("exact_pairs", len(predictors) - early)
+    metric("exact_worker_seconds", time.perf_counter() - started)
+    return rows
+
+
 def _score_chunk(job):
     response, predictors, external, screening = job
     s, n = _STATE, _STATE["info"]["n"]
-    X, y = bits(predictors).T.astype(float), bits([response])[0].astype(float)
-    overlap, counts = X.T @ y, X.sum(axis=0)
-    cell = np.minimum.reduce([overlap, counts-overlap, y.sum()-overlap, n-counts-y.sum()+overlap])
+    collecting = "score_cache" in s
+    X = bits(predictors).T.astype(float)
+    if collecting:
+        started = time.perf_counter()
+        response_key = ("pattern", response)
+        responses = s["score_cache"]
+        if response_key not in responses:
+            y = bits([response])[0].astype(float)
+            responses.put(response_key, y, 256 + y.nbytes)
+        else:
+            y = responses.get(response_key)
+        counts, present = s["presence"][predictors], float(s["presence"][response])
+    else:
+        y = bits([response])[0].astype(float)
+        counts, present = X.sum(axis=0), y.sum()
+    overlap = X.T @ y
+    cell = np.minimum.reduce([overlap, counts-overlap, present-overlap, n-counts-present+overlap])
     eligible = cell >= s["settings"]["min_cell_count"]
+    if collecting:
+        metric("decode_and_eligibility_worker_seconds", time.perf_counter() - started)
+    rows = []
     if not screening and not eligible.all():
-        # Final-only leaf work cannot produce a discovery from ineligible
-        # pairs. Save the eligibility decision without fitting a useless null.
-        result=[(int(u),response,0,-2,None,None,None,"INELIGIBLE_NOT_SCREENED")
+        # Final-only ineligible pairs need no fitted null.
+        rows = [(int(u),response,0,-2,None,None,None,"INELIGIBLE_NOT_SCREENED")
                 for u,ok in zip(predictors,eligible) if not ok]
-        selected=[u for u,ok in zip(predictors,eligible) if ok]
-        if selected:
-            result.extend(_score_chunk((response,selected,external,False)))
-        return result
+        predictors = [u for u,ok in zip(predictors,eligible) if ok]
+        if not predictors:
+            return rows
+        X, eligible = X[:, eligible], eligible[eligible]
     cache, status = get_null(response, external)
     if cache is None:
-        return [(int(u), response, 0, 0 if ok else -2, None, None, None, status)
-                for u, ok in zip(predictors, eligible)]
+        return rows + [(int(u), response, 0, 0 if ok else -2, None, None, None, status)
+                       for u, ok in zip(predictors, eligible)]
     gate, final = s["settings"]["gate_critical"], s["settings"]["final_critical"]
+    if collecting and hasattr(cache["decomp"], "score_variance"):
+        return rows + _fast_tree_rows(X, cache, response, predictors, eligible, gate, final)
     # Ineligible pairs route the hierarchy, but can never become discoveries.
     cutoffs = [gate, np.where(eligible, final, gate)]
     if s["settings"]["exact"]:
@@ -457,7 +551,7 @@ def _score_chunk(job):
         metric("bound_decided_pairs",sum(status=='BOUNDED' for status in statuses))
     def decision(low, high, cutoff):
         return 1 if low >= cutoff else -1 if high < cutoff else 0
-    return [(int(u), response, decision(l, h, gate), decision(l, h, final) if ok else -2,
+    return rows + [(int(u), response, decision(l, h, gate), decision(l, h, final) if ok else -2,
              float(l), float(h) if np.isfinite(h) else None, value, status)
             for u, ok, l, h, value, status in zip(predictors, eligible, lo, hi, p, statuses)]
 

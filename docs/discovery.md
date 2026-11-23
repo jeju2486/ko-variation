@@ -1,8 +1,6 @@
-# Unitig discovery in KOVAR 0.9.2
+# Unitig discovery in KOVAR 0.9.5
 
-Current execution revision: **`pc-screen-1`**, tagged `v0.9.2-pcscreen1`.
-The original `v0.9.2` tag remains unchanged. `--version` still reports 0.9.2;
-the startup banner, identities and summaries identify the execution revision.
+Development execution revision **`tiled-tree-1`**.
 
 `ko-variation-discover` (also `ko-variation discover`) accepts PAN-GWES unitig
 presence/absence directly. SpydrPick, MI and ARACNE are not required. Historical candidate-table scans use the v0.8.3 tag in a separate environment.
@@ -61,6 +59,24 @@ there are no concurrent numerical worker jobs during this screen. Row blocks
 are bounded by `--screen-block-size` and the memory budget. Finished raw scores
 and residual arrays are deleted; candidate indices and root mapping remain for
 restart. Rejected pairs never create individual SQLite task records.
+
+With `--null-backend tree`, non-exact PC-screened hierarchy runs verify retained
+coarse pairs in bounded tiles. A block is queued for descent only when its
+representative reaches the exploration threshold or is unresolved. The tile
+cursor, decisions and surviving tasks are committed together. The scorer
+reuses response-specific tree coefficients, stops when accumulated squared
+contrasts rule out both thresholds, and calculates exact P for significant
+tree-score hits. Routine misses can have a bound or no P. Coarse rejections
+are recorded compactly in the work database and included in progress totals.
+The PC shortlist, hierarchy gates, Bonferroni family, distance and beta
+calculations retain their existing definitions.
+
+Resume a compatible v0.9.4 checkpoint with the same inputs, scientific
+settings and NumPy/SciPy versions. Existing fitted nulls, queued work and
+decisions carry forward. KOVAR validates the saved source manifest against the
+v0.9.4 release and the preceding development layout before migration. Use
+`--exact` on a separate reference run if exact score P values are needed
+throughout the pairs visited by the search.
 
 Use a separate output to adopt the new filter while borrowing expensive work:
 

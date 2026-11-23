@@ -17,9 +17,9 @@ python -m pip install -e '.[network,phenotype]'
 ko-variation --version
 ```
 
-Version 0.9.4 adds an optional compact tree-null backend. Dense fitting remains
-the default until the full real-data validation of the tighter optimizer is
-complete. Install `.[tree]` and add `--null-backend tree` to use it.
+Development version 0.9.5 adds tiled pair search for the optional tree-null
+backend. Install `.[tree]` and use `--null-backend tree` with the default
+PC-screened hierarchy to enable it. Dense fitting remains the default.
 
 ## Discover covariation
 
@@ -119,5 +119,5 @@ software source. [Validation scope](docs/validation.md).
 See [current project state](PROJECT_STATE.md) for branch responsibilities and
 [tree-null settings](docs/tree_null.md) for accuracy, storage and restart rules.
 
-The minimal public release is now on `main`, tagged `v0.9.4`. This development
-branch deliberately retains supplementary and diagnostic source omitted from main.
+The public release on `main` is `v0.9.4`. This development branch retains
+supplementary benchmarks and diagnostics.

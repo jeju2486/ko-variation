@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from ko_variation import coarse_screen as screen
+from ko_variation import coarse_screen as screen, discovery_search as search
 from ko_variation.discovery import main
 from ko_variation.discovery_store import schema, get_meta, set_meta
 from ko_variation.discovery_store import connect
@@ -76,6 +76,38 @@ class CoarseScreenTests(unittest.TestCase):
                     if done:break
                 self.assertEqual(len(seen),len(expected));self.assertEqual(len(set(seen)),len(seen))
                 del arrays;db.close()
+
+    def test_tiled_admission_commits_cursor_and_decisions_together(self):
+        db = connect(":memory:")
+        self.addCleanup(db.close)
+        schema(db)
+        arrays = np.array([1, 2, 3]), np.array([[0, 1], [0, 2]]), np.array([0, 0, 1, 2])
+        reps = {1: 0, 2: 1, 3: 2}
+        args = SimpleNamespace(threads=2, _has_external_nulls=False)
+        rows = [(0, 1, -1, -1, 0., 5., None, "BOUNDED"),
+                (0, 2, 1, 1, 40., 40., 1e-9, "OK")]
+
+        def admit():
+            return search.admit_coarse_tile(db, arrays, 4, reps, None, args, None)
+
+        payload = dict(rows=rows, inventory=[], metrics={}, worker_state=None)
+
+        def score_jobs(pool, score, jobs, threads, **kwargs):
+            return [payload] if list(jobs) else []
+
+        with patch.object(search, "bounded_map", side_effect=score_jobs) as score:
+            with patch.object(screen, "save_candidate_cursor", side_effect=RuntimeError("interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    admit()
+            self.assertIsNone(get_meta(db, "pc_coarse_cursor"))
+            self.assertEqual(search.queried_count(db), 0)
+            self.assertEqual(db.execute("SELECT * FROM tasks").fetchall(), [])
+            self.assertEqual(admit(), ([(1, 3)], True))
+            self.assertEqual(get_meta(db, "pc_coarse_cursor"), 2)
+            self.assertEqual(search.queried_count(db), 2)
+            self.assertEqual(admit(), ([], True))
+            self.assertEqual(search.evaluate(db, [(0, 1), (0, 2)], None, args), [(-1, -1), (1, 1)])
+            self.assertEqual(score.call_count, 3)
 
     def test_undefined_residuals_are_rescued(self):
         with tempfile.TemporaryDirectory() as temporary:
