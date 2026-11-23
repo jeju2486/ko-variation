@@ -112,7 +112,7 @@ timed replay.
 
 | Mode | Addition |
 |---|---|
-| `current` | Production scheduler and scorer |
+| `current` | Historical response scheduler and scorer, before v0.9.5 |
 | `fused` | Fused tree scoring with cached response coefficients |
 | `early` | Partial-variance termination |
 | `counts` | Shared predictor counts and cached decoded responses, with no second decoding of the eligible subset |
@@ -125,6 +125,39 @@ The summary reports total throughput, database growth, the singleton split
 for the input interval, worker counters and timing. It checks every mode
 against `current` for pair decisions, child tasks and significant exact
 p-values, when available. A discrepancy returns a nonzero exit status.
+
+### Two-sided bounds versus v0.9.5
+
+Use a saved non-exact tree-backed v0.9.5 run whose PC shortlist and null prefit
+are complete. Replay its **results** directory and write to a separate folder.
+
+```bash
+python benchmarks/production_replay_benchmark.py \
+  --run /path/to/discovery/results --out /path/to/two-sided-replay \
+  --start 0 --pairs 100000 --threads 36 --memory-gb 40 --batch-size 256 \
+  --modes v095 v095_bounds v095_bounds_decision
+```
+
+| Mode | Scoring |
+|---|---|
+| `v095` | Actual v0.9.5 search and early-stopping scorer |
+| `v095_bounds` | Test both variance bounds first and keep the baseline's exact significant P-values |
+| `v095_bounds_decision` | Same bounds, with exact P-value calculation deferred for certified significant hits |
+
+The added pass calculates the numerator and weighted presence counts together
+for sparse, response-aligned batches. It hands undecided pairs and their
+already-computed numerators to the v0.9.5 tree scorer. For a second pass, use
+`--bound-rounds 2` with a different output folder. It applies the tighter
+per-isolate weights (w_i/(1+tau L w_i)) only where round one leaves a decision
+unresolved. (L) is a conservative maximum absolute row-sum bound for the
+largest eigenvalue of the shared kinship matrix.
+
+`summary.json` compares end-to-end replay wall time, tree work, per-round
+decisions, child tasks and exact P-values. The decision-only mode reports
+explicitly deferred P-values separately. A disagreement still returns a
+nonzero status. The source checkpoint is opened read-only. A repeat in a new
+output folder with reversed mode order can help assess startup and warm-cache
+effects.
 
 To test restart, run with `--modes tile_rows --interrupt before` or
 `--modes tile_compact --interrupt after`. This intentionally returns status

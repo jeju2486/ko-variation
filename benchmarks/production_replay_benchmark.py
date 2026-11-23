@@ -22,15 +22,19 @@ guard_blas_environment(default_threads=1)
 import numpy as np
 from scipy.stats import chi2
 
-from ko_variation.tree_score import TreeScore, ZeroTauScore, classify
+from ko_variation.tree_score import TreeScore, ZeroTauScore, classify, contrast_norms_until
 from ko_variation import coarse_screen, discovery_nulls, discovery_score as kernels, discovery_search
 from ko_variation.discovery_execution import ResponsePool, batches, bounded_map, merge_metrics
 from ko_variation.discovery_store import atomic_json, connect, digest, get_meta, schema, set_meta
 
 
-MODES = ("current", "fused", "early", "counts", "tile_rows", "tile_compact")
+LEGACY_MODES = ("current", "fused", "early", "counts", "tile_rows", "tile_compact")
+V095_MODES = ("v095", "v095_bounds", "v095_bounds_decision")
+MODES = LEGACY_MODES + V095_MODES
+CERTIFIED = "BENCHMARK_DIAGONAL_BOUND"
 ORIGINAL_CHUNK = kernels._score_chunk
 ORIGINAL_EVALUATE = discovery_search.evaluate
+ORIGINAL_FAST_TREE_ROWS = kernels._fast_tree_rows
 
 
 class InterruptedReplay(Exception):
@@ -49,9 +53,14 @@ def initialize_worker(work, info, settings, mode, presence_file, interval, zero_
     kernels.initialize(work, info, settings)
     discovery_nulls.save = prevent_cache_write
     discovery_nulls.compatible = allow_saved_format
-    if mode == "current":
+    if mode in ("current", "v095"):
         return
     state = kernels._STATE
+    if mode in V095_MODES:
+        state["defer_significant_p"] = mode == "v095_bounds_decision"
+        kernels._fast_tree_rows = two_sided_tree_rows
+        TreeScore.early_stop = early_stop_with_saved_u
+        return
     limit = settings["cache_bytes_per_worker"] // 4
     state["nulls"].limit -= limit
     state["cache_limit"] -= limit
@@ -161,6 +170,108 @@ def optimized_chunk(job):
     return rows
 
 
+BOUND_MARGIN = 1e-9
+
+
+def early_stop_with_saved_u(self, X, cutoff, interval):
+    """Use the sieve's score numerator in the unchanged v0.9.5 tree kernel."""
+    u = kernels._STATE["diagonal_u"]
+    upper_u = np.abs(u) + BOUND_MARGIN * np.maximum(1., np.abs(u))
+    limit = np.maximum(upper_u ** 2 / cutoff, 1e-12)
+    limit += BOUND_MARGIN * np.maximum(1., limit)
+    v, stopped, terms = contrast_norms_until(
+        *self.tree_indices, *self.coefficients, self.project(X), limit, interval)
+    v[stopped] = np.nan
+    return u, v, stopped, terms
+
+
+def weighted_variance(present, total):
+    return present * (1. - present / total)
+
+
+def diagonal_decisions(u_low, u_high, v_lower, v_upper, eligible, gate, final):
+    lower = v_lower - BOUND_MARGIN * np.maximum(1., np.abs(v_lower))
+    upper = v_upper + BOUND_MARGIN * np.maximum(1., np.abs(v_upper))
+    valid = (lower > 1e-12) & np.isfinite(u_high) & np.isfinite(lower) & np.isfinite(upper)
+    route = np.where(u_low >= gate * upper, 1, np.where(u_high < gate * lower, -1, 0))
+    decision = np.where(u_low >= final * upper, 1, np.where(u_high < final * lower, -1, 0))
+    decision = np.where(eligible, decision, -2)
+    settled = valid & (route != 0) & (decision != 0)
+    return settled, route, decision, lower, upper
+
+
+def two_sided_tree_rows(X, cache, response, predictors, eligible, gate, final):
+    state = kernels._STATE
+    if cache["tau"] == 0.:
+        return ORIGINAL_FAST_TREE_ROWS(X, cache, response, predictors, eligible, gate, final)
+    started = time.perf_counter()
+    settings, model_cache = state["settings"], state["score_cache"]
+    key = ("diagonal", response)
+    if key in model_cache:
+        moments, weight_sum, inflation, tighter, tighter_sum = model_cache.get(key)
+    else:
+        weights = cache["weights"]
+        scale = cache["tau"] * settings["lambda_upper"]
+        moments = np.column_stack((cache["y"] - cache["mu"], weights))
+        weight_sum = weights.sum()
+        inflation = 1. + scale * weights.max()
+        tighter = weights / (1. + scale * weights) if settings["bound_rounds"] == 2 else None
+        tighter_sum = tighter.sum() if tighter is not None else None
+        size = 256 + moments.nbytes + (tighter.nbytes if tighter is not None else 0)
+        model_cache.put(key, (moments, weight_sum, inflation, tighter, tighter_sum), size)
+
+    u, present = (X.T @ moments).T
+    u_abs = np.abs(u)
+    guard = BOUND_MARGIN * np.maximum(1., u_abs)
+    u_low, u_high = np.maximum(0., u_abs - guard)**2, (u_abs + guard)**2
+    v_upper = weighted_variance(present, weight_sum)
+    v_lower = v_upper / inflation
+    settled, route, decision, lo, hi = diagonal_decisions(
+        u_low, u_high, v_lower, v_upper, eligible, gate, final)
+    first = int(settled.sum())
+    if tighter is not None:
+        pending = np.flatnonzero(~settled)
+        if pending.size:
+            columns = X if pending.size == X.shape[1] else X[:, pending]
+            v_lower[pending] = np.maximum(v_lower[pending],
+                weighted_variance(columns.T @ tighter, tighter_sum))
+            settled, route, decision, lo, hi = diagonal_decisions(
+                u_low, u_high, v_lower, v_upper, eligible, gate, final)
+
+    resolved_by_round_two = int(settled.sum()) - first
+    would_accept = settled & (decision == 1)
+    if not state["defer_significant_p"]:
+        settled &= ~would_accept
+    accepted = int(np.count_nonzero(settled & (decision == 1)))
+    kernels.metric("diagonal_pairs_checked", X.shape[1])
+    kernels.metric("diagonal_round_one_resolved", first)
+    kernels.metric("diagonal_round_two_resolved", resolved_by_round_two)
+    kernels.metric("diagonal_certified_significant", int(would_accept.sum()))
+    kernels.metric("diagonal_significant_p_deferred", accepted)
+    kernels.metric("diagonal_resolved", int(settled.sum()))
+    kernels.metric("bound_decided_pairs", int(settled.sum()))
+    kernels.metric("possible_tree_terms", X.shape[0] * int(settled.sum()))
+    rows = [(int(predictors[i]), response, int(route[i]), int(decision[i]),
+             float(u_low[i] / hi[i]), float(u_high[i] / lo[i]), None, CERTIFIED)
+            for i in np.flatnonzero(settled)]
+    kernels.metric("diagonal_worker_seconds", time.perf_counter() - started)
+
+    remaining = np.flatnonzero(~settled)
+    if remaining.size:
+        if remaining.size == X.shape[1]:
+            arguments = X, cache, response, predictors, eligible, gate, final
+            state["diagonal_u"] = u
+        else:
+            arguments = (X[:, remaining], cache, response, [predictors[i] for i in remaining],
+                         eligible[remaining], gate, final)
+            state["diagonal_u"] = u[remaining]
+        try:
+            rows.extend(ORIGINAL_FAST_TREE_ROWS(*arguments))
+        finally:
+            del state["diagonal_u"]
+    return rows
+
+
 def check_for_compact(db, pairs):
     hits = {}
     for block in batches(pairs, 400):
@@ -265,6 +376,9 @@ def source_inputs(cli):
     settings = manifest["settings"]
     if settings.get("search") != "hierarchy" or settings.get("coarse_screen") != "pc":
         raise ValueError("Replay needs a source hierarchy with a completed PC screen")
+    if any(mode in V095_MODES for mode in cli.modes):
+        if settings.get("null_backend") != "tree" or settings.get("exact") or not (work / "pattern_presence.npy").is_file():
+            raise ValueError("v095 modes need a v0.9.5 non-exact tree checkpoint with a completed PC screen")
     with closing(sqlite3.connect((work / "work.sqlite").as_uri() + "?mode=ro", uri=True)) as source:
         screen = get_meta(source, "coarse_screen_summary")
     if not screen or screen["selected_pairs"] <= cli.start:
@@ -276,7 +390,10 @@ def source_inputs(cli):
     identity = dict(source_run=digest(run_manifest), prepared=digest(work / "prepared.json"),
                     benchmark=digest(Path(__file__)), scorer=digest(Path(kernels.__file__).with_name("tree_score.py")),
                     start=cli.start, end=end, threads=cli.threads, memory_gb=cli.memory_gb,
-                    batch_size=cli.batch_size, early_check_interval=cli.early_check_interval, zero_tau=cli.zero_tau)
+                    batch_size=cli.batch_size, early_check_interval=cli.early_check_interval,
+                    zero_tau=cli.zero_tau, bound_rounds=cli.bound_rounds,
+                    runtime_source={Path(module.__file__).name: digest(Path(module.__file__))
+                                    for module in (kernels, discovery_search, coarse_screen)})
     return work, info, settings, screen, arrays, identity
 
 
@@ -322,10 +439,21 @@ def run_mode(cli, work, info, source_settings, arrays, mode):
     args = SimpleNamespace(**source_settings, threads=cli.threads, batch_size=cli.batch_size, tmp_dir=work,
                            out=destination, memory_gb=budget["working_gb"], _plan=plan,
                            compact_lookup_seconds=0.)
+    args._tiled_coarse = mode in V095_MODES
     settings = dict(min_cell_count=args.min_cell_count, gate_critical=float(chi2.isf(args.screen_p, 1)),
                     final_critical=float(chi2.isf(args.alpha / family, 1)), exact=args.exact,
                     require_cached_nulls=True, batch_size=args.batch_size, null_cache_format="compact",
                     null_cache_rank=128, null_backend=getattr(args, "null_backend", "dense"), workers=cli.threads, **plan)
+    if mode in V095_MODES:
+        settings["fast_tree_scores"] = True
+    if mode in V095_MODES[1:]:
+        kinship = np.load(work / "K.npy", mmap_mode="r")
+        # The maximum absolute row sum upper-bounds the spectral radius.
+        largest = max(float(np.abs(kinship[start:start + 256]).sum(axis=1).max())
+                      for start in range(0, len(kinship), 256))
+        settings.update(bound_rounds=cli.bound_rounds,
+                        lambda_upper=largest + BOUND_MARGIN * max(1., largest))
+        del kinship
     worker_args = (str(work), info, settings, mode, str(cli.out / "presence.npy"),
                    cli.early_check_interval, cli.zero_tau)
     with closing(connect(database, min(64, budget["working_gb"] * 1024 * .05))) as db:
@@ -358,7 +486,7 @@ def run_mode(cli, work, info, source_settings, arrays, mode):
     return incomplete
 
 
-def differences(db, reference, variant):
+def differences(db, reference, variant, *, defer_p=False):
     db.execute("ATTACH DATABASE ? AS baseline", (reference.as_uri() + "?mode=ro",))
     db.execute("ATTACH DATABASE ? AS trial", (variant.as_uri() + "?mode=ro",))
     try:
@@ -377,10 +505,10 @@ def differences(db, reference, variant):
         counts["significant_p_mismatches"] = db.execute("""
             SELECT count(*) FROM baseline.decisions r JOIN trial.decisions t USING(u,v)
             WHERE r.final=1 AND t.final=1 AND (
-                (r.p IS NULL)!=(t.p IS NULL) OR (r.p IS NOT NULL AND t.p IS NOT NULL
+                ((r.p IS NULL)!=(t.p IS NULL) AND NOT (? AND t.p IS NULL AND t.status=?)) OR (r.p IS NOT NULL AND t.p IS NOT NULL
                 AND abs(r.p-t.p)>1e-8*max(abs(r.p),abs(t.p),1e-300))
             )
-        """).fetchone()[0]
+        """, (defer_p, CERTIFIED)).fetchone()[0]
         return counts
     finally:
         db.execute("DETACH DATABASE baseline")
@@ -389,7 +517,6 @@ def differences(db, reference, variant):
 
 def report(out, modes, identity, arrays):
     results = []
-    baseline = out / "current/work.sqlite"
     seed_bytes = (out / "seed.sqlite").stat().st_size
     with closing(sqlite3.connect((out / "seed.sqlite").as_uri() + "?mode=ro", uri=True)) as db:
         singleton_nodes = {node for node, in db.execute("SELECT id FROM nodes WHERE parent=0 AND size=1")}
@@ -413,16 +540,30 @@ def report(out, modes, identity, arrays):
                                 db_growth_bytes=path.stat().st_size - seed_bytes, rows=rows,
                                 timing=timing, runtime=get_meta(db, "runtime_totals", {}),
                                 hierarchy=get_meta(db, "hierarchy_metrics", {})))
-    have_baseline = any(result["mode"] == "current" for result in results)
+    by_mode = {result["mode"]: result for result in results}
     with closing(sqlite3.connect(":memory:", uri=True)) as db:
         for result in results:
             mode = result["mode"]
-            comparison = (differences(db, baseline, out / mode / "work.sqlite")
-                          if have_baseline and mode != "current" else {})
+            reference = "v095" if mode in V095_MODES else "current"
+            comparison = {}
+            speed = ""
+            if reference in by_mode and mode != reference:
+                comparison = differences(db, out / reference / "work.sqlite", out / mode / "work.sqlite",
+                                         defer_p=mode == "v095_bounds_decision")
+                result["speedup"] = by_mode[reference]["timing"]["seconds"] / result["timing"]["seconds"]
+                result["reference_mode"] = reference
+                speed = f"; {result['speedup']:.2f}x vs {reference}"
             result["comparison"] = comparison
             check = f"; {sum(comparison.values()):,} discrepancies" if comparison else ""
-            print(f"{mode}: {result['coarse_per_second']:,.0f} coarse pairs/s; "
-                  f"{result['db_bytes'] / MIB:,.1f} MiB; {result['significant']:,} significant{check}", flush=True)
+            diagonals = ""
+            if mode in V095_MODES[1:]:
+                metrics = result["runtime"]
+                diagonals = (f"; {metrics.get('diagonal_resolved', 0):,} diagonal decisions"
+                             f"; {metrics.get('diagonal_significant_p_deferred', 0):,} exact P-values deferred")
+            print(f"{mode}: {result['timing']['seconds']:.3f}s; "
+                  f"{result['coarse_per_second']:,.0f} coarse pairs/s; "
+                  f"{result['db_bytes'] / MIB:,.1f} MiB; {result['significant']:,} significant"
+                  f"{speed}{check}{diagonals}", flush=True)
     atomic_json(out / "summary.json", dict(selection=identity, coarse_pairs=breakdown, modes=results))
     return int(any(count for row in results for count in row["comparison"].values()))
 
@@ -438,7 +579,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--early-check-interval", type=int, default=16)
     parser.add_argument("--zero-tau", action="store_true", help="Enable the exact zero-tau shortcut in optimized modes")
-    parser.add_argument("--modes", nargs="+", choices=MODES, default=MODES)
+    parser.add_argument("--modes", nargs="+", choices=MODES, default=LEGACY_MODES)
+    parser.add_argument("--bound-rounds", type=int, choices=(1, 2), default=1,
+                        help="For v095 bounds, optionally tighten the lower bound of unresolved pairs")
     parser.add_argument("--interrupt", choices=("before", "after"), help="Stop at the first tile commit boundary")
     cli = parser.parse_args()
     if cli.start < 0 or min(cli.pairs, cli.threads, cli.batch_size, cli.early_check_interval) < 1:
