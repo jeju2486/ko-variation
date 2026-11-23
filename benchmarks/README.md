@@ -11,6 +11,7 @@ match before comparing recovery percentages.
 | Essential | MI versus tree-PC recovery, PC counts and retention | screen_benchmark.py, screen_benchmark_extend.py, plot_screen_benchmark.py |
 | Essential | Exact versus adaptive decisions and hierarchical/PC screening recovery | discovery_benchmark.py, plot_discovery_benchmark.py |
 | Development | Saved PC40 candidate replay with batched tree scores and pair/cluster bounds | cluster_score_benchmark.py |
+| Development | End-to-end PC candidate interval replay with worker dispatch and SQLite | production_replay_benchmark.py |
 | Useful | Full beta refitting versus warm fitting and score approximation | beta_benchmark.py |
 | Conditional | Consolidated KOVAR/pyseer/AMR checks supporting biological claims | amr_checks.py, run_amr_checks.sh |
 | Conditional | S. aureus target-unitig allele audit, censor-aware MIC prediction and random partners | saureus_mic.py, run_saureus_mic.sh |
@@ -88,3 +89,46 @@ written before a comparison mismatch returns a nonzero exit status.
 `speedup_vs_fused` compares each variant with the fused scorer on the same
 workload and saved tree nulls. For `fused_rebuild`, use its reciprocal or
 compare the two times to read the speedup from caching.
+
+## Production interval replay
+
+Run against a discovery checkpoint whose PC screen and null prefit are
+complete. Use a separate output on the filesystem you want to benchmark.
+
+```bash
+python benchmarks/production_replay_benchmark.py \
+  --run /path/to/discovery/results --out /path/to/production-replay \
+  --start 0 --pairs 100000 --threads 24 --memory-gb 8 --batch-size 256
+```
+
+The replay takes a contiguous interval of the existing PC candidate list. It
+copies the hierarchy for the selected root blocks into one scratch seed
+database. Every mode starts from that seed, reads saved nulls without refitting
+them, and follows the usual child traversal and leaf evaluation. The replay
+does not include the original run's prior pair decisions, within-root search,
+distance calculation or beta fitting. It includes process startup, scheduling,
+scoring and durable writes. Seed creation and result comparison are outside the
+timed replay.
+
+| Mode | Addition |
+|---|---|
+| `current` | Production scheduler and scorer |
+| `fused` | Fused tree scoring with cached response coefficients |
+| `early` | Partial-variance termination |
+| `counts` | Shared predictor counts and cached decoded responses, with no second decoding of the eligible subset |
+| `tile_rows` | Score response-aligned coarse windows before creating tasks, keeping decision rows |
+| `tile_compact` | Store routine coarse rejections as pair keys and final states. Compute p-values for tree-scored significant hits |
+
+`--zero-tau` adds the exact shortcut to the optimized modes. Compare a
+separate replay on the same interval without the option to isolate its effect.
+The summary reports total throughput, database growth, the singleton split
+for the input interval, worker counters and timing. It checks every mode
+against `current` for pair decisions, child tasks and significant exact
+p-values, when available. A discrepancy returns a nonzero exit status.
+
+To test restart, run with `--modes tile_rows --interrupt before` or
+`--modes tile_compact --interrupt after`. This intentionally returns status
+75 at the first tile commit boundary. Repeat with the same interval and
+output directory, omitting `--interrupt`. Completed modes are skipped.
+Use independent output directories for throughput measurements so timing
+does not include a deliberate interruption.
