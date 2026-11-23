@@ -10,8 +10,8 @@ from unittest.mock import patch
 import numpy as np
 
 from ko_variation import discovery_score as kernels
-from ko_variation.discovery import schema, search, get_meta
-from ko_variation.discovery_eligibility import impossible_block
+from ko_variation.discovery_search import impossible_block, search
+from ko_variation.discovery_store import schema, get_meta
 from ko_variation.discovery_store import connect
 
 

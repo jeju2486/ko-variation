@@ -9,7 +9,9 @@ import numpy as np
 
 from ko_variation import discovery_score as kernels
 from ko_variation import discovery_nulls as store
-from ko_variation.discovery import schema,set_meta,get_meta,coarse_tasks,main
+from ko_variation.discovery import main
+from ko_variation.discovery_search import coarse_tasks
+from ko_variation.discovery_store import schema, set_meta, get_meta
 from ko_variation.discovery_store import connect,digest
 from ko_variation.glmm import _weighted_eigen,prepare_kinship_eigensystem,score_predictor_block
 from ko_variation.memory_budget import working_usage
@@ -120,7 +122,7 @@ class PrefitTests(unittest.TestCase):
             aliases=work/'null_canonical.npy'
             stamp=aliases.stat().st_mtime_ns
             (out/'null_stage_summary.json').unlink()
-            with patch('ko_variation.discovery_nulls.ProcessPoolExecutor',side_effect=AssertionError('rechecked completed stage')):
+            with patch('ko_variation.discovery.process_pool',side_effect=AssertionError('rechecked completed stage')):
                 self.assertEqual(main(common+['--resume','--require-cached-nulls']),0)
             self.assertEqual(aliases.stat().st_mtime_ns,stamp)
             self.assertEqual(json.loads((out/'null_stage_summary.json').read_text()),summary)

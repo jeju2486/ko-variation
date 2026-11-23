@@ -1,6 +1,7 @@
 """Focused v0.9 checks: mathematical bounds, restart and distance semantics."""
 import csv
 import gzip
+from importlib.util import find_spec
 import json
 from pathlib import Path
 import subprocess
@@ -11,8 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from ko_variation.discovery import (main, parser, distance_and_beta, export, partition,
-                                    schema, set_meta)
+from ko_variation.discovery import main, parser, distance_and_beta, export
+from ko_variation.discovery_search import partition
+from ko_variation.discovery_store import schema, set_meta
 from ko_variation.discovery_store import connect, prepare, digest, atomic_json, open_patterns
 from ko_variation import discovery_score as kernels
 from ko_variation.glmm import _weighted_eigen, score_predictor_block
@@ -53,6 +55,35 @@ class DiscoveryTests(unittest.TestCase):
         tree.write_text("("+",".join(f"s{i}:1" for i in range(n))+");")
         unitigs.write_text("".join(f"{i} ACGTACGT\n" for i in range(X.shape[1])))
         return fasta,tree,unitigs
+
+    @unittest.skipUnless(find_spec("Bio"), "PAN-GWES preparation requires Biopython")
+    def test_raw_pangwes_preparation_reuses_checkpoint_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            expected, tree, unitigs = self.inputs(root)
+            raw, assemblies, gfa, metadata = (root / name for name in ("raw.fa", "assemblies", "raw.gfa", "raw.json"))
+            raw.write_text("".join(">duplicate\n" if line.startswith(">") else line
+                                   for line in expected.read_text().splitlines(keepends=True)))
+            names = [f"/source/assemblies/s{i}.fna" for i in range(96)]
+            assemblies.write_text("\n".join(names))
+            gfa.write_text("".join(f"P\tReference:{i}_Sequence:0\t0+\t*\n" for i in range(1, 97)))
+            metadata.write_text(json.dumps({"parameters info": {"input": names}}))
+            prepared, rooted = root / "inputs/samples.fa", root / "inputs/tree.nwk"
+            out = root / "results"
+            argv = ["--fasta", str(raw), "--tree", str(tree), "--out", str(out), "--unitigs", str(unitigs),
+                    "--prepare-pangwes", *map(str, (assemblies, gfa, metadata, prepared, rooted)), "--prepare-only"]
+            self.assertEqual(main(argv), 0)
+            self.assertEqual(prepared.read_bytes(), expected.read_bytes())
+            self.assertFalse(out.exists())
+            stamp = prepared.stat().st_mtime_ns
+            work = out / ".kovar_work"
+            work.mkdir(parents=True)
+            (work / "run_identity.json").write_text("{}")
+            self.assertEqual(main(argv), 0)
+            self.assertEqual(prepared.stat().st_mtime_ns, stamp)
+            raw.write_text(raw.read_text() + "\n")
+            with self.assertRaisesRegex(ValueError, "generated files changed"):
+                main(argv)
 
     def test_scanner_resume_parallel_exact_equivalence_and_local_retention(self):
         with tempfile.TemporaryDirectory() as temporary:

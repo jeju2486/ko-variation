@@ -26,6 +26,19 @@ python -m ko_variation.discovery --version
 bash examples/run_discovery.sh --help
 ```
 
+To prepare raw PAN-GWES inputs in the same invocation, pass the raw pseudo-FASTA
+and tree to `--fasta` and `--tree`. Add
+`--prepare-pangwes ASSEMBLIES GFA METADATA PREPARED_FASTA PREPARED_TREE`. The
+prepared paths must share a directory outside the results directory. Install
+Biopython for this mode. Add `--prepare-only` to stop after preparing inputs.
+For copied graph files, `--local-graph-paths FILE` writes an absolute copy of
+`--paths`. Repeat `--graph-path-rebase OLD_PREFIX NEW_ROOT` as needed.
+
+The Bash runner passes `--resume-if-present` to Python. Discovery still checks
+the run identity before resuming. Verified v0.9.4 checkpoints retain their
+prepared inputs, fitted nulls and committed decisions through the discovery
+layout refactor.
+
 If you already use a suitable conda/virtual environment, activate it and run
 `python -m pip install .` there instead of creating `.venv`. Optional downstream
 network/phenotype dependencies can be installed with:

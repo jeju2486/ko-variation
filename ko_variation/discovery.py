@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-import itertools
 import json
 import math
 from pathlib import Path
@@ -26,20 +25,15 @@ from threadpoolctl import threadpool_limits
 
 from . import __version__, __discovery_revision__
 from . import discovery_score as kernels
-from .discovery_store import atomic_json, connect, digest, prepare, write_gzip, import_benchmark_nulls
-from .discovery_execution import ResponsePool, bounded_map
+from .discovery_store import (atomic_json, connect, digest, get_meta, import_benchmark_nulls,
+                              localize_graph_paths, prepare, prepare_pangwes, schema, set_meta,
+                              write_gzip)
+from .discovery_execution import ResponsePool, batches, bounded_map, merge_metrics, process_pool
+from .discovery_search import make_hierarchy, search
 from . import discovery_nulls as nulls
 from . import coarse_screen
-from .memory_budget import ByteLRU, detect_budget, plan_workers, MIB
-
-
-def batches(values, size):
-    source = iter(values)
-    while True:
-        batch = list(itertools.islice(source, size))
-        if not batch:
-            break
-        yield batch
+from .memory_budget import detect_budget, plan_workers
+from .null_identity import check_identity, null_source_hash
 
 
 def parser():
@@ -47,6 +41,13 @@ def parser():
     p.add_argument("--fasta", type=Path, required=True, help="Unique sample-ID FASTA; A=0,C=1")
     p.add_argument("--tree", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--prepare-pangwes", type=Path, nargs=5,
+                   metavar=("ASSEMBLIES", "GFA", "METADATA", "PREPARED_FASTA", "PREPARED_TREE"),
+                   help="Use raw --fasta and --tree to produce sample-labelled discovery inputs")
+    p.add_argument("--prepare-only", action="store_true", help="Prepare PAN-GWES inputs and stop")
+    p.add_argument("--local-graph-paths", type=Path, help="Write an absolute, localized copy of --paths")
+    p.add_argument("--graph-path-rebase", nargs=2, metavar=("OLD_PREFIX", "NEW_ROOT"), action="append",
+                   default=[], help="Replace an old graph path prefix when writing --local-graph-paths")
     p.add_argument("--unitigs", type=Path, help="PAN-GWES zero-based unitig-ID/sequence file")
     p.add_argument("--paths", type=Path, help="PAN-GWES per-isolate graph path list")
     p.add_argument("--edges", type=Path, help="Global graph edges, for older unitig_distance versions")
@@ -89,6 +90,7 @@ def parser():
     p.add_argument('--null-cache-rank',type=int,default=128,
                    help='Retained spectral directions; omitted directions use conservative bounds or exact reconstruction [128]')
     p.add_argument("--resume", action="store_true", help="Reuse compatible completed work")
+    p.add_argument("--resume-if-present", action="store_true", help="Resume automatically if a checkpoint exists")
     p.add_argument("--version", action="version", version=__version__)
     return p
 
@@ -115,11 +117,16 @@ def validate(args):
         args.prefit_nulls='all'
     if args.unitig_distance and not (args.unitigs and args.paths):
         raise ValueError("Distance calculation needs --unitigs and --paths")
+    if args.prepare_only and (not args.prepare_pangwes or args.prefit_only):
+        raise ValueError("--prepare-only requires --prepare-pangwes and cannot be combined with --prefit-only")
+    if (args.local_graph_paths and not args.paths) or (args.graph_path_rebase and not args.local_graph_paths):
+        raise ValueError("Graph localization requires --paths and --local-graph-paths")
 
 
 def identity(args):
     # Execution resources can change on resume; statistical settings cannot.
     omitted = {"threads", "memory_gb", "out", "tmp_dir", "resume", "reuse_nulls_from", "require_cached_nulls",
+               "resume_if_present", "prepare_pangwes", "prepare_only", "local_graph_paths", "graph_path_rebase",
                "unitig_distance", "unitigs", "paths", "edges", "kmer_length", "distal_bp", "no_beta", "distance_batch_size", "batch_size",
                'prefit_nulls','prefit_only','null_cache_format','null_cache_rank','screen_block_size','reuse_prepared_from'}
     if args.coarse_screen=='none' or args.search=='exhaustive': omitted.update(('coarse_screen','screen_pcs','coarse_retain'))
@@ -128,436 +135,100 @@ def identity(args):
     inputs = {k: digest(getattr(args, k)) for k in ("fasta", "tree", "exclude_samples") if getattr(args, k)}
     code = {name: digest(Path(__file__).with_name(name)) for name in
             ("discovery.py", "discovery_store.py", "discovery_score.py", "discovery_execution.py", "memory_budget.py",
-             "discovery_eligibility.py", "discovery_nulls.py", "coarse_screen.py", "null_identity.py", "glmm.py", "kinship.py", "tree_null.py")}
-    from .null_identity import null_source_hash
+             "discovery_search.py", "discovery_nulls.py", "coarse_screen.py", "null_identity.py", "glmm.py", "kinship.py", "tree_null.py")}
     return dict(version=__version__, execution_revision=__discovery_revision__,inputs=inputs, settings=settings, code=code,
                 numpy=np.__version__, scipy=scipy.__version__,null_model_source_sha256=null_source_hash())
 
 
-def schema(db):
-    db.executescript("""
-    CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY,parent INTEGER,level INTEGER,
-      anchor INTEGER,size INTEGER DEFAULT 0,ready INTEGER DEFAULT 0);
-    CREATE INDEX IF NOT EXISTS node_parent ON nodes(parent,id);
-    CREATE TABLE IF NOT EXISTS members(node INTEGER,pid INTEGER,PRIMARY KEY(node,pid)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS assigned(parent INTEGER,pid INTEGER,child INTEGER,PRIMARY KEY(parent,pid)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS reps(node INTEGER,pid INTEGER,PRIMARY KEY(node,pid)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS tasks(a INTEGER,b INTEGER,done INTEGER DEFAULT 0,PRIMARY KEY(a,b)) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS pending_tasks ON tasks(done,a,b);
-    CREATE TABLE IF NOT EXISTS block_eligibility(node INTEGER,min_cell INTEGER,center INTEGER,
-      radius INTEGER,eligible_members INTEGER,PRIMARY KEY(node,min_cell)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS decisions(u INTEGER,v INTEGER,gate INTEGER,final INTEGER,
-      t_low REAL,t_high REAL,p REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS discovery_hits ON decisions(final,u,v);
-    CREATE TABLE IF NOT EXISTS external_nulls(pid INTEGER PRIMARY KEY,path TEXT);
-    CREATE TABLE IF NOT EXISTS null_aliases(pid INTEGER PRIMARY KEY,canonical INTEGER);
-    CREATE TABLE IF NOT EXISTS null_inventory(pid INTEGER PRIMARY KEY,status TEXT,mode TEXT,
-      fit_seconds REAL,source TEXT,local INTEGER,signature TEXT);
-    CREATE TABLE IF NOT EXISTS beta(u INTEGER,v INTEGER,value REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
-    CREATE TABLE IF NOT EXISTS distance(u INTEGER,v INTEGER,pu INTEGER,pv INTEGER,
-      distance REAL,connected INTEGER,status TEXT DEFAULT 'PENDING',PRIMARY KEY(u,v)) WITHOUT ROWID;
-    CREATE INDEX IF NOT EXISTS distance_pending ON distance(status,u,v);
-    CREATE INDEX IF NOT EXISTS distance_pattern ON distance(pu,pv,distance);
-    """)
-
-
-def get_meta(db, key, default=None):
-    row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-    return json.loads(row[0]) if row else default
-
-
-def set_meta(db, key, value):
-    db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, json.dumps(value, allow_nan=False)))
-
-
-def partition(db, node, threshold, pool, args, n):
-    """Greedy fixed-anchor star partition. Every membership passes directly.
-
-    Assignments are persisted as each bounded batch completes. A representative
-    can be resumed without repeating assignments from an interrupted pass.
-    """
-    last_log=time.monotonic()
-    while True:
-        active = get_meta(db, f"partition:{node}")
-        lower_seed = get_meta(db,f"partition_next:{node}",0)
-        row = db.execute("SELECT m.pid FROM members m LEFT JOIN assigned a ON a.parent=m.node AND a.pid=m.pid "
-                         "WHERE m.node=? AND m.pid>=? AND a.pid IS NULL ORDER BY m.pid LIMIT 1", (node,lower_seed)).fetchone()
-        if row is None and active is None:
-            break
-        representative = active[0] if active else row[0]
-        # Recover an unfinished representative pass after an interruption.
-        child = db.execute("SELECT id FROM nodes WHERE parent=? AND anchor=?", (node, representative)).fetchone()
-        if child:
-            child = child[0]
-        else:
-            level = db.execute("SELECT level FROM nodes WHERE id=?", (node,)).fetchone()[0]+1
-            with db:
-                child = db.execute("INSERT INTO nodes(parent,level,anchor) VALUES (?,?,?)", (node, level, representative)).lastrowid
-        with db:
-            set_meta(db, f"partition:{node}", [representative,child])
-        k = db.execute("SELECT present FROM patterns WHERE id=?",(representative,)).fetchone()[0]
-        # Necessary positive-phi margin bounds: impossible membership is never
-        # sent to a worker. This is exact, unlike representative hit pruning.
-        lo = max(1,math.ceil(n*threshold*k/(n-k+threshold*k)-1e-10))
-        hi = min(n-1,math.floor(n*k/(threshold*(n-k)+k)+1e-10))
-        cursor = db.execute("SELECT m.pid FROM patterns p JOIN members m ON m.pid=p.id "
-                            "LEFT JOIN assigned a ON a.parent=m.node AND a.pid=m.pid "
-                            "WHERE m.node=? AND a.pid IS NULL AND p.present BETWEEN ? AND ? ORDER BY m.pid", (node,lo,hi))
-        jobs = ((representative, [r[0] for r in batch], threshold) for batch in batches(cursor, args.batch_size))
-        for matches in bounded_map(pool, kernels.similarity, jobs, args.threads):
-            with db:
-                db.executemany("INSERT OR IGNORE INTO assigned VALUES (?,?,?)", ((node, p, child) for p in matches))
-            if time.monotonic()-last_log>25:
-                print(f"[KOVAR] category node={node}; representative={representative}; assigning batches",flush=True)
-                last_log=time.monotonic()
-        with db:
-            db.execute("INSERT OR IGNORE INTO members SELECT child,pid FROM assigned WHERE parent=? AND child=?", (node, child))
-            db.execute("UPDATE nodes SET size=(SELECT count(*) FROM members WHERE node=?) WHERE id=?", (child, child))
-            db.execute("DELETE FROM meta WHERE key=?", (f"partition:{node}",))
-            set_meta(db,f"partition_next:{node}",representative+1)
-        # Progress once per representative, also visible for very large pools.
-        if child % 100 == 0:
-            print(f"[KOVAR] categories: node={node}; latest child={child}", flush=True)
-    with db:
-        db.execute("UPDATE nodes SET ready=1 WHERE id=?", (node,))
-
-
-def make_hierarchy(db, info, pool, args):
-    if get_meta(db, "hierarchy_complete"):
+def prefit(db, work, info, args, settings):
+    # Inputs, cohort, null-fitting source and numerical environment were already
+    # verified by the run identity. Only cache representation can change here.
+    signature=json.dumps([args.null_cache_format,args.null_cache_rank,info['patterns']],separators=(',',':'))
+    aliases=nulls.aliases_for_pool(db,work,info,reuse_complements=args.prefit_nulls=='all')
+    if args.prefit_nulls!='all':
         return
-    with db:
-        db.execute("INSERT OR IGNORE INTO nodes(id,parent,level,anchor,size) VALUES (0,NULL,-1,0,?)", (info["patterns"],))
-        db.execute("INSERT OR IGNORE INTO members SELECT 0,id FROM patterns")
-    thresholds = [args.coarse_r2]+args.refine_r2
-    while True:
-        row = db.execute("SELECT id,level,size FROM nodes WHERE ready=0 ORDER BY id LIMIT 1").fetchone()
-        if row is None:
-            break
-        node, level, size = row
-        if node and size <= args.leaf_size:
-            with db:
-                db.execute("UPDATE nodes SET ready=1 WHERE id=?", (node,))
-        elif level+1 < len(thresholds):
-            partition(db, node, thresholds[level+1], pool, args,info["n"])
-        else:
-            # Final chunks are computational leaves, not biological categories.
-            with db:
-                for batch in batches(db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid", (node,)), args.leaf_size):
-                    child = db.execute("INSERT INTO nodes(parent,level,anchor,size,ready) VALUES (?,?,?,?,1)",
-                                       (node, level+1, batch[0][0], len(batch))).lastrowid
-                    db.executemany("INSERT INTO members VALUES (?,?)", ((child, p[0]) for p in batch))
-                db.execute("UPDATE nodes SET ready=1 WHERE id=?", (node,))
-    # Mean correlation to all members equals a dot product with their summed
-    # standardized vectors. A central observed representative therefore costs
-    # O(n*members), not a dense members-by-members correlation matrix.
-    for node, anchor, size in db.execute("SELECT id,anchor,size FROM nodes WHERE id>0 ORDER BY id"):
-        width = 1 if args.rep_policy == "single" else max(1, min(math.ceil(size*.01), args.max_reps))
-        selected = [r[0] for r in db.execute("SELECT pid FROM reps WHERE node=? ORDER BY pid", (node,))]
-        if not selected and size==1:
-            with db:
-                db.execute("INSERT INTO reps VALUES (?,?)",(node,anchor))
-            continue
-        if not selected:
-            total=np.zeros(info["n"])
-            jobs=([r[0] for r in batch] for batch in batches(db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid",(node,)),args.batch_size))
-            for vector in bounded_map(pool,kernels.standardized_sum,jobs,args.threads):
-                total+=vector
-            jobs=(([r[0] for r in batch],total) for batch in batches(db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid",(node,)),args.batch_size))
-            _,representative=min(bounded_map(pool,kernels.central,jobs,args.threads))
-            selected=[representative]
-            with db:
-                db.execute("INSERT INTO reps VALUES (?,?)",(node,representative))
-        while len(selected) < width:
-            cursor = db.execute("SELECT pid FROM members WHERE node=? ORDER BY pid", (node,))
-            jobs = (([r[0] for r in batch], selected) for batch in batches(cursor, args.batch_size))
-            pick = min(bounded_map(pool, kernels.farthest, jobs, args.threads))
-            if pick[1] < 0:
-                break
-            selected.append(pick[1])
-            with db:
-                db.execute("INSERT INTO reps VALUES (?,?)", (node, pick[1]))
-    with db:
-        set_meta(db, "hierarchy_complete", True)
-
-
-def merge_metrics(target, values):
-    for key,value in values.items():
-        target[key]=max(target.get(key,0),value) if key=="cache_peak_bytes_worker" else target.get(key,0)+value
-
-
-def evaluate(db, pairs, pool, args, screening=False, *, return_mapping=False):
-    """Bulk-read decisions, coalesce responses, and commit bounded result blocks."""
-    started=time.perf_counter()
-    requested=sorted({tuple(sorted((int(u),int(v)))) for u,v in pairs if u!=v},key=lambda pair:(pair[1],pair[0]))
-    if not requested:
-        return {} if return_mapping else []
-    known,missing,new_pairs={},[],set()
-    read_started=time.perf_counter()
-    for block in batches(requested,400):
-        values=','.join(['(?,?)']*len(block))
-        query=(f'WITH requested(u,v) AS (VALUES {values}) '
-               'SELECT r.u,r.v,d.gate,d.final,d.status FROM requested r '
-               'LEFT JOIN decisions d ON d.u=r.u AND d.v=r.v')
-        rows={(u,v):(gate,final,status) for u,v,gate,final,status in db.execute(query,[x for pair in block for x in pair])}
-        for pair in block:
-            gate,final,status=rows[pair]
-            if status is None or screening and status=="INELIGIBLE_NOT_SCREENED":
-                missing.append(pair)
-                if status is None:
-                    new_pairs.add(pair)
-            else:
-                known[pair]=(gate,final)
-    external={}
-    responses=sorted({v for _,v in missing})
-    for block in batches(responses if getattr(args,'_has_external_nulls',True) else [],400):
-        marks=','.join('?' for _ in block)
-        external.update(db.execute(f'SELECT pid,path FROM external_nulls WHERE pid IN ({marks})',block))
-        external.update(db.execute(f'SELECT a.pid,e.path FROM null_aliases a JOIN external_nulls e '
-                                   f'ON e.pid=a.canonical WHERE a.pid IN ({marks})',block))
-    totals=dict(driver_db_read_seconds=time.perf_counter()-read_started)
-    pending=[]
-    models=[]
-    def flush():
-        if not pending:
-            return
-        write_started=time.perf_counter()
-        with db:
-            count=get_meta(db,"queried_pairs_count")
-            if count is None:
-                count=db.execute('SELECT count(*) FROM decisions').fetchone()[0]
-            db.executemany('INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?,?,?,?)',pending)
-            count+=sum((row[0],row[1]) in new_pairs for row in pending)
-            set_meta(db,"queried_pairs_count",count)
-            nulls.record_models(db,models)
-        models.clear()
-        pending.clear()
-        merge_metrics(totals,dict(driver_db_write_seconds=time.perf_counter()-write_started))
-    def jobs():
-        for response,group in itertools.groupby(missing,key=lambda pair:pair[1]):
-            yield response,[pair[0] for pair in group],external.get(response),screening
-    states={}
-    for payload in bounded_map(pool,kernels.score_profiled,jobs(),args.threads,ordered=False):
-        result=payload['rows']
-        models.extend(payload.get('inventory',[]))
-        merge_metrics(totals,payload['metrics'])
-        if payload.get('worker_state'):
-            states[str(payload['worker_state']['pid'])]=payload['worker_state']
-        pending.extend(result)
-        known.update(((row[0],row[1]),(row[2],row[3])) for row in result)
-        if len(pending)>=4096:
-            flush()
-    flush()
-    merge_metrics(totals,dict(coordinator_batch_wall_seconds=time.perf_counter()-started))
-    with db:
-        saved=get_meta(db,'runtime_totals',{})
-        merge_metrics(saved,totals)
-        set_meta(db,'runtime_totals',saved)
-        if states:
-            current=get_meta(db,'worker_state',{})
-            current.update(states)
-            set_meta(db,'worker_state',current)
-    return known if return_mapping else [known[pair] for pair in requested]
-
-
-class NodeCache:
-    def __init__(self,db,limit):
-        self.db,self.cache=db,ByteLRU(limit)
-
-    def get(self,node):
-        if node in self.cache:
-            return self.cache.get(node)
-        size=self.db.execute('SELECT size FROM nodes WHERE id=?',(node,)).fetchone()[0]
-        children=tuple(r[0] for r in self.db.execute('SELECT id FROM nodes WHERE parent=? ORDER BY id',(node,)))
-        reps=tuple(r[0] for r in self.db.execute('SELECT pid FROM reps WHERE node=? ORDER BY pid',(node,)))
-        members=() if children else tuple(r[0] for r in self.db.execute('SELECT pid FROM members WHERE node=? ORDER BY pid',(node,)))
-        value=(size,children,reps,members)
-        self.cache.put(node,value,256+40*(len(children)+len(reps)+len(members)))
-        return value
-
-
-def coarse_tasks(db, roots, ordered, capacity, old_position=None, workers=1):
-    """Bounded concurrent response columns, excluding a frozen legacy prefix.
-
-    Several response columns advance together to occupy the worker pool. Each
-    column retains its null across batches; no dense root-pair matrix exists.
-    Old queued/completed tasks and their row-prefix remain untouched.
-    """
-    n=len(roots)
-    legacy=get_meta(db,'legacy_root_stop')
-    if legacy is None:
-        legacy=get_meta(db,'root_cursor',[0,1])
-        i,j=legacy
-        with db:
-            set_meta(db,'legacy_root_stop',legacy)
-            set_meta(db,'coarse_scheduled_count',i*(2*n-i-1)//2+j-i-1 if n>1 else 0)
-    active=get_meta(db,'response_coarse_columns',[])
-    next_right=get_meta(db,'response_coarse_next',1)
-    if next_right>=n and not active: return [],True
-    if old_position is None: old_position={node:i for i,node in enumerate(roots)}
-    fresh=[]
-    scanned=0
-    quantum=max(1,min(256,capacity//max(1,workers)))
-    while len(fresh)<capacity and scanned<max(4096,capacity*8):
-        while len(active)<workers and next_right<n:
-            active.append([next_right,0]);next_right+=1
-        if not active: break
-        right,left=active.pop(0)
-        accepted=0
-        while left<right and accepted<quantum and len(fresh)<capacity and scanned<max(4096,capacity*8):
-            a,b=ordered[left],ordered[right]
-            i,j=sorted((old_position[a],old_position[b]))
-            if not (i<legacy[0] or (i==legacy[0] and j<legacy[1])):
-                fresh.append(tuple(sorted((a,b))))
-                accepted+=1
-            left+=1;scanned+=1
-        if left<right: active.append([right,left])
-    with db:
-        db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',fresh)
-        set_meta(db,'response_coarse_columns',active)
-        set_meta(db,'response_coarse_next',next_right)
-        set_meta(db,'coarse_scheduled_count',get_meta(db,'coarse_scheduled_count',0)+len(fresh))
-    return fresh,next_right>=n and not active
-
-
-def search(db, info, pool, args):
-    if get_meta(db,'search_complete'):
+    if get_meta(db,'null_prefit_complete')==signature:
+        if not (args.out/'null_stage_summary.json').exists():
+            atomic_json(args.out/'null_stage_summary.json',get_meta(db,'null_stage_summary'))
+        print('[KOVAR] reusing completed null stage; numerical caches verified on first use',flush=True)
         return
-    started,last=time.monotonic(),0.
-    plan=getattr(args,'_plan',{})
-    buffer_limit=plan.get('query_buffer_pairs',8192)
-    frontier=plan.get('frontier_tasks',max(128,args.threads*64))
-    nodes=NodeCache(db,min(64*MIB,max(MIB,int(args.memory_gb*(1<<30)*.03))))
-    eligibility=None
-    screen_info=get_meta(db,'coarse_screen_summary')
-    if args.search=='hierarchy' and getattr(args,'min_cell_count',0)>0:
-        from .discovery_eligibility import Eligibility
-        eligibility=Eligibility(db,pool,args,info)
-    def progress():
-        nonlocal last
-        if time.monotonic()-last<25:
-            return
-        count=get_meta(db,'queried_pairs_count',0)
-        runtime=get_meta(db,'runtime_totals',{})
-        hierarchy=get_meta(db,'hierarchy_metrics',{})
-        print(f"[KOVAR] search: {count:,} queried pattern pairs; {time.monotonic()-started:.0f}s this invocation; "
-              f"new_nulls={runtime.get('new_null_fits',0):,}; cache_hits={runtime.get('null_cache_hits',0):,}; "
-              f"disk_loads={runtime.get('null_cache_disk_loads',0):,}; "
-              f"ineligible_blocks={hierarchy.get('eligibility_pruned_internal_blocks',0)+hierarchy.get('eligibility_pruned_cross_blocks',0):,}; "
-              f"proxy_pruned_blocks={hierarchy.get('representative_pruned_blocks',0):,}; "
-              f"bounded_pairs={runtime.get('bound_decided_pairs',0):,}; exact_pairs={runtime.get('exact_pairs',0):,}"
-              +(f"; coarse_opened={get_meta(db,'coarse_scheduled_count',0):,}/{screen_info['selected_pairs']:,}" if screen_info else ''),flush=True)
+    started=time.monotonic()
+    summary={'stage':'null_fitting','response_patterns':info['patterns'],'completed':0}
+    with db:
+        set_meta(db,'active_stage','null_fitting')
+    def run():
+        pending=[]
+        totals={}
+        states={}
+        completed=0
         last=time.monotonic()
-    if args.search=='exhaustive':
-        response,offset=get_meta(db,'exhaustive_cursor',[1,0])
-        while response<info['patterns']:
-            query=[]
-            while response<info['patterns'] and len(query)<buffer_limit:
-                stop=min(response,offset+buffer_limit-len(query))
-                query.extend((u,response) for u in range(offset,stop))
-                offset=stop
-                if offset>=response:
-                    response,offset=response+1,0
-            evaluate(db,query,pool,args)
+        query=('SELECT a.pid,e.path FROM null_aliases a '
+               'LEFT JOIN external_nulls e ON e.pid=a.pid '
+               'LEFT JOIN null_inventory i ON i.pid=a.pid '
+               'WHERE a.pid=a.canonical AND (i.signature IS NULL OR i.signature!=?)')
+        count=db.execute('SELECT count(*) FROM ('+query+')',(signature,)).fetchone()[0]
+        if not count:
+            return
+        def flush():
+            if not pending: return
             with db:
-                set_meta(db,'exhaustive_cursor',[response,offset])
-            progress()
-    else:
-        if not get_meta(db,'search_initialized'):
-            with db:
-                # Singleton internal blocks contain no pair to test.
-                db.execute('INSERT OR IGNORE INTO tasks SELECT id,id,0 FROM nodes WHERE parent=0 AND size>1')
-                set_meta(db,'root_cursor',[0,1])
-                set_meta(db,'search_initialized',True)
-        roots=[row[0] for row in db.execute('SELECT id FROM nodes WHERE parent=0 ORDER BY id')]
-        ordered=[row[0] for row in db.execute('SELECT n.id FROM nodes n JOIN reps r ON r.node=n.id '
-                                             'WHERE n.parent=0 GROUP BY n.id ORDER BY max(r.pid),n.id')]
-        old_position={node:i for i,node in enumerate(roots)}
-        filtered=getattr(args,'coarse_screen','none')=='pc'
-        arrays=coarse_screen.open_candidates(Path(args.tmp_dir) if args.tmp_dir else args.out/'.kovar_work',
-            get_meta(db,'coarse_screen_summary')['selected_pairs']) if filtered else None
-        while True:
-            # Reserve at least 3/4 of each frontier for queued refinements and
-            # at most 1/4 for fresh coarse comparisons. Neither waits for the
-            # other queue to finish. Scheduling/cursor updates are atomic.
-            quota=max(1,frontier//4)
-            tasks=db.execute('SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT ?',
-                             (max(1,frontier-quota),)).fetchall()
-            if filtered:
-                fresh,coarse_done=coarse_screen.candidate_tasks(db,arrays,frontier-len(tasks),get_meta,set_meta,args.threads)
-            else:
-                fresh,coarse_done=coarse_tasks(db,roots,ordered,frontier-len(tasks),old_position,args.threads)
-            tasks.extend(fresh)
-            if not tasks:
-                if coarse_done: break
-                progress()
-                continue
-            summaries=eligibility.summaries(tasks) if eligibility else {}
-            pruned={(a,b) for a,b in tasks if eligibility and eligibility.impossible(a,b,summaries)}
-            def gate_pairs():
-                for a,b in tasks:
-                    if a!=b and (a,b) not in pruned:
-                        yield from itertools.product(nodes.get(a)[2],nodes.get(b)[2])
-            gates={}
-            for block in batches(gate_pairs(),buffer_limit):
-                gates.update(evaluate(db,block,pool,args,screening=True,return_mapping=True))
-            leaf_queries,leaf_done,transitions=[],[],[]
-            metrics={}
-            def finish_leaves():
-                if leaf_queries:
-                    evaluate(db,leaf_queries,pool,args)
-                if leaf_done:
-                    with db:
-                        db.executemany('UPDATE tasks SET done=1 WHERE a=? AND b=?',leaf_done)
-                leaf_queries.clear()
-                leaf_done.clear()
-            for a,b in tasks:
-                if (a,b) in pruned:
-                    key='eligibility_pruned_internal_blocks' if a==b else 'eligibility_pruned_cross_blocks'
-                    metrics[key]=metrics.get(key,0)+1
-                    transitions.append((a,b,()))
-                    continue
-                sa,ca,ra,ma=nodes.get(a)
-                sb,cb,rb,mb=nodes.get(b)
-                expand=a==b or any(gates[tuple(sorted(pair))][0]!=-1 for pair in itertools.product(ra,rb))
-                if not expand:
-                    metrics['representative_pruned_blocks']=metrics.get('representative_pruned_blocks',0)+1
-                children=()
-                if expand and not ca and not cb:
-                    # Coalesce terminal work across blocks before scheduling it
-                    # by response. The buffer remains bounded independently of
-                    # the number of categories or total genomic pair count.
-                    pairs=itertools.combinations(ma,2) if a==b else itertools.product(ma,mb)
-                    for block in batches(pairs,buffer_limit):
-                        if len(leaf_queries)+len(block)>buffer_limit:
-                            finish_leaves()
-                        leaf_queries.extend(block)
-                        if len(leaf_queries)>=buffer_limit:
-                            evaluate(db,leaf_queries,pool,args)
-                            leaf_queries.clear()
-                    leaf_done.append((a,b))
-                    continue
-                if expand:
-                    if a==b:
-                        children=itertools.combinations_with_replacement(ca,2)
-                    elif ca and (not cb or sa>=sb):
-                        children=itertools.product(ca,(b,))
-                    else:
-                        children=itertools.product((a,),cb)
-                transitions.append((a,b,children))
-            finish_leaves()
-            # Preserve atomic child scheduling/task completion while avoiding
-            # one FULL-synchronous transaction for every tiny traversal block.
-            with db:
-                for a,b,children in transitions:
-                    db.executemany('INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)',(tuple(sorted(pair)) for pair in children))
-                    db.execute('UPDATE tasks SET done=1 WHERE a=? AND b=?',(a,b))
-                saved=get_meta(db,'hierarchy_metrics',{})
-                merge_metrics(saved,metrics)
-                set_meta(db,'hierarchy_metrics',saved)
-            progress()
+                nulls.record_models(db,pending,signature)
+                saved=get_meta(db,'prefit_runtime_totals',{})
+                merge_metrics(saved,totals)
+                set_meta(db,'prefit_runtime_totals',saved)
+                set_meta(db,'worker_state',states)
+                set_meta(db,'null_stage_progress',dict(checked=completed,total=count,
+                         seconds=time.monotonic()-started))
+            pending.clear();totals.clear()
+        def jobs():
+            # One streaming join replaces one path lookup per pattern. Keep a
+            # stable reader while the coordinator commits completed inventory.
+            path=db.execute('PRAGMA database_list').fetchone()[2]
+            reader=sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True)
+            try:
+                reader.execute('BEGIN')
+                for pid,external in reader.execute(query,(signature,)):
+                    yield pid,external
+            finally:
+                reader.close()
+        with process_pool(args.threads, kernels.initialize, (str(work), info, settings)) as pool:
+            for payload in bounded_map(pool,kernels.prefit_profiled,jobs(),args.threads,ordered=False):
+                completed+=1
+                pending.append(payload)
+                merge_metrics(totals,payload['metrics'])
+                states[str(payload['worker_state']['pid'])]=payload['worker_state']
+                if len(pending)>=256 or time.monotonic()-last>25:
+                    flush()
+                    print(f'[KOVAR] null fitting: {completed:,}/{count:,} unfinished canonical patterns checked; '
+                          f'{time.monotonic()-started:.0f}s this stage',flush=True)
+                    last=time.monotonic()
+            flush()
+    run()
+    # A failed canonical fit must not suppress a potentially successful native
+    # complement fit. Restore its own response and fit it independently once.
+    failures={pid for pid,status in db.execute('SELECT pid,status FROM null_inventory') if status!='OK'}
+    retry=[pid for pid,canonical in enumerate(aliases) if pid!=canonical and int(canonical) in failures]
+    if retry:
+        aliases=np.array(aliases,copy=True)
+        for pid in retry: aliases[pid]=pid
+        with db:
+            db.execute("DELETE FROM meta WHERE key='null_aliases_published'")
+            db.executemany('UPDATE null_aliases SET canonical=pid WHERE pid=?',((p,) for p in retry))
+        nulls.publish_aliases(db,work,aliases)
+        run()
+    counts=dict(db.execute('SELECT status,count(*) FROM null_inventory GROUP BY status'))
+    modes=dict(db.execute('SELECT mode,count(*) FROM null_inventory GROUP BY mode'))
+    summary.update(stage='null_fitting_complete',completed=sum(counts.values()),
+        canonical_models=int(np.count_nonzero(aliases==np.arange(len(aliases)))),
+        complement_aliases=int(np.count_nonzero(aliases!=np.arange(len(aliases)))),
+        statuses=counts,cache_modes=modes,seconds_this_invocation=time.monotonic()-started)
     with db:
-        set_meta(db,'search_complete',True)
+        set_meta(db,'null_stage_summary',summary)
+        set_meta(db,'null_prefit_complete',signature)
+        set_meta(db,'null_inventory_seeded',True)
+    atomic_json(args.out/'null_stage_summary.json',summary)
+    print(f"[KOVAR] null stage complete: {summary['completed']:,} models; "
+          f"{summary['complement_aliases']:,} complement aliases; statuses={counts}",flush=True)
 
 
 def import_nulls(db, work, info, args, *, current_identity=None):
@@ -827,12 +498,27 @@ def export(db, info, work, args, total_seconds):
 def main(argv=None):
     args = parser().parse_args(argv)
     validate(args)
+    args.out = args.out.resolve()
+    work = args.tmp_dir.resolve() if args.tmp_dir else args.out / ".kovar_work"
+    if args.prepare_pangwes:
+        assembly_list, gfa, metadata, fasta, tree = (p.resolve() for p in args.prepare_pangwes)
+        prepare_pangwes(args.fasta.resolve(), args.tree.resolve(), assembly_list, gfa, metadata,
+                        fasta, tree, args.exclude_samples.resolve() if args.exclude_samples else None,
+                        args.tree_missing_samples, work)
+        args.fasta, args.tree = fasta, tree
+    if args.local_graph_paths:
+        paths = args.local_graph_paths.resolve()
+        inputs = (args.fasta.resolve(), args.tree.resolve(), args.paths.resolve())
+        if paths in inputs:
+            raise ValueError("Local graph path list must differ from the input paths")
+        localize_graph_paths(args.paths.resolve(), paths, args.graph_path_rebase)
+        args.paths = paths
+    if args.prepare_only:
+        return 0
     started = time.monotonic()
     args._memory_info=detect_budget(args.memory_gb,args.threads)
     args.memory_gb=args._memory_info['working_gb']
-    args.out = args.out.resolve()
     args.out.mkdir(parents=True,exist_ok=True)
-    work = args.tmp_dir.resolve() if args.tmp_dir else args.out/".kovar_work"
     output_identity=args.out/"run_identity.json"
     if output_identity.exists():
         existing=json.loads(output_identity.read_text())
@@ -853,10 +539,12 @@ def main(argv=None):
         expected = identity(args)
         manifest = work/"run_identity.json"
         if manifest.exists():
-            if not args.resume:
+            if not (args.resume or args.resume_if_present):
                 raise ValueError("Existing work requires --resume")
-            from .null_identity import migrate_identity
-            migrate_identity(json.loads(manifest.read_text()),expected,manifest)
+            if check_identity(json.loads(manifest.read_text()), expected):
+                atomic_json(manifest, expected)
+            if args.resume_if_present and not args.resume:
+                print(f"[KOVAR] resuming checkpoint: {work}", flush=True)
         else:
             atomic_json(manifest,expected)
         atomic_json(args.out/"run_identity.json",dict(expected,work_directory=str(work)))
@@ -919,7 +607,7 @@ def main(argv=None):
                   f"{info['patterns']*estimate/(1<<30):.1f} GiB; "
                   "pair checkpoints and expanded unitig results require additional disk space",flush=True)
             if not get_meta(db,'search_complete') or args.prefit_only:
-                nulls.prefit(db,work,info,args,settings,get_meta,set_meta,merge_metrics)
+                prefit(db, work, info, args, settings)
                 if args.prefit_only:
                     return 0
             if args.prefit_nulls=='all':
@@ -927,11 +615,12 @@ def main(argv=None):
             with db:
                 set_meta(db,'worker_state',{})
                 set_meta(db,'active_stage','pair_search')
-            with ResponsePool(args.threads,kernels.initialize,(str(work),info,settings)) as pool:
+            with ResponsePool(args.threads, kernels.initialize, (str(work), info, settings),
+                              canonical_responses=nulls.open_aliases(work)) as pool:
                 if args.search=="hierarchy":
                     make_hierarchy(db,info,pool,args)
                     if args.coarse_screen=='pc':
-                        coarse_screen.prepare_screen(db,work,info,args,get_meta,set_meta)
+                        coarse_screen.prepare_screen(db, work, info, args)
                         with db: set_meta(db,'active_stage','pair_search')
                 search(db,info,pool,args)
             # Release every score-worker cache before the external graph tool

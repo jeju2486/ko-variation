@@ -9,7 +9,8 @@ from unittest.mock import patch
 import numpy as np
 
 from ko_variation import coarse_screen as screen
-from ko_variation.discovery import schema,get_meta,set_meta,main
+from ko_variation.discovery import main
+from ko_variation.discovery_store import schema, get_meta, set_meta
 from ko_variation.discovery_store import connect
 from tests import test_discovery as fixtures
 
@@ -59,15 +60,15 @@ class CoarseScreenTests(unittest.TestCase):
                         stopped=True;raise RuntimeError('interrupted stage')
                 with patch('ko_variation.coarse_screen.atomic_json',side_effect=interrupt):
                     with self.assertRaisesRegex(RuntimeError,'interrupted stage'):
-                        screen.prepare_screen(db,work,info,args,get_meta,set_meta)
-                result=screen.prepare_screen(db,work,info,args,get_meta,set_meta)
+                        screen.prepare_screen(db,work,info,args)
+                result=screen.prepare_screen(db,work,info,args)
                 pairs=np.fromfile(work/'coarse_screen'/'candidates.u32',dtype='<u4').reshape(-1,2)
                 self.assertEqual({tuple(map(int,p)) for p in pairs},expected)
                 self.assertEqual(result['selected_pairs'],len(expected));self.assertIn((0,1),expected)
                 self.assertFalse((work/'coarse_screen'/'scores.f32').exists())
                 arrays=screen.open_candidates(work,len(expected));seen=[]
                 while True:
-                    tasks,done=screen.candidate_tasks(db,arrays,4,get_meta,set_meta,workers=3)
+                    tasks,done=screen.candidate_tasks(db,arrays,4,workers=3)
                     if not seen:
                         self.assertGreater(len({b for _,b in tasks}),1)
                         del arrays;arrays=screen.open_candidates(work,len(expected))
@@ -79,7 +80,7 @@ class CoarseScreenTests(unittest.TestCase):
     def test_undefined_residuals_are_rescued(self):
         with tempfile.TemporaryDirectory() as temporary:
             folder=Path(temporary);work,db,info,args,expected=self.fixture(folder,force=True)
-            result=screen.prepare_screen(db,work,info,args,get_meta,set_meta)
+            result=screen.prepare_screen(db,work,info,args)
             pairs=np.fromfile(work/'coarse_screen'/'candidates.u32',dtype='<u4').reshape(-1,2)
             self.assertEqual({tuple(map(int,p)) for p in pairs},expected)
             self.assertGreaterEqual(result['undefined_representatives'],2)

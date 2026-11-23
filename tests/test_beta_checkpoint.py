@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from ko_variation.discovery import distance_and_beta, identity, parser, schema, set_meta
 from ko_variation.discovery_store import connect
-from ko_variation.null_identity import migrate_identity
+from ko_variation.null_identity import check_identity
 
 
 class BetaCheckpointTests(unittest.TestCase):
@@ -140,13 +140,11 @@ class BetaCheckpointTests(unittest.TestCase):
 
     def test_restart_requires_same_numerical_release(self):
         expected=dict(settings={'alpha':.05},code={'glmm.py':'current'})
-        with tempfile.TemporaryDirectory() as temporary:
-            manifest=Path(temporary)/'identity.json'
-            self.assertFalse(migrate_identity(expected,expected,manifest))
-            with self.assertRaisesRegex(ValueError,'Scientific'):
-                migrate_identity(dict(expected,settings={'alpha':.01}),expected,manifest)
-            with self.assertRaisesRegex(ValueError,'verified'):
-                migrate_identity(dict(expected,code={'glmm.py':'old'}),expected,manifest)
+        self.assertFalse(check_identity(expected,expected))
+        with self.assertRaisesRegex(ValueError,'Scientific'):
+            check_identity(dict(expected,settings={'alpha':.01}),expected)
+        with self.assertRaisesRegex(ValueError,'verified'):
+            check_identity(dict(expected,code={'glmm.py':'old'}),expected)
 
     def test_metadata_release_reuses_identical_numerical_state(self):
         expected=dict(version='0.9.4',settings={'null_backend':'tree'},
@@ -156,18 +154,14 @@ class BetaCheckpointTests(unittest.TestCase):
         previous=copy.deepcopy(expected)
         previous['version']='0.9.3'
         previous['code']['null_identity.py']='old-helper'
-        with tempfile.TemporaryDirectory() as temporary:
-            manifest=Path(temporary)/'run_identity.json'
-            self.assertTrue(migrate_identity(previous,expected,manifest))
-            self.assertEqual(json.loads(manifest.read_text()),expected)
-            for key in ('glmm.py','tree_null.py'):
-                changed=copy.deepcopy(previous);changed['code'][key]='changed'
-                with self.assertRaisesRegex(ValueError,'verified'):
-                    migrate_identity(changed,expected,manifest)
-            changed=dict(previous,null_model_source_sha256='other-fitter')
+        self.assertTrue(check_identity(previous,expected))
+        for key in ('glmm.py','tree_null.py'):
+            changed=copy.deepcopy(previous);changed['code'][key]='changed'
             with self.assertRaisesRegex(ValueError,'verified'):
-                migrate_identity(changed,expected,manifest)
-
+                check_identity(changed,expected)
+        changed=dict(previous,null_model_source_sha256='other-fitter')
+        with self.assertRaisesRegex(ValueError,'verified'):
+            check_identity(changed,expected)
 
 if __name__ == '__main__':
     unittest.main()

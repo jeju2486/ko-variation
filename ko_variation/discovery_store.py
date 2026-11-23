@@ -11,8 +11,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import shutil
+import tempfile
 
 import numpy as np
 
@@ -47,6 +49,43 @@ def connect(path, memory_mb=32):
     return db
 
 
+def schema(db):
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY,parent INTEGER,level INTEGER,
+      anchor INTEGER,size INTEGER DEFAULT 0,ready INTEGER DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS node_parent ON nodes(parent,id);
+    CREATE TABLE IF NOT EXISTS members(node INTEGER,pid INTEGER,PRIMARY KEY(node,pid)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS assigned(parent INTEGER,pid INTEGER,child INTEGER,PRIMARY KEY(parent,pid)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS reps(node INTEGER,pid INTEGER,PRIMARY KEY(node,pid)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS tasks(a INTEGER,b INTEGER,done INTEGER DEFAULT 0,PRIMARY KEY(a,b)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS pending_tasks ON tasks(done,a,b);
+    CREATE TABLE IF NOT EXISTS block_eligibility(node INTEGER,min_cell INTEGER,center INTEGER,
+      radius INTEGER,eligible_members INTEGER,PRIMARY KEY(node,min_cell)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS decisions(u INTEGER,v INTEGER,gate INTEGER,final INTEGER,
+      t_low REAL,t_high REAL,p REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS discovery_hits ON decisions(final,u,v);
+    CREATE TABLE IF NOT EXISTS external_nulls(pid INTEGER PRIMARY KEY,path TEXT);
+    CREATE TABLE IF NOT EXISTS null_aliases(pid INTEGER PRIMARY KEY,canonical INTEGER);
+    CREATE TABLE IF NOT EXISTS null_inventory(pid INTEGER PRIMARY KEY,status TEXT,mode TEXT,
+      fit_seconds REAL,source TEXT,local INTEGER,signature TEXT);
+    CREATE TABLE IF NOT EXISTS beta(u INTEGER,v INTEGER,value REAL,status TEXT,PRIMARY KEY(u,v)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS distance(u INTEGER,v INTEGER,pu INTEGER,pv INTEGER,
+      distance REAL,connected INTEGER,status TEXT DEFAULT 'PENDING',PRIMARY KEY(u,v)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS distance_pending ON distance(status,u,v);
+    CREATE INDEX IF NOT EXISTS distance_pattern ON distance(pu,pv,distance);
+    """)
+
+
+def get_meta(db, key, default=None):
+    row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return json.loads(row[0]) if row else default
+
+
+def set_meta(db, key, value):
+    db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, json.dumps(value, allow_nan=False)))
+
+
 def records(path):
     """Yield unique-ID pseudo-FASTA records, validating A/C strictly."""
     name, chunks = None, []
@@ -72,6 +111,147 @@ def records(path):
                 chunks.append(sequence)
         if name is not None:
             yield name, b"".join(chunks)
+
+
+def prepare_pangwes(raw_fasta, raw_tree, assembly_list, gfa, metadata, fasta,
+                    tree_file, exclude, missing_policy, work):
+    """Validate Cuttlefish row order and publish a sample-labelled FASTA and tree."""
+    if fasta.parent != tree_file.parent or fasta == tree_file:
+        raise ValueError("Prepared FASTA and tree need distinct paths in the same directory")
+    prep = fasta.parent
+    manifest = prep / "preparation.json"
+    mapping = prep / "sample_mapping.tsv"
+    outputs = [fasta, tree_file, mapping]
+    sources = [raw_fasta, assembly_list, gfa, metadata, raw_tree] + ([exclude] if exclude else [])
+    if len(set(outputs + [manifest])) != 4 or set(outputs + [manifest]).intersection(sources):
+        raise ValueError("Prepared inputs must have their own paths")
+
+    def stamp(path):
+        stat = path.stat()
+        return [str(path.resolve()), stat.st_size, stat.st_mtime_ns]
+
+    for source in sources:
+        if not source.is_file() or not source.stat().st_size:
+            raise ValueError(f"Missing or empty upstream input: {source}")
+    identity = dict(sources=[stamp(p) for p in sources], missing_policy=missing_policy,
+                    preparation="cuttlefish-ids-matched-midpoint-v1")
+    prep.mkdir(parents=True, exist_ok=True)
+    lock = sqlite3.connect(prep / ".preparation.lock.sqlite", timeout=0)
+    try:
+        lock.execute("BEGIN EXCLUSIVE")
+        if manifest.exists():
+            old = json.loads(manifest.read_text())
+            if (old["identity"] == identity and all(p.is_file() for p in outputs)
+                    and old["outputs"] == [stamp(p) for p in outputs]):
+                print(f"[prepare] Reusing prepared inputs: {prep}", flush=True)
+                return
+        if (work / "run_identity.json").exists():
+            raise ValueError("Upstream inputs or generated files changed; choose a new output")
+
+        assemblies = [line.strip() for line in assembly_list.read_text().splitlines() if line.strip()]
+        recorded = json.loads(metadata.read_text())["parameters info"]["input"]
+        if isinstance(recorded, str):
+            recorded = [name.strip() for name in recorded.split(",")]
+        if recorded != assemblies:
+            raise ValueError("Cuttlefish JSON input order differs from the assembly list")
+        names = [Path(name).stem for name in assemblies]
+        if not names or len(set(names)) != len(names) or any(re.search(r"\s", name) for name in names):
+            raise ValueError("Assembly filename stems must be unique sample IDs without whitespace")
+
+        references = {}
+        pattern = re.compile(r"Reference:(\d+)_Sequence:")
+        print("[prepare] Reading original GFA sample/reference order", flush=True)
+        with gfa.open() as stream:
+            for line in stream:
+                if line.startswith("P\t"):
+                    match = pattern.search(line.split("\t", 2)[1])
+                    if match is None:
+                        raise ValueError("Unexpected GFA path name; cannot infer sample IDs")
+                    references[int(match[1])] = None
+        if list(references) not in (list(range(len(names))), list(range(1, len(names) + 1))):
+            raise ValueError("GFA references must follow contiguous zero-based or one-based input order")
+
+        try:
+            from Bio import Phylo
+        except ImportError as error:
+            raise ValueError("PAN-GWES input preparation requires Biopython") from error
+        excluded = {line.strip() for line in exclude.read_text().splitlines() if line.strip()} if exclude else set()
+        if excluded - set(names):
+            raise ValueError(f"Excluded sample IDs absent from FASTA: {sorted(excluded - set(names))}")
+        tree = Phylo.read(raw_tree, "newick")
+        tips = [tip.name for tip in tree.get_terminals()]
+        if None in tips or len(set(tips)) != len(tips):
+            raise ValueError("Tree tips must have unique sample IDs")
+        desired = set(names) - excluded
+        missing = sorted(desired - set(tips))
+        if missing and missing_policy == "error":
+            raise ValueError(f"{len(missing)} sample IDs absent from tree, e.g. {missing[:5]}")
+        keep = desired & set(tips)
+        if len(keep) < 4:
+            raise ValueError("At least four retained isolates are required")
+        for tip in list(tree.get_terminals()):
+            if tip.name not in keep:
+                tree.prune(tip)
+        tree.root_at_midpoint()
+
+        with tempfile.TemporaryDirectory(prefix=".prepare-", dir=prep) as temporary:
+            temp_fasta, temp_tree, temp_map = [Path(temporary) / path.name for path in outputs]
+            Phylo.write(tree, temp_tree, "newick", format_branch_length="%0.15g")
+            index = 0
+            print(f"[prepare] Streaming {len(names):,} isolates to sample-ID FASTA", flush=True)
+            with raw_fasta.open() as source, temp_fasta.open("w") as target:
+                for line in source:
+                    if line.startswith(">"):
+                        if index >= len(names):
+                            raise ValueError("More pseudo-FASTA records than GFA sample references")
+                        target.write(f">{names[index]}\n")
+                        index += 1
+                    else:
+                        target.write(line)
+            if index != len(names):
+                raise ValueError(f"FASTA/GFA sample count mismatch: {index} != {len(names)}")
+            with temp_map.open("w", newline="") as stream:
+                writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
+                writer.writerow(["fasta_row_0based", "gfa_reference", "sample_id", "assembly", "retained"])
+                for i, (ref, name, assembly) in enumerate(zip(references, names, assemblies)):
+                    writer.writerow([i, ref, name, assembly, int(name in keep)])
+            for temporary_file, target in zip((temp_fasta, temp_tree, temp_map), outputs):
+                os.replace(temporary_file, target)
+        atomic_json(manifest, dict(identity=identity, outputs=[stamp(p) for p in outputs],
+                    samples=len(names), retained=len(keep), excluded=sorted(excluded),
+                    missing_in_tree=missing, tree_root="midpoint after matching/exclusions",
+                    unitig_columns="unchanged"))
+        print(f"[prepare] Complete: {len(names):,} FASTA rows; {len(keep):,} retained tree tips", flush=True)
+    finally:
+        lock.close()
+
+
+def localize_graph_paths(source, target, rebase):
+    """Resolve copied graph paths with explicit project-prefix mappings."""
+    if source == target:
+        raise ValueError("Local graph path list must differ from the source file")
+    resolved = []
+    for raw in source.read_text().splitlines():
+        if not (raw := raw.strip()):
+            continue
+        path = Path(raw).expanduser()
+        candidates = [Path(root) / raw.rsplit(marker, 1)[1] for marker, root in rebase
+                      if marker and marker in raw]
+        candidates.append(path if path.is_absolute() else source.parent / path)
+        match = next((p.resolve() for p in candidates if p.is_file()), None)
+        if match is None:
+            raise ValueError(f"Copied graph path not found locally: {raw}")
+        resolved.append(str(match))
+    if not resolved:
+        raise ValueError("The graph path list is empty")
+    content = "\n".join(resolved) + "\n"
+    if not target.exists() or target.read_text() != content:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".paths-", dir=target.parent) as temporary:
+            pending = Path(temporary) / target.name
+            pending.write_text(content)
+            os.replace(pending, target)
+    print(f"[prepare] Local graph-path list: {target}; {len(resolved):,} graph files", flush=True)
 
 
 def reuse_prepared(args, db, work, expected):

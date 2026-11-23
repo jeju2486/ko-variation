@@ -11,9 +11,10 @@ from unittest.mock import patch
 
 from ko_variation.memory_budget import (ByteLRU,cgroup_limits,detect_budget,plan_workers,GIB)
 from ko_variation.discovery_execution import bounded_map,ResponsePool
-from ko_variation.null_identity import migrate_identity
+from ko_variation.null_identity import check_identity
 from ko_variation.discovery_store import connect
-from ko_variation.discovery import schema,search,get_meta
+from ko_variation.discovery_search import search
+from ko_variation.discovery_store import schema, get_meta
 from ko_variation import discovery_score as kernels
 from ko_variation.discovery_store import digest
 
@@ -83,10 +84,11 @@ class ResourceTests(unittest.TestCase):
             def submit(self,function,job): return self.index
         pool=object.__new__(ResponsePool)
         pool.workers,pool.next_worker=4,0
+        pool.canonical_responses = None
         pool.executors=[Executor(i) for i in range(4)]
         def score_profiled(job): return job
-        self.assertEqual(pool.submit(score_profiled,(7,[])),3)
-        self.assertEqual(pool.submit(score_profiled,(7,[])),3)
+        self.assertEqual(pool.submit_response(score_profiled,(7,[]),7),3)
+        self.assertEqual(pool.submit_response(score_profiled,(7,[]),7),3)
 
     def test_pressure_shrinks_cache_and_changed_files_are_rehashed(self):
         cache=ByteLRU(100)
@@ -117,16 +119,15 @@ class ResourceTests(unittest.TestCase):
 
     def test_migration_rejects_unknown_code_and_changed_science(self):
         with tempfile.TemporaryDirectory() as temporary:
-            manifest=Path(temporary)/'identity.json'
             old=dict(version='0.9.0',code={'glmm.py':'old'},settings={'alpha':.05,'batch_size':256},
                      inputs={},numpy='x',scipy='y',null_model_source_sha256='fit')
             expected=dict(old,version='0.9.1',code={'new':'code'},settings={'alpha':.05})
             bad=dict(old,settings={'alpha':.01,'batch_size':256})
             with self.assertRaisesRegex(ValueError,'Scientific'):
-                migrate_identity(bad,expected,manifest)
+                check_identity(bad,expected)
             bad=dict(old,settings=expected['settings'],code=dict(old['code'],**{'discovery.py':'unknown'}))
             with self.assertRaisesRegex(ValueError,'verified'):
-                migrate_identity(bad,expected,manifest)
+                check_identity(bad,expected)
 
     def test_recursive_frontier_and_restart_do_not_lose_pairs(self):
         with tempfile.TemporaryDirectory() as temporary:

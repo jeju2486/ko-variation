@@ -15,7 +15,7 @@ import time
 import numpy as np
 from threadpoolctl import threadpool_limits
 
-from .discovery_store import atomic_json, open_patterns
+from .discovery_store import atomic_json, get_meta, open_patterns, set_meta
 
 
 def array_file(path, values):
@@ -78,7 +78,7 @@ def threshold(path, count, keep, threads, chunk, state, save):
     return prefix,state['threshold_ties']
 
 
-def prepare_screen(db, work, info, args, get_meta, set_meta):
+def prepare_screen(db, work, info, args):
     """Bounded RAM and stage checkpoints; no SQLite row per rejected pair."""
     ready=get_meta(db,'coarse_screen_summary')
     directory=work/'coarse_screen';directory.mkdir(exist_ok=True)
@@ -214,7 +214,7 @@ def open_candidates(work, count):
     return roots,pairs,offsets
 
 
-def candidate_tasks(db, arrays, capacity, get_meta, set_meta, workers=1):
+def candidate_tasks(db, arrays, capacity, workers=1):
     roots,pairs,offsets=arrays
     offset=get_meta(db,'pc_coarse_cursor',0)
     total=len(pairs)

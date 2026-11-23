@@ -1,6 +1,12 @@
 """Bounded worker scheduling with response affinity and immediate completion."""
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+import itertools
 import multiprocessing
+
+
+def process_pool(workers, initializer, initargs):
+    return ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                               initializer=initializer, initargs=initargs)
 
 
 class ResponsePool:
@@ -9,27 +15,20 @@ class ResponsePool:
     Independent category/refit jobs are distributed round-robin. Every process
     initializer restricts native libraries to one thread; total CPUs stay bounded.
     """
-    def __init__(self, workers, initializer, initargs):
+    def __init__(self, workers, initializer, initargs, *, canonical_responses=None):
         self.workers = workers
         self.next_worker = 0
-        self.response_aliases=None
-        if initargs:
-            from pathlib import Path
-            import numpy as np
-            path=Path(initargs[0])/'null_canonical.npy'
-            if path.exists(): self.response_aliases=np.load(path,mmap_mode='r')
-        context = multiprocessing.get_context("spawn")
-        self.executors = [ProcessPoolExecutor(max_workers=1, mp_context=context,
-                           initializer=initializer, initargs=initargs) for _ in range(workers)]
+        self.canonical_responses = canonical_responses
+        self.executors = [process_pool(1, initializer, initargs) for _ in range(workers)]
+
+    def submit_response(self, function, job, response):
+        if self.canonical_responses is not None:
+            response = int(self.canonical_responses[response])
+        return self.executors[response % self.workers].submit(function, job)
 
     def submit(self, function, job):
-        if function.__name__ in {"score", "score_profiled"}:
-            mapping=getattr(self,'response_aliases',None)
-            response=int(mapping[job[0]]) if mapping is not None else int(job[0])
-            index = response % self.workers
-        else:
-            index = self.next_worker % self.workers
-            self.next_worker += 1
+        index = self.next_worker % self.workers
+        self.next_worker += 1
         return self.executors[index].submit(function, job)
 
     def __enter__(self):
@@ -40,7 +39,7 @@ class ResponsePool:
             executor.shutdown(wait=True, cancel_futures=kind is not None)
 
 
-def bounded_map(pool, function, jobs, threads, *, ordered=True):
+def bounded_map(pool, function, jobs, threads, *, ordered=True, response_index=None):
     """Bound queued work; scoring consumes completions without head-of-line waits.
 
     Numerical category reductions retain input order for deterministic floating
@@ -48,13 +47,16 @@ def bounded_map(pool, function, jobs, threads, *, ordered=True):
     """
     source, pending, completed = iter(jobs), {}, {}
     submitted = yielded = 0
+    submit_response = getattr(pool, 'submit_response', None) if response_index is not None else None
 
     def submit_one():
         nonlocal submitted
         job = next(source, None)
         if job is None:
             return False
-        pending[pool.submit(function, job)] = submitted
+        future = (submit_response(function, job, job[response_index]) if submit_response else
+                  pool.submit(function, job))
+        pending[future] = submitted
         submitted += 1
         return True
 
@@ -83,3 +85,17 @@ def bounded_map(pool, function, jobs, threads, *, ordered=True):
                 yielded += 1
         while len(pending)+len(completed) < max(1,threads*2) and submit_one():
             pass
+
+
+def batches(values, size):
+    source = iter(values)
+    while True:
+        batch = list(itertools.islice(source, size))
+        if not batch:
+            break
+        yield batch
+
+
+def merge_metrics(target, values):
+    for key,value in values.items():
+        target[key]=max(target.get(key,0),value) if key=="cache_peak_bytes_worker" else target.get(key,0)+value

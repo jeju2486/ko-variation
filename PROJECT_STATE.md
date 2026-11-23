@@ -1,11 +1,18 @@
 # KOVAR: ranked summary of the whole chat
 
-Updated 2026-11-18. Read this instead of replaying the conversation. This covers
+Updated 2026-11-23. Read this instead of replaying the conversation. This covers
 the scientific, computational and operational discussions, not only the solver.
 Historical results apply to their tested cohorts. Verify the current run identity
 before reusing numbers or caches; proposals are distinguished from conclusions.
 
 ## P0 -- release, accepted calculation and immediate next step
+
+- Development discovery layout: `discovery.py` owns stage order and prefit,
+  `discovery_search.py` owns hierarchy and eligibility, and
+  `discovery_store.py` owns input preparation and SQLite metadata.
+  `discovery_nulls.py` stores models without scheduling workers. Both Bash
+  launchers call discovery once. Verified v0.9.4 checkpoints have a specific
+  migration to this layout with unchanged statistical settings.
 
 - MIC development revision: primary censored ridge models now use no tree PCs;
   retain lineage-separated inner/outer CV. Compare blaZ carriage and unitig
@@ -240,7 +247,10 @@ before reusing numbers or caches; proposals are distinguished from conclusions.
    the larger evidence supports changing it.
 4. [ ] Recheck PC40/retention/hierarchy recovery against exact small-panel
    references using the same cohort, eligibility rules and full hypothesis family;
-   quantify missed hits before tightening query budgets.
+   quantify missed hits before tightening query budgets. For the three-day
+   Klebsiella goal, profile a fixed slice, compare 0.5–1% PC40 budgets against
+   10%, then benchmark batching by response, safe block pruning and writes
+   separately. Measure total runtime including distance and beta.
 5. [ ] Run final species-specific configurations with frozen cohort/sample order,
    documented cell and distance cutoffs, durable state and restart checks.
 6. [ ] Revisit missing AMR targets and any GOLD/pyseer differences only from

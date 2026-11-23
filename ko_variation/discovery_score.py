@@ -36,12 +36,11 @@ def initialize(work, info, settings):
                   K=np.load(work/"K.npy", mmap_mode="r"),
                   eigen=KinshipEigensystem(np.load(work/"K_values.npy", mmap_mode="r"),
                       np.load(work/"K_vectors.npy", mmap_mode="r"), info["shared_covariance"]))
-    alias=work/"null_canonical.npy"
     if settings.get('null_backend','dense')=='tree':
         from .tree_null import TreeAlgebra
         with np.load(work/'tree.npz',allow_pickle=False) as arrays:
             _STATE['tree']=TreeAlgebra(*(arrays[k] for k in ('left','right','tip','length')))
-    _STATE["canonical"]=np.load(alias,mmap_mode="r") if alias.exists() else None
+    _STATE["canonical"] = null_cache.open_aliases(work)
 
 
 def metric(key,value=1):
