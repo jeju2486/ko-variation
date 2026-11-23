@@ -159,9 +159,36 @@ nonzero status. The source checkpoint is opened read-only. A repeat in a new
 output folder with reversed mode order can help assess startup and warm-cache
 effects.
 
+### Decision reuse and checkpoint writes
+
+Compare the exact-P bounds mode with the same scorer and two coordinator
+changes:
+
+```bash
+python benchmarks/production_replay_benchmark.py \
+  --run /path/to/discovery/results --out /path/to/checkpoint-replay \
+  --start 400000000 --pairs 100000 --threads 36 --memory-gb 40 --batch-size 256 \
+  --modes v095_bounds v095_bounds_reuse v095_bounds_io
+```
+
+- `v095_bounds_reuse` uses freshly scored coarse decisions directly in the
+  current traversal. Older and resumed tasks still look up saved decisions
+  in SQLite.
+- `v095_bounds_io` adds durable write batching. The replay commits at
+  a frontier boundary or after 16,384 row changes at the end of a complete
+  write section. Cursor updates, decisions and tasks stay atomic. SQLite's
+  synchronous setting is the same for all modes.
+
+The output reports wall time versus `v095_bounds`, reused gate decisions,
+commit counts and time inside commit calls. Commit time can overlap the
+existing database-write timer. Both variants compare saved pair decisions,
+child task state and significant exact P-values against `v095_bounds`.
+
 To test restart, run with `--modes tile_rows --interrupt before` or
 `--modes tile_compact --interrupt after`. This intentionally returns status
 75 at the first tile commit boundary. Repeat with the same interval and
 output directory, omitting `--interrupt`. Completed modes are skipped.
+For combined writes, use `--modes v095_bounds_io --interrupt before` or
+`--interrupt after` to stop at the first combined checkpoint commit.
 Use independent output directories for throughput measurements so timing
 does not include a deliberate interruption.

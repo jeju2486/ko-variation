@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import closing
+from functools import partial
 import json
 import math
 from pathlib import Path
@@ -29,11 +30,13 @@ from ko_variation.discovery_store import atomic_json, connect, digest, get_meta,
 
 
 LEGACY_MODES = ("current", "fused", "early", "counts", "tile_rows", "tile_compact")
-V095_MODES = ("v095", "v095_bounds", "v095_bounds_decision")
+IO_MODES = ("v095_bounds_reuse", "v095_bounds_io")
+V095_MODES = ("v095", "v095_bounds", "v095_bounds_decision") + IO_MODES
 MODES = LEGACY_MODES + V095_MODES
 CERTIFIED = "BENCHMARK_DIAGONAL_BOUND"
 ORIGINAL_CHUNK = kernels._score_chunk
 ORIGINAL_EVALUATE = discovery_search.evaluate
+ORIGINAL_ADMISSION = discovery_search.admit_coarse_tile
 ORIGINAL_FAST_TREE_ROWS = kernels._fast_tree_rows
 
 
@@ -365,6 +368,88 @@ class TileAdmission:
         return sorted(survivors), offset >= total
 
 
+class ReplayDatabase(sqlite3.Connection):
+    """Measure durable commits and optionally combine writes within a frontier."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.checkpoint_commits = 0
+        self.checkpoint_commit_seconds = 0.
+        self.write_sections = 0
+        self.committed_changes = 0
+        self.combine_limit = 0
+        self.interrupt_at = None
+
+    def checkpoint(self):
+        if not self.in_transaction:
+            return
+        if self.interrupt_at == "before":
+            raise InterruptedReplay("before combined checkpoint commit")
+        started = time.perf_counter()
+        self.commit()
+        self.checkpoint_commit_seconds += time.perf_counter() - started
+        self.checkpoint_commits += 1
+        self.committed_changes = self.total_changes
+        if self.interrupt_at == "after":
+            raise InterruptedReplay("after combined checkpoint commit")
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None:
+            return super().__exit__(exc_type, exc_value, traceback)
+        if self.in_transaction:
+            self.write_sections += 1
+            if self.total_changes - self.committed_changes >= self.combine_limit:
+                self.checkpoint()
+        return False
+
+
+def open_replay_database(path, memory_mb):
+    # Keep the production SQLite settings for every benchmark mode.
+    factory = partial(sqlite3.connect, factory=ReplayDatabase)
+    with patch.object(sqlite3, "connect", factory):
+        return connect(path, memory_mb)
+
+
+class ReplayCoordinator:
+    def __init__(self, combine):
+        self.combine = combine
+        self.fresh = {}
+        self.reused_gate_decisions = 0
+
+    def admit(self, db, arrays, capacity, reps, pool, args, eligibility):
+        self.fresh.clear()
+        if self.combine:
+            # The previous frontier is complete. Publish it before opening the next.
+            db.checkpoint()
+
+        def remember_rows(pool, function, jobs, threads, **kwargs):
+            for payload in bounded_map(pool, function, jobs, threads, **kwargs):
+                if function is kernels.score_profiled:
+                    self.fresh.update(((u, v), (gate, final))
+                                      for u, v, gate, final, *_ in payload["rows"] if gate != -1)
+                yield payload
+
+        with patch.object(discovery_search, "bounded_map", remember_rows):
+            return ORIGINAL_ADMISSION(db, arrays, capacity, reps, pool, args, eligibility)
+
+    def evaluate(self, db, pairs, pool, args, screening=False, *, return_mapping=False):
+        if not (self.fresh and screening and return_mapping):
+            return ORIGINAL_EVALUATE(db, pairs, pool, args, screening, return_mapping=return_mapping)
+        known, pending = {}, []
+        for u, v in pairs:
+            if u == v:
+                continue
+            key = (int(u), int(v)) if u < v else (int(v), int(u))
+            if key in self.fresh:
+                known[key] = self.fresh[key]
+            else:
+                pending.append(key)
+        self.reused_gate_decisions += len(known)
+        if pending:
+            known.update(ORIGINAL_EVALUATE(db, pending, pool, args, screening, return_mapping=True))
+        return known
+
+
 def source_inputs(cli):
     run = cli.run.resolve()
     run_manifest = run / "run_identity.json"
@@ -456,7 +541,7 @@ def run_mode(cli, work, info, source_settings, arrays, mode):
         del kinship
     worker_args = (str(work), info, settings, mode, str(cli.out / "presence.npy"),
                    cli.early_check_interval, cli.zero_tau)
-    with closing(connect(database, min(64, budget["working_gb"] * 1024 * .05))) as db:
+    with closing(open_replay_database(database, min(64, budget["working_gb"] * 1024 * .05))) as db:
         if get_meta(db, "search_complete"):
             return False
         args._has_external_nulls = db.execute("SELECT 1 FROM external_nulls LIMIT 1").fetchone() is not None
@@ -466,21 +551,41 @@ def run_mode(cli, work, info, source_settings, arrays, mode):
             tiles = TileAdmission(db, pool, args, info, mode, cli.interrupt) if tiled else None
             producer = tiles if tiled else coarse_screen.candidate_tasks
             evaluate = evaluate_with_compact if mode == "tile_compact" else ORIGINAL_EVALUATE
+            combined = mode == "v095_bounds_io"
+            coordinator = ReplayCoordinator(combined) if mode in IO_MODES else None
+            admission = coordinator.admit if coordinator else ORIGINAL_ADMISSION
+            if coordinator:
+                evaluate = coordinator.evaluate
+            if combined:
+                # Flush after a frontier or after this many changes at a complete
+                # production write section. A tile's cursor and rows stay atomic.
+                db.combine_limit = 16_384
+                db.interrupt_at = cli.interrupt
             with patch.object(coarse_screen, "open_candidates", return_value=arrays), \
                  patch.object(coarse_screen, "candidate_tasks", producer), \
+                 patch.object(discovery_search, "admit_coarse_tile", admission), \
                  patch.object(discovery_search, "evaluate", evaluate):
                 try:
                     discovery_search.search(db, info, pool, args)
+                    db.checkpoint()
                 except InterruptedReplay as error:
+                    db.rollback()
                     print(f"[{mode}] intentional interruption {error}", flush=True)
                     incomplete = True
+                finally:
+                    db.combine_limit = 0
+                    db.interrupt_at = None
         seconds = time.perf_counter() - started
         with db:
             saved = get_meta(db, "replay_timing", {})
             merge_metrics(saved, dict(seconds=seconds, invocations=1, interruptions=int(incomplete),
                                       tile_seconds=tiles.seconds if tiles else 0.,
                                       tile_write_seconds=tiles.write_seconds if tiles else 0.,
-                                      compact_lookup_seconds=args.compact_lookup_seconds))
+                                      compact_lookup_seconds=args.compact_lookup_seconds,
+                                      checkpoint_commits=db.checkpoint_commits,
+                                      checkpoint_commit_seconds=db.checkpoint_commit_seconds,
+                                      write_sections=db.write_sections,
+                                      reused_gate_decisions=coordinator.reused_gate_decisions if coordinator else 0))
             set_meta(db, "replay_timing", saved)
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     return incomplete
@@ -493,7 +598,7 @@ def differences(db, reference, variant, *, defer_p=False):
         queries = {
             "pair_decisions": ("SELECT u,v,gate,final FROM {db}.decisions UNION ALL "
                                "SELECT u,v,-1,final FROM {db}.compact_rejections"),
-            "child_tasks": ("SELECT a,b FROM {db}.tasks t JOIN {db}.nodes x ON x.id=t.a "
+            "child_tasks": ("SELECT a,b,t.done FROM {db}.tasks t JOIN {db}.nodes x ON x.id=t.a "
                             "JOIN {db}.nodes y ON y.id=t.b WHERE x.parent!=0 OR y.parent!=0"),
         }
         counts = {}
@@ -544,7 +649,8 @@ def report(out, modes, identity, arrays):
     with closing(sqlite3.connect(":memory:", uri=True)) as db:
         for result in results:
             mode = result["mode"]
-            reference = "v095" if mode in V095_MODES else "current"
+            reference = ("v095_bounds" if mode in IO_MODES else
+                         "v095" if mode in V095_MODES else "current")
             comparison = {}
             speed = ""
             if reference in by_mode and mode != reference:
@@ -560,10 +666,13 @@ def report(out, modes, identity, arrays):
                 metrics = result["runtime"]
                 diagonals = (f"; {metrics.get('diagonal_resolved', 0):,} diagonal decisions"
                              f"; {metrics.get('diagonal_significant_p_deferred', 0):,} exact P-values deferred")
-            print(f"{mode}: {result['timing']['seconds']:.3f}s; "
+            timing = result["timing"]
+            io = (f"; {timing['checkpoint_commits']:,} commits ({timing['checkpoint_commit_seconds']:.2f}s)"
+                  f"; {timing['reused_gate_decisions']:,} fresh gate lookups saved")
+            print(f"{mode}: {timing['seconds']:.3f}s; "
                   f"{result['coarse_per_second']:,.0f} coarse pairs/s; "
                   f"{result['db_bytes'] / MIB:,.1f} MiB; {result['significant']:,} significant"
-                  f"{speed}{check}{diagonals}", flush=True)
+                  f"{speed}{check}{diagonals}{io}", flush=True)
     atomic_json(out / "summary.json", dict(selection=identity, coarse_pairs=breakdown, modes=results))
     return int(any(count for row in results for count in row["comparison"].values()))
 
@@ -582,12 +691,13 @@ def main():
     parser.add_argument("--modes", nargs="+", choices=MODES, default=LEGACY_MODES)
     parser.add_argument("--bound-rounds", type=int, choices=(1, 2), default=1,
                         help="For v095 bounds, optionally tighten the lower bound of unresolved pairs")
-    parser.add_argument("--interrupt", choices=("before", "after"), help="Stop at the first tile commit boundary")
+    parser.add_argument("--interrupt", choices=("before", "after"), help="Stop at the first tile or combined checkpoint commit")
     cli = parser.parse_args()
     if cli.start < 0 or min(cli.pairs, cli.threads, cli.batch_size, cli.early_check_interval) < 1:
         parser.error("Start must be nonnegative and counts must be positive")
-    if cli.interrupt and (len(cli.modes) != 1 or not cli.modes[0].startswith("tile_")):
-        parser.error("--interrupt requires a single tiled mode")
+    if cli.interrupt and (len(cli.modes) != 1 or
+                          not (cli.modes[0].startswith("tile_") or cli.modes[0] == "v095_bounds_io")):
+        parser.error("--interrupt requires a single tile_* or v095_bounds_io mode")
     cli.out = cli.out.resolve()
     work, info, settings, screen, arrays, identity = source_inputs(cli)
     cli.out.mkdir(parents=True, exist_ok=True)
