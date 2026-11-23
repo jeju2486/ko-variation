@@ -27,11 +27,14 @@ from ko_variation.tree_score import TreeScore, ZeroTauScore, classify, contrast_
 from ko_variation import coarse_screen, discovery_nulls, discovery_score as kernels, discovery_search
 from ko_variation.discovery_execution import ResponsePool, batches, bounded_map, merge_metrics
 from ko_variation.discovery_store import atomic_json, connect, digest, get_meta, schema, set_meta
+from benchmarks import tree_matrix_replay
 
 
 LEGACY_MODES = ("current", "fused", "early", "counts", "tile_rows", "tile_compact")
 IO_MODES = ("v095_bounds_reuse", "v095_bounds_io")
-V095_MODES = ("v095", "v095_bounds", "v095_bounds_decision") + IO_MODES
+BOUNDS_MODES = ("v095_bounds", "v095_bounds_decision") + IO_MODES
+TREE_MODES = ("v095_tree_raw", "v095_tree_matrix")
+V095_MODES = ("v095",) + BOUNDS_MODES + TREE_MODES
 MODES = LEGACY_MODES + V095_MODES
 CERTIFIED = "BENCHMARK_DIAGONAL_BOUND"
 ORIGINAL_CHUNK = kernels._score_chunk
@@ -58,8 +61,11 @@ def initialize_worker(work, info, settings, mode, presence_file, interval, zero_
     discovery_nulls.compatible = allow_saved_format
     if mode in ("current", "v095"):
         return
+    if mode in TREE_MODES:
+        tree_matrix_replay.initialize(matrix=mode == "v095_tree_matrix")
+        return
     state = kernels._STATE
-    if mode in V095_MODES:
+    if mode in BOUNDS_MODES:
         state["defer_significant_p"] = mode == "v095_bounds_decision"
         kernels._fast_tree_rows = two_sided_tree_rows
         TreeScore.early_stop = early_stop_with_saved_u
@@ -478,7 +484,11 @@ def source_inputs(cli):
                     batch_size=cli.batch_size, early_check_interval=cli.early_check_interval,
                     zero_tau=cli.zero_tau, bound_rounds=cli.bound_rounds,
                     runtime_source={Path(module.__file__).name: digest(Path(module.__file__))
-                                    for module in (kernels, discovery_search, coarse_screen)})
+                                    for module in (kernels, discovery_search, coarse_screen, tree_matrix_replay)})
+    if settings.get("null_backend") == "tree" and (work / "tree.npz").is_file():
+        with np.load(work / "tree.npz", allow_pickle=False) as tree:
+            sibling_nodes = tree_matrix_replay.sibling_indices(tree["left"], tree["right"], tree["tip"])
+        identity["sibling_tip_pairs"] = len(sibling_nodes)
     return work, info, settings, screen, arrays, identity
 
 
@@ -531,7 +541,7 @@ def run_mode(cli, work, info, source_settings, arrays, mode):
                     null_cache_rank=128, null_backend=getattr(args, "null_backend", "dense"), workers=cli.threads, **plan)
     if mode in V095_MODES:
         settings["fast_tree_scores"] = True
-    if mode in V095_MODES[1:]:
+    if mode in BOUNDS_MODES:
         kinship = np.load(work / "K.npy", mmap_mode="r")
         # The maximum absolute row sum upper-bounds the spectral radius.
         largest = max(float(np.abs(kinship[start:start + 256]).sum(axis=1).max())
@@ -556,6 +566,8 @@ def run_mode(cli, work, info, source_settings, arrays, mode):
             admission = coordinator.admit if coordinator else ORIGINAL_ADMISSION
             if coordinator:
                 evaluate = coordinator.evaluate
+            mapper = (partial(tree_matrix_replay.map_with_sibling_tiles, width=cli.batch_size)
+                      if mode == "v095_tree_matrix" else bounded_map)
             if combined:
                 # Flush after a frontier or after this many changes at a complete
                 # production write section. A tile's cursor and rows stay atomic.
@@ -564,6 +576,7 @@ def run_mode(cli, work, info, source_settings, arrays, mode):
             with patch.object(coarse_screen, "open_candidates", return_value=arrays), \
                  patch.object(coarse_screen, "candidate_tasks", producer), \
                  patch.object(discovery_search, "admit_coarse_tile", admission), \
+                 patch.object(discovery_search, "bounded_map", mapper), \
                  patch.object(discovery_search, "evaluate", evaluate):
                 try:
                     discovery_search.search(db, info, pool, args)
@@ -662,17 +675,23 @@ def report(out, modes, identity, arrays):
             result["comparison"] = comparison
             check = f"; {sum(comparison.values()):,} discrepancies" if comparison else ""
             diagonals = ""
-            if mode in V095_MODES[1:]:
+            if mode in BOUNDS_MODES:
                 metrics = result["runtime"]
                 diagonals = (f"; {metrics.get('diagonal_resolved', 0):,} diagonal decisions"
                              f"; {metrics.get('diagonal_significant_p_deferred', 0):,} exact P-values deferred")
+            matrix = ""
+            if mode == "v095_tree_matrix":
+                metrics = result["runtime"]
+                matrix = (f"; {identity['sibling_tip_pairs']:,} sibling-tip contrasts"
+                          f"; {metrics.get('sibling_early_rejections', 0):,} sibling-bound rejections"
+                          f"; {metrics.get('sibling_dense_tiles', 0):,} dense matrix tiles")
             timing = result["timing"]
             io = (f"; {timing['checkpoint_commits']:,} commits ({timing['checkpoint_commit_seconds']:.2f}s)"
                   f"; {timing['reused_gate_decisions']:,} fresh gate lookups saved")
             print(f"{mode}: {timing['seconds']:.3f}s; "
                   f"{result['coarse_per_second']:,.0f} coarse pairs/s; "
                   f"{result['db_bytes'] / MIB:,.1f} MiB; {result['significant']:,} significant"
-                  f"{speed}{check}{diagonals}{io}", flush=True)
+                  f"{speed}{check}{diagonals}{matrix}{io}", flush=True)
     atomic_json(out / "summary.json", dict(selection=identity, coarse_pairs=breakdown, modes=results))
     return int(any(count for row in results for count in row["comparison"].values()))
 
@@ -682,7 +701,7 @@ def main():
     parser.add_argument("--run", type=Path, required=True, help="Source discovery results directory")
     parser.add_argument("--out", type=Path, required=True, help="Separate benchmark directory")
     parser.add_argument("--start", type=int, default=0, help="Zero-based position in the saved PC candidate list")
-    parser.add_argument("--pairs", type=int, default=100_000)
+    parser.add_argument("--pairs", type=int, help="Number of coarse candidates (1,000,000 for tree experiments; otherwise 100,000)")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--memory-gb", type=float, default=None)
     parser.add_argument("--batch-size", type=int, default=128)
@@ -693,6 +712,8 @@ def main():
                         help="For v095 bounds, optionally tighten the lower bound of unresolved pairs")
     parser.add_argument("--interrupt", choices=("before", "after"), help="Stop at the first tile or combined checkpoint commit")
     cli = parser.parse_args()
+    if cli.pairs is None:
+        cli.pairs = 1_000_000 if any(mode in TREE_MODES for mode in cli.modes) else 100_000
     if cli.start < 0 or min(cli.pairs, cli.threads, cli.batch_size, cli.early_check_interval) < 1:
         parser.error("Start must be nonnegative and counts must be positive")
     if cli.interrupt and (len(cli.modes) != 1 or

@@ -184,6 +184,37 @@ commit counts and time inside commit calls. Commit time can overlap the
 existing database-write timer. Both variants compare saved pair decisions,
 child task state and significant exact P-values against `v095_bounds`.
 
+### Projection-free tree scoring and sibling-tip matrix pass
+
+The tree experiments default to **1,000,000 saved coarse candidates**. The
+example below uses a later Klebsiella interval and compares three modes with
+the same inputs, eligibility, thresholds and exact significant P-values.
+
+```bash
+python benchmarks/production_replay_benchmark.py \
+  --run /path/to/discovery/results --out /path/to/tree-matrix-replay \
+  --start 400000000 --pairs 1000000 --threads 36 --memory-gb 40 --batch-size 256 \
+  --modes v095 v095_tree_raw v095_tree_matrix
+```
+
+- `v095` uses the production tree score and early stopping.
+- `v095_tree_raw` uses the raw predictors. For the intercept-only tree model,
+  the intercept cancels from every child contrast. It also omits the separate
+  root-mean term, while retaining the contrast between the two root children.
+- `v095_tree_matrix` adds a sibling-tip variance bound during representative
+  screening. It groups up to four small response jobs already assigned to
+  the same worker, shares decoded sibling differences across that tile and
+  uses a matrix product when at least half the entries were selected. Sparse
+  tiles use only the selected predictor columns. The tree pass starts from
+  that partial variance and adds the remaining terms once. Other work uses
+  the projection-free scorer.
+
+The report checks gate and final decisions, child tasks and exact significant
+P-values against `v095`. It also reports time in the matrix pass, tile counts,
+and how many candidates the sibling bound rejects before the tree pass.
+Replay timing includes the new response-job grouping. Use separate output
+directories for repeats and reverse mode order to check warm-cache effects.
+
 To test restart, run with `--modes tile_rows --interrupt before` or
 `--modes tile_compact --interrupt after`. This intentionally returns status
 75 at the first tile commit boundary. Repeat with the same interval and
