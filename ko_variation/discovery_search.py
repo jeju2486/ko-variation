@@ -345,7 +345,7 @@ def coarse_tasks(db, roots, ordered, capacity, old_position=None, workers=1):
     return fresh,next_right>=n and not active
 
 
-def admit_coarse_tile(db, arrays, capacity, reps, pool, args, eligibility):
+def admit_coarse_tile(db, arrays, capacity, reps, pool, args, eligibility, *, fresh_gates=None):
     blocks, offset, active, next_right = coarse_screen.candidate_window(db, arrays, capacity, args.threads)
     done = offset >= len(arrays[1])
     if not blocks:
@@ -389,9 +389,12 @@ def admit_coarse_tile(db, arrays, capacity, reps, pool, args, eligibility):
         set_meta(db, "hierarchy_metrics", hierarchy)
         merge_metrics(totals, dict(coarse_tiles=1, coarse_tile_candidates=len(blocks),
                                   compact_rejections=len(negatives),
+                                  fresh_gate_lookups_saved=len(decisions) if fresh_gates is not None else 0,
                                   driver_db_write_seconds=time.perf_counter()-writing,
                                   coordinator_batch_wall_seconds=time.perf_counter()-started))
         save_worker_profile(db, totals, states)
+    if fresh_gates is not None:
+        fresh_gates.update(((u, v), (gate, final)) for u, v, gate, final, *_ in decisions)
     return survivors, done
 
 
@@ -462,8 +465,11 @@ def search(db, info, pool, args):
             quota=max(1,frontier//4)
             tasks=db.execute('SELECT a,b FROM tasks WHERE done=0 ORDER BY a,b LIMIT ?',
                              (max(1,frontier-quota),)).fetchall()
+            fresh_gates = {} if tiled and getattr(args, "_reuse_fresh_gates", True) else None
             if tiled:
-                fresh,coarse_done=admit_coarse_tile(db, arrays, frontier-len(tasks), root_reps, pool, args, eligibility)
+                fresh, coarse_done = admit_coarse_tile(
+                    db, arrays, frontier-len(tasks), root_reps, pool, args, eligibility,
+                    fresh_gates=fresh_gates)
             elif filtered:
                 fresh,coarse_done=coarse_screen.candidate_tasks(db,arrays,frontier-len(tasks),args.threads)
             else:
@@ -478,8 +484,13 @@ def search(db, info, pool, args):
             def gate_pairs():
                 for a,b in tasks:
                     if a!=b and (a,b) not in pruned:
-                        yield from itertools.product(nodes.get(a)[2],nodes.get(b)[2])
-            gates={}
+                        pairs = itertools.product(nodes.get(a)[2], nodes.get(b)[2])
+                        if fresh_gates:
+                            yield from ((u, v) for u, v in pairs
+                                        if ((u, v) if u <= v else (v, u)) not in fresh_gates)
+                        else:
+                            yield from pairs
+            gates = fresh_gates.copy() if fresh_gates else {}
             for block in batches(gate_pairs(),buffer_limit):
                 gates.update(evaluate(db,block,pool,args,screening=True,return_mapping=True))
             leaf_queries,leaf_done,transitions=[],[],[]

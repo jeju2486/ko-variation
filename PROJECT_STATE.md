@@ -14,6 +14,13 @@ before reusing numbers or caches; proposals are distinguished from conclusions.
   candidates with matching decisions. Full-run speed remains to be measured.
   Compatible v0.9.4 runs keep their fitted nulls and position when resumed.
 
+- Development revision tiled-tree-2 reuses freshly scored coarse decisions
+  and runs the two-sided variance prepass. Significant tree-score P-values
+  remain exact. Keep one four-mode replay for the supplementary optimization
+  figure and compare all arms on the same late Klebsiella interval. The
+  earlier sibling-tip, checkpoint batching and scoring prototypes stay in
+  Git history. Full-data speed for the combined changes is still unmeasured.
+
 - Development discovery layout: `discovery.py` owns stage order and prefit,
   `discovery_search.py` owns hierarchy and eligibility, and
   `discovery_store.py` owns input preparation and SQLite metadata.

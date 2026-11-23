@@ -637,8 +637,10 @@ def main(argv=None):
                                   and args.null_backend == "tree" and not args.exact)
             if args._tiled_coarse and not get_meta(db, "search_complete"):
                 prepare_presence_counts(db, work, info)
+                from .tree_score import kinship_eigenvalue_bound
                 settings["fast_tree_scores"] = True
-                print("[KOVAR] PC hierarchy: tiled coarse admission and early tree-score rejection", flush=True)
+                settings["tree_bound_eigenvalue"] = kinship_eigenvalue_bound(np.load(work / "K.npy", mmap_mode="r"))
+                print("[KOVAR] PC hierarchy: reuse fresh decisions and apply two-sided tree-score bounds", flush=True)
             with db:
                 set_meta(db,'worker_state',{})
                 set_meta(db,'active_stage','pair_search')
@@ -653,6 +655,7 @@ def main(argv=None):
             # Release every score-worker cache before the external graph tool
             # gets its own memory budget. Refit workers start lazily afterwards.
             settings.pop('fast_tree_scores', None)
+            settings.pop('tree_bound_eigenvalue', None)
             if args.unitig_distance:
                 with db: set_meta(db,'active_stage','distance_and_beta')
                 with ResponsePool(args.threads,kernels.initialize,(str(work),info,settings)) as pool:

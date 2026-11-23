@@ -429,8 +429,33 @@ def adaptive_statistics(X, cache, criticals, ranks=(0, 8, 16, 32, 64, 128)):
 
 
 def _fast_tree_rows(X, cache, response, predictors, eligible, gate, final):
-    started = time.perf_counter()
     tree_score, scorers = _STATE["tree_score"], _STATE["score_cache"]
+    possible_terms = X.size
+    eigenvalue_bound = _STATE["settings"].get("tree_bound_eigenvalue")
+    rows, u = [], None
+    if eigenvalue_bound is not None and cache["tau"] != 0.:
+        started = time.perf_counter()
+        key = ("diagonal", response)
+        if key in scorers:
+            bounds = scorers.get(key)
+        else:
+            bounds = tree_score.DiagonalScoreBounds(cache, eigenvalue_bound)
+            scorers.put(key, bounds, 256 + bounds.moments.nbytes)
+        u, settled, ids, routes, states, lows, highs = bounds.settle(X, eligible, gate, final)
+        rows = [(int(predictors[i]), response, int(route), int(state), float(lo), float(hi), None, "BOUNDED")
+                for i, route, state, lo, hi in zip(ids, routes, states, lows, highs)]
+        metric("diagonal_pairs_checked", X.shape[1])
+        metric("diagonal_resolved", len(rows))
+        metric("bound_decided_pairs", len(rows))
+        if rows:
+            pending = np.flatnonzero(~settled)
+            predictors = [predictors[i] for i in pending]
+            X, u, eligible = X[:, pending], u[pending], eligible[pending]
+        metric("diagonal_worker_seconds", time.perf_counter() - started)
+        if not predictors:
+            metric("possible_tree_terms", possible_terms)
+            return rows
+    started = time.perf_counter()
     scorer_key = ("scorer", response)
     if scorer_key in scorers:
         scorer = scorers.get(scorer_key)
@@ -447,7 +472,7 @@ def _fast_tree_rows(X, cache, response, predictors, eligible, gate, final):
         terms = 0
         metric("zero_tau_pairs", X.shape[1])
     else:
-        u, v, stopped, terms = scorer.early_stop(X, cutoff, 16)
+        u, v, stopped, terms = scorer.early_stop(X, cutoff, 16, u=u)
     routing, decision, statistic = tree_score.classify(u, v, eligible, gate, final, stopped)
     compute_p = (decision == 1) & np.isfinite(statistic)
     p_values = np.full(len(predictors), np.nan)
@@ -459,7 +484,6 @@ def _fast_tree_rows(X, cache, response, predictors, eligible, gate, final):
     indices = np.flatnonzero(verify)
     reference = dict(zip(indices, score_predictor_block(X[:, indices], cache,
                                                        compute_spa_adjustment=False))) if len(indices) else {}
-    rows = []
     for i, pid in enumerate(predictors):
         route, state = int(routing[i]), int(decision[i])
         p = float(p_values[i]) if np.isfinite(p_values[i]) else None
@@ -482,7 +506,7 @@ def _fast_tree_rows(X, cache, response, predictors, eligible, gate, final):
         rows.append((int(pid), response, route, state, low, high, p, flag))
     early = int(stopped.sum())
     metric("tree_terms", terms)
-    metric("possible_tree_terms", X.size)
+    metric("possible_tree_terms", possible_terms)
     metric("early_stopped_pairs", early)
     metric("bound_decided_pairs", early)
     metric("exact_pairs", len(predictors) - early)

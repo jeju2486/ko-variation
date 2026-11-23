@@ -1,6 +1,6 @@
 # Unitig discovery in KOVAR 0.9.5
 
-Development execution revision **`tiled-tree-1`**.
+Development execution revision **`tiled-tree-2`**.
 
 `ko-variation-discover` (also `ko-variation discover`) accepts PAN-GWES unitig
 presence/absence directly. SpydrPick, MI and ARACNE are not required. Historical candidate-table scans use the v0.8.3 tag in a separate environment.
@@ -68,13 +68,15 @@ reuses response-specific tree coefficients, stops when accumulated squared
 contrasts rule out both thresholds, and calculates exact P for significant
 tree-score hits. Routine misses can have a bound or no P. Coarse rejections
 are recorded compactly in the work database and included in progress totals.
-The PC shortlist, hierarchy gates, Bonferroni family, distance and beta
-calculations retain their existing definitions.
+The coordinator reuses fresh coarse decisions during traversal. The scorer
+tries a two-sided variance bound before touching the tree. When it cannot
+settle both thresholds, or when an exact P-value is needed for a significant
+pair, scoring continues through the tree. The PC shortlist, hierarchy gates,
+Bonferroni family, distance and beta retain their existing definitions.
 
-Resume a compatible v0.9.4 checkpoint with the same inputs, scientific
-settings and NumPy/SciPy versions. Existing fitted nulls, queued work and
-decisions carry forward. KOVAR validates the saved source manifest against the
-v0.9.4 release and the preceding development layout before migration. Use
+Resume verified v0.9.4 and v0.9.5 tiled-tree-1 checkpoints with the same inputs,
+scientific settings and NumPy/SciPy versions. Saved nulls, queued work and
+decisions carry forward. Use
 `--exact` on a separate reference run if exact score P values are needed
 throughout the pairs visited by the search.
 

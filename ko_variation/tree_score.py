@@ -25,26 +25,6 @@ def contrast_coefficients(left, right, tip, length, weights, tau):
 
 
 @njit(cache=True)
-def contrast_norms(left, right, tip, fractions_a, fractions_b, scale, root_scale, data):
-    width = data.shape[1]
-    means = np.empty((len(tip), width))
-    norms = np.zeros(width)
-    for node in range(len(tip)):
-        if tip[node] >= 0:
-            means[node, :] = data[tip[node], :]
-        else:
-            a, b = left[node], right[node]
-            for j in range(width):
-                z = (means[a, j] - means[b, j]) / scale[node]
-                norms[j] += z * z
-                means[node, j] = fractions_a[node] * means[a, j] + fractions_b[node] * means[b, j]
-    for j in range(width):
-        z = means[-1, j] / root_scale
-        norms[j] += z * z
-    return norms
-
-
-@njit(cache=True)
 def contrast_norms_until(left, right, tip, fractions_a, fractions_b, scale, root_scale,
                          data, limit, check_interval):
     width = data.shape[1]
@@ -100,12 +80,9 @@ class TreeScore:
         coefficient = self.nuisance @ (self.inverse_design.T @ X)
         return np.ascontiguousarray(X - self.design @ coefficient)
 
-    def __call__(self, X):
-        variance = contrast_norms(*self.tree_indices, *self.coefficients, self.project(X))
-        return X.T @ self.residual, variance
-
-    def early_stop(self, X, cutoff, interval):
-        u = X.T @ self.residual
+    def early_stop(self, X, cutoff, interval, *, u=None):
+        if u is None:
+            u = X.T @ self.residual
         # A partial norm lower-bounds the final variance. Leave slack around
         # the classification boundary and the minimum usable variance.
         upper_u = np.abs(u) + 1e-9 * np.maximum(1., np.abs(u))
@@ -115,6 +92,41 @@ class TreeScore:
             *self.tree_indices, *self.coefficients, self.project(X), limit, interval)
         variance[stopped] = np.nan
         return u, variance, stopped, terms
+
+
+def kinship_eigenvalue_bound(kinship):
+    largest = max(float(np.abs(kinship[start:start + 256]).sum(axis=1).max())
+                  for start in range(0, len(kinship), 256))
+    return largest + 1e-9 * max(1., largest)
+
+
+class DiagonalScoreBounds:
+    """Bound the intercept-adjusted score using the fitted null's weights."""
+
+    def __init__(self, cache, eigenvalue_bound):
+        weights = cache["weights"]
+        self.moments = np.column_stack((cache["y"] - cache["mu"], weights))
+        self.weight_sum = weights.sum()
+        self.inflation = 1. + cache["tau"] * eigenvalue_bound * weights.max()
+
+    def settle(self, X, eligible, gate, final):
+        u, present = (X.T @ self.moments).T
+        variance_upper = present * (1. - present / self.weight_sum)
+        variance_lower = variance_upper / self.inflation
+        variance_lower -= 1e-9 * np.maximum(1., np.abs(variance_lower))
+        variance_upper += 1e-9 * np.maximum(1., np.abs(variance_upper))
+        u_abs = np.abs(u)
+        margin = 1e-9 * np.maximum(1., u_abs)
+        u_lower, u_upper = np.maximum(0., u_abs - margin)**2, (u_abs + margin)**2
+        route = np.where(u_lower >= gate * variance_upper, 1,
+                         np.where(u_upper < gate * variance_lower, -1, 0))
+        decision = np.where(eligible, np.where(u_upper < final * variance_lower, -1, 0), -2)
+        # Final hits still use the tree score to report their exact P-values.
+        settled = ((route != 0) & (decision != 0) & (variance_lower > 1e-12)
+                   & np.isfinite(u_upper) & np.isfinite(variance_lower) & np.isfinite(variance_upper))
+        ids = np.flatnonzero(settled)
+        return (u, settled, ids, route[ids], decision[ids],
+                u_lower[ids] / variance_upper[ids], u_upper[ids] / variance_lower[ids])
 
 
 class ZeroTauScore:

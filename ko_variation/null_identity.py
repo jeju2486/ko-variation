@@ -90,14 +90,20 @@ def _same_refactored_run(previous, expected):
     return old_unchanged == new_unchanged and dict(previous, code=current_code) == expected
 
 
-# Full v0.9.4 production and development source manifests (LF and CRLF).
+# Supported v0.9.4 and v0.9.5 source manifests (LF and CRLF).
 _TILED_PREDECESSORS = {
-    "252c294dd83a2d544b8e070d4ecfe45dcd54739f3722cfb3b5f13d4b73be3d80",
-    "a756ef907e9537c267631b8fd3dc6c70f91f3b43e2c7b21665658f90cdf1ccc2",
-    "9086e70d6f319a18c0aa9d74f6ca6d6191890afac352a381bbec605b1c4c9164",
-    "4933c8d8e175e7cceb27ac215f1081046967478cb8f75fbb8c60bfd86709508e",
+    ("0.9.4", "tree-null-1"): {
+        "252c294dd83a2d544b8e070d4ecfe45dcd54739f3722cfb3b5f13d4b73be3d80",
+        "a756ef907e9537c267631b8fd3dc6c70f91f3b43e2c7b21665658f90cdf1ccc2",
+        "9086e70d6f319a18c0aa9d74f6ca6d6191890afac352a381bbec605b1c4c9164",
+        "4933c8d8e175e7cceb27ac215f1081046967478cb8f75fbb8c60bfd86709508e",
+    },
+    ("0.9.5", "tiled-tree-1"): {
+        "930b20360afa41fb137422ba9154ed1cdb804d6c8155cd7589bea176f9a50d6b",
+        "cb18c09cb6d562bff467e5d928ad939d4230eb865bbe0f33d8ed64886e50e8d8",
+    },
 }
-_TILED_SOURCE = "59bd2ef8adec18d8f952ac3f1967ec1d41877483f27115e47ab395f932728ffc"
+_TILED_SOURCE = "e6ea6c82755eac17b0b14e2ed63eb18a841cb4caf71f2ecc05d6a7d56b6eafd5"
 
 
 def _source_manifest_hash(code):
@@ -105,11 +111,11 @@ def _source_manifest_hash(code):
 
 
 def _same_tiled_run(previous, expected):
-    if (previous.get("version"), previous.get("execution_revision")) != ("0.9.4", "tree-null-1"):
+    predecessor = previous.get("version"), previous.get("execution_revision")
+    allowed = _TILED_PREDECESSORS.get(predecessor, ())
+    if expected.get("execution_revision") != "tiled-tree-2":
         return False
-    if expected.get("execution_revision") != "tiled-tree-1":
-        return False
-    if _source_manifest_hash(previous.get("code", {})) not in _TILED_PREDECESSORS:
+    if _source_manifest_hash(previous.get("code", {})) not in allowed:
         return False
     current = expected.get("code", {})
     normalized = {}

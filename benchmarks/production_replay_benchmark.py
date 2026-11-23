@@ -1,14 +1,14 @@
-"""Replay a saved interval of the production PC-screen search in scratch databases."""
+"""Ablate decision reuse and two-sided bounds on a saved PC shortlist."""
 from __future__ import annotations
 
 import argparse
 from contextlib import closing
-from functools import partial
 import json
 import math
 from pathlib import Path
 import shutil
 import sqlite3
+from statistics import median
 import sys
 import time
 from types import SimpleNamespace
@@ -16,490 +16,73 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ko_variation.memory_budget import ByteLRU, MIB, detect_budget, guard_blas_environment, plan_workers
+from ko_variation.memory_budget import detect_budget, guard_blas_environment, plan_workers
 
 guard_blas_environment(default_threads=1)
 
 import numpy as np
 from scipy.stats import chi2
 
-from ko_variation.tree_score import TreeScore, ZeroTauScore, classify, contrast_norms_until
-from ko_variation import coarse_screen, discovery_nulls, discovery_score as kernels, discovery_search
-from ko_variation.discovery_execution import ResponsePool, batches, bounded_map, merge_metrics
+from ko_variation import coarse_screen, discovery_nulls, discovery_score, discovery_search, tree_score
+from ko_variation.discovery_execution import ResponsePool
 from ko_variation.discovery_store import atomic_json, connect, digest, get_meta, schema, set_meta
-from benchmarks import tree_matrix_replay
 
 
-LEGACY_MODES = ("current", "fused", "early", "counts", "tile_rows", "tile_compact")
-IO_MODES = ("v095_bounds_reuse", "v095_bounds_io")
-BOUNDS_MODES = ("v095_bounds", "v095_bounds_decision") + IO_MODES
-TREE_MODES = ("v095_tree_raw", "v095_tree_matrix")
-V095_MODES = ("v095",) + BOUNDS_MODES + TREE_MODES
-MODES = LEGACY_MODES + V095_MODES
-CERTIFIED = "BENCHMARK_DIAGONAL_BOUND"
-ORIGINAL_CHUNK = kernels._score_chunk
-ORIGINAL_EVALUATE = discovery_search.evaluate
-ORIGINAL_ADMISSION = discovery_search.admit_coarse_tile
-ORIGINAL_FAST_TREE_ROWS = kernels._fast_tree_rows
-
-
-class InterruptedReplay(Exception):
-    pass
+MODES = {
+    "v095": (False, False),
+    "reuse": (True, False),
+    "bounds": (False, True),
+    "combined": (True, True),
+}
+LABELS = {"v095": "v0.9.5", "reuse": "Decision reuse", "bounds": "Two-sided bounds", "combined": "Combined"}
 
 
 def prevent_cache_write(*args, **kwargs):
-    raise ValueError("This replay requires compatible saved nulls and never writes to the source cache")
+    raise ValueError("The replay must use saved nulls without writing to the source")
 
 
-def allow_saved_format(record, compact, rank, n):
-    return record["status"] != "OK" or record.get("format") == 2
-
-
-def initialize_worker(work, info, settings, mode, presence_file, interval, zero_tau):
-    kernels.initialize(work, info, settings)
+def initialize_worker(work, info, settings):
+    discovery_score.initialize(work, info, settings)
     discovery_nulls.save = prevent_cache_write
-    discovery_nulls.compatible = allow_saved_format
-    if mode in ("current", "v095"):
-        return
-    if mode in TREE_MODES:
-        tree_matrix_replay.initialize(matrix=mode == "v095_tree_matrix")
-        return
-    state = kernels._STATE
-    if mode in BOUNDS_MODES:
-        state["defer_significant_p"] = mode == "v095_bounds_decision"
-        kernels._fast_tree_rows = two_sided_tree_rows
-        TreeScore.early_stop = early_stop_with_saved_u
-        return
-    limit = settings["cache_bytes_per_worker"] // 4
-    state["nulls"].limit -= limit
-    state["cache_limit"] -= limit
-    state["replay_cache"] = ByteLRU(limit)
-    state["replay_mode"] = mode
-    state["replay_presence"] = np.load(presence_file, mmap_mode="r")
-    state["replay_interval"] = interval
-    state["replay_zero_tau"] = zero_tau
-    kernels._score_chunk = optimized_chunk
+    discovery_nulls.compatible = lambda record, *_: record["status"] != "OK" or record.get("format") == 2
 
 
-def cache_value(state, key, build, size):
-    cache = state["replay_cache"]
-    if key in cache:
-        return cache.get(key)
-    value = build()
-    cache.put(key, value, size)
-    return value
-
-
-def response_pattern(state, response):
-    def unpack():
-        y = kernels.bits([response])[0].astype(float)
-        return y, y.sum()
-
-    if state["replay_mode"] in ("fused", "early"):
-        return unpack()
-    return cache_value(state, ("response", response), unpack, 256 + 8 * state["info"]["n"])
-
-
-def optimized_chunk(job):
-    response, predictors, external, screening = job
-    state = kernels._STATE
-    settings = state["settings"]
-    started = time.perf_counter()
-    reuse_counts = state["replay_mode"] not in ("fused", "early")
-    X = kernels.bits(predictors).T.astype(float)
-    y, present = response_pattern(state, response)
-    if reuse_counts:
-        counts = state["replay_presence"][predictors].astype(float)
-    else:
-        counts = X.sum(axis=0)
-    overlap = X.T @ y
-    eligible = np.minimum.reduce((overlap, counts - overlap, present - overlap,
-                                 len(y) - counts - present + overlap)) >= settings["min_cell_count"]
-    kernels.metric("decode_and_eligibility_worker_seconds", time.perf_counter() - started)
-    rows = []
-    if not screening and not eligible.all():
-        rows = [(int(pid), response, 0, -2, None, None, None, "INELIGIBLE_NOT_SCREENED")
-                for pid, ok in zip(predictors, eligible) if not ok]
-        predictors = [pid for pid, ok in zip(predictors, eligible) if ok]
-        if not predictors:
-            return rows
-        if not reuse_counts:
-            return rows + optimized_chunk((response, predictors, external, screening))
-        X = X[:, eligible]
-        eligible = np.ones(len(predictors), dtype=bool)
-
-    cache, status = kernels.get_null(response, external)
-    if cache is None:
-        return rows + [(int(pid), response, 0, 0 if ok else -2, None, None, None, status)
-                       for pid, ok in zip(predictors, eligible)]
-    if not hasattr(cache["decomp"], "score_variance"):
-        return rows + ORIGINAL_CHUNK((response, predictors, external, screening))
-
-    started = time.perf_counter()
-    gate, final = settings["gate_critical"], settings["final_critical"]
-    stopped = np.zeros(len(predictors), dtype=bool)
-    terms = X.size
-
-    def build():
-        kernels.metric("tree_coefficient_setups")
-        return TreeScore(cache)
-
-    cutoff = min(gate, final)
-    if state["replay_zero_tau"] and cache["tau"] == 0.:
-        u, v = ZeroTauScore(cache)(X)
-        terms = 0
-        kernels.metric("zero_tau_pairs", len(predictors))
-    else:
-        scorer = cache_value(state, ("scorer", response), build, 512 + 112 * len(y))
-        if state["replay_mode"] == "fused":
-            u, v = scorer(X)
-        else:
-            u, v, stopped, terms = scorer.early_stop(X, cutoff, state["replay_interval"])
-    routing, decision, statistic = classify(u, v, eligible, gate, final, stopped)
-    compute_p = np.isfinite(statistic)
-    if state["replay_mode"] == "tile_compact":
-        compute_p &= decision == 1
-    p_values = np.full(len(predictors), np.nan)
-    p_values[compute_p] = chi2.sf(statistic[compute_p], 1)
-    for i, pid in enumerate(predictors):
-        if stopped[i]:
-            low, high, flag = 0., cutoff, "BOUNDED"
-        elif math.isfinite(statistic[i]):
-            low = high = float(statistic[i])
-            flag = "OK"
-        else:
-            low, high, flag = 0., None, "SINGULAR_PREDICTOR_AFTER_KINSHIP"
-        rows.append((int(pid), response, int(routing[i]), int(decision[i]), low, high,
-                     float(p_values[i]) if math.isfinite(p_values[i]) else None, flag))
-    kernels.metric("tree_terms", terms)
-    kernels.metric("possible_tree_terms", X.size)
-    kernels.metric("early_stopped_pairs", int(stopped.sum()))
-    kernels.metric("exact_pairs", len(predictors) - int(stopped.sum()))
-    kernels.metric("exact_worker_seconds", time.perf_counter() - started)
-    return rows
-
-
-BOUND_MARGIN = 1e-9
-
-
-def early_stop_with_saved_u(self, X, cutoff, interval):
-    """Use the sieve's score numerator in the unchanged v0.9.5 tree kernel."""
-    u = kernels._STATE["diagonal_u"]
-    upper_u = np.abs(u) + BOUND_MARGIN * np.maximum(1., np.abs(u))
-    limit = np.maximum(upper_u ** 2 / cutoff, 1e-12)
-    limit += BOUND_MARGIN * np.maximum(1., limit)
-    v, stopped, terms = contrast_norms_until(
-        *self.tree_indices, *self.coefficients, self.project(X), limit, interval)
-    v[stopped] = np.nan
-    return u, v, stopped, terms
-
-
-def weighted_variance(present, total):
-    return present * (1. - present / total)
-
-
-def diagonal_decisions(u_low, u_high, v_lower, v_upper, eligible, gate, final):
-    lower = v_lower - BOUND_MARGIN * np.maximum(1., np.abs(v_lower))
-    upper = v_upper + BOUND_MARGIN * np.maximum(1., np.abs(v_upper))
-    valid = (lower > 1e-12) & np.isfinite(u_high) & np.isfinite(lower) & np.isfinite(upper)
-    route = np.where(u_low >= gate * upper, 1, np.where(u_high < gate * lower, -1, 0))
-    decision = np.where(u_low >= final * upper, 1, np.where(u_high < final * lower, -1, 0))
-    decision = np.where(eligible, decision, -2)
-    settled = valid & (route != 0) & (decision != 0)
-    return settled, route, decision, lower, upper
-
-
-def two_sided_tree_rows(X, cache, response, predictors, eligible, gate, final):
-    state = kernels._STATE
-    if cache["tau"] == 0.:
-        return ORIGINAL_FAST_TREE_ROWS(X, cache, response, predictors, eligible, gate, final)
-    started = time.perf_counter()
-    settings, model_cache = state["settings"], state["score_cache"]
-    key = ("diagonal", response)
-    if key in model_cache:
-        moments, weight_sum, inflation, tighter, tighter_sum = model_cache.get(key)
-    else:
-        weights = cache["weights"]
-        scale = cache["tau"] * settings["lambda_upper"]
-        moments = np.column_stack((cache["y"] - cache["mu"], weights))
-        weight_sum = weights.sum()
-        inflation = 1. + scale * weights.max()
-        tighter = weights / (1. + scale * weights) if settings["bound_rounds"] == 2 else None
-        tighter_sum = tighter.sum() if tighter is not None else None
-        size = 256 + moments.nbytes + (tighter.nbytes if tighter is not None else 0)
-        model_cache.put(key, (moments, weight_sum, inflation, tighter, tighter_sum), size)
-
-    u, present = (X.T @ moments).T
-    u_abs = np.abs(u)
-    guard = BOUND_MARGIN * np.maximum(1., u_abs)
-    u_low, u_high = np.maximum(0., u_abs - guard)**2, (u_abs + guard)**2
-    v_upper = weighted_variance(present, weight_sum)
-    v_lower = v_upper / inflation
-    settled, route, decision, lo, hi = diagonal_decisions(
-        u_low, u_high, v_lower, v_upper, eligible, gate, final)
-    first = int(settled.sum())
-    if tighter is not None:
-        pending = np.flatnonzero(~settled)
-        if pending.size:
-            columns = X if pending.size == X.shape[1] else X[:, pending]
-            v_lower[pending] = np.maximum(v_lower[pending],
-                weighted_variance(columns.T @ tighter, tighter_sum))
-            settled, route, decision, lo, hi = diagonal_decisions(
-                u_low, u_high, v_lower, v_upper, eligible, gate, final)
-
-    resolved_by_round_two = int(settled.sum()) - first
-    would_accept = settled & (decision == 1)
-    if not state["defer_significant_p"]:
-        settled &= ~would_accept
-    accepted = int(np.count_nonzero(settled & (decision == 1)))
-    kernels.metric("diagonal_pairs_checked", X.shape[1])
-    kernels.metric("diagonal_round_one_resolved", first)
-    kernels.metric("diagonal_round_two_resolved", resolved_by_round_two)
-    kernels.metric("diagonal_certified_significant", int(would_accept.sum()))
-    kernels.metric("diagonal_significant_p_deferred", accepted)
-    kernels.metric("diagonal_resolved", int(settled.sum()))
-    kernels.metric("bound_decided_pairs", int(settled.sum()))
-    kernels.metric("possible_tree_terms", X.shape[0] * int(settled.sum()))
-    rows = [(int(predictors[i]), response, int(route[i]), int(decision[i]),
-             float(u_low[i] / hi[i]), float(u_high[i] / lo[i]), None, CERTIFIED)
-            for i in np.flatnonzero(settled)]
-    kernels.metric("diagonal_worker_seconds", time.perf_counter() - started)
-
-    remaining = np.flatnonzero(~settled)
-    if remaining.size:
-        if remaining.size == X.shape[1]:
-            arguments = X, cache, response, predictors, eligible, gate, final
-            state["diagonal_u"] = u
-        else:
-            arguments = (X[:, remaining], cache, response, [predictors[i] for i in remaining],
-                         eligible[remaining], gate, final)
-            state["diagonal_u"] = u[remaining]
-        try:
-            rows.extend(ORIGINAL_FAST_TREE_ROWS(*arguments))
-        finally:
-            del state["diagonal_u"]
-    return rows
-
-
-def check_for_compact(db, pairs):
-    hits = {}
-    for block in batches(pairs, 400):
-        values = ",".join(["(?,?)"] * len(block))
-        sql = (f"WITH requested(u,v) AS (VALUES {values}) "
-               "SELECT c.u,c.v,c.final FROM requested r "
-               "JOIN compact_rejections c ON (r.u,r.v)=(c.u,c.v)")
-        hits.update(((u, v), (-1, final)) for u, v, final in db.execute(
-            sql, [i for pair in block for i in pair]))
-    return hits
-
-
-def evaluate_with_compact(db, pairs, pool, args, screening=False, *, return_mapping=False):
-    requested = sorted({tuple(sorted((int(u), int(v)))) for u, v in pairs if u != v},
-                       key=lambda pair: (pair[1], pair[0]))
-    started = time.perf_counter()
-    saved = check_for_compact(db, requested)
-    args.compact_lookup_seconds += time.perf_counter() - started
-    pending = [pair for pair in requested if pair not in saved]
-    saved.update(ORIGINAL_EVALUATE(db, pending, pool, args, screening, return_mapping=True))
-    return saved if return_mapping else [saved[key] for key in requested]
-
-
-def tile_scores(db, pairs, pool, args):
-    grouped = {}
-    for u, v in pairs:
-        grouped.setdefault(v, []).append(u)
-    external = {}
-    if args._has_external_nulls:
-        for block in batches(sorted(grouped), 400):
-            marks = ",".join("?" for _ in block)
-            external.update(db.execute(f"SELECT pid,path FROM external_nulls WHERE pid IN ({marks})", block))
-            external.update(db.execute("SELECT a.pid,e.path FROM null_aliases a "
-                f"JOIN external_nulls e ON a.canonical=e.pid WHERE a.pid IN ({marks})", block))
-    jobs = ((v, sorted(us), external.get(v), True) for v, us in grouped.items())
-    rows, metrics = [], {}
-    for payload in bounded_map(pool, kernels.score_profiled, jobs, args.threads,
-                               ordered=False, response_index=0):
-        rows.extend(payload["rows"])
-        merge_metrics(metrics, payload["metrics"])
-    return rows, metrics
-
-
-class TileAdmission:
-    def __init__(self, db, pool, args, info, mode, interrupt):
-        self.pool, self.args, self.mode, self.interrupt = pool, args, mode, interrupt
-        self.eligibility = discovery_search.Eligibility(db, pool, args, info) if args.min_cell_count else None
-        self.reps = dict(db.execute("SELECT r.node,r.pid FROM reps r JOIN nodes n ON n.id=r.node WHERE n.parent=0"))
-        self.seconds = self.write_seconds = 0.
-
-    def __call__(self, db, arrays, capacity, workers=1):
-        started = time.perf_counter()
-        offset = get_meta(db, "pc_coarse_cursor", 0)
-        total = len(arrays[1])
-        if offset >= total:
-            return [], True
-        blocks, offset, active, next_right = coarse_screen.candidate_window(db, arrays, capacity, workers)
-        if not blocks:
-            raise ValueError("Candidate cursor ended before the selected interval was exhausted")
-        pruned = set()
-        if self.eligibility:
-            summary = self.eligibility.summaries(blocks)
-            pruned = {pair for pair in blocks if self.eligibility.impossible(*pair, summary)}
-        tested = {tuple(sorted((self.reps[a], self.reps[b]))): (a, b)
-                  for a, b in blocks if (a, b) not in pruned}
-        rows, metrics = tile_scores(db, tested, self.pool, self.args)
-        survivors = [tested[u, v] for u, v, gate, *_ in rows if gate != -1]
-        rejected = len(tested) - len(survivors)
-        if self.interrupt == "before":
-            raise InterruptedReplay("before tile commit")
-        writing = time.perf_counter()
-        with db:
-            if self.mode == "tile_compact":
-                db.executemany("INSERT INTO compact_rejections VALUES (?,?,?)",
-                               ((u, v, final) for u, v, gate, final, *_ in rows if gate == -1))
-                rows = [row for row in rows if row[2] != -1]
-            db.executemany("INSERT INTO decisions VALUES (?,?,?,?,?,?,?,?)", rows)
-            db.executemany("INSERT OR IGNORE INTO tasks(a,b) VALUES (?,?)", sorted(survivors))
-            set_meta(db, "queried_pairs_count", get_meta(db, "queried_pairs_count", 0) + len(tested))
-            coarse_screen.save_candidate_cursor(db, offset, active, next_right)
-            saved = get_meta(db, "hierarchy_metrics", {})
-            merge_metrics(saved, dict(eligibility_pruned_cross_blocks=len(pruned), representative_pruned_blocks=rejected))
-            set_meta(db, "hierarchy_metrics", saved)
-            saved = get_meta(db, "runtime_totals", {})
-            merge_metrics(saved, metrics)
-            set_meta(db, "runtime_totals", saved)
-        self.write_seconds += time.perf_counter() - writing
-        self.seconds += time.perf_counter() - started
-        if self.interrupt == "after":
-            raise InterruptedReplay("after tile commit")
-        return sorted(survivors), offset >= total
-
-
-class ReplayDatabase(sqlite3.Connection):
-    """Measure durable commits and optionally combine writes within a frontier."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.checkpoint_commits = 0
-        self.checkpoint_commit_seconds = 0.
-        self.write_sections = 0
-        self.committed_changes = 0
-        self.combine_limit = 0
-        self.interrupt_at = None
-
-    def checkpoint(self):
-        if not self.in_transaction:
-            return
-        if self.interrupt_at == "before":
-            raise InterruptedReplay("before combined checkpoint commit")
-        started = time.perf_counter()
-        self.commit()
-        self.checkpoint_commit_seconds += time.perf_counter() - started
-        self.checkpoint_commits += 1
-        self.committed_changes = self.total_changes
-        if self.interrupt_at == "after":
-            raise InterruptedReplay("after combined checkpoint commit")
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if exc_type is not None:
-            return super().__exit__(exc_type, exc_value, traceback)
-        if self.in_transaction:
-            self.write_sections += 1
-            if self.total_changes - self.committed_changes >= self.combine_limit:
-                self.checkpoint()
-        return False
-
-
-def open_replay_database(path, memory_mb):
-    # Keep the production SQLite settings for every benchmark mode.
-    factory = partial(sqlite3.connect, factory=ReplayDatabase)
-    with patch.object(sqlite3, "connect", factory):
-        return connect(path, memory_mb)
-
-
-class ReplayCoordinator:
-    def __init__(self, combine):
-        self.combine = combine
-        self.fresh = {}
-        self.reused_gate_decisions = 0
-
-    def admit(self, db, arrays, capacity, reps, pool, args, eligibility):
-        self.fresh.clear()
-        if self.combine:
-            # The previous frontier is complete. Publish it before opening the next.
-            db.checkpoint()
-
-        def remember_rows(pool, function, jobs, threads, **kwargs):
-            for payload in bounded_map(pool, function, jobs, threads, **kwargs):
-                if function is kernels.score_profiled:
-                    self.fresh.update(((u, v), (gate, final))
-                                      for u, v, gate, final, *_ in payload["rows"] if gate != -1)
-                yield payload
-
-        with patch.object(discovery_search, "bounded_map", remember_rows):
-            return ORIGINAL_ADMISSION(db, arrays, capacity, reps, pool, args, eligibility)
-
-    def evaluate(self, db, pairs, pool, args, screening=False, *, return_mapping=False):
-        if not (self.fresh and screening and return_mapping):
-            return ORIGINAL_EVALUATE(db, pairs, pool, args, screening, return_mapping=return_mapping)
-        known, pending = {}, []
-        for u, v in pairs:
-            if u == v:
-                continue
-            key = (int(u), int(v)) if u < v else (int(v), int(u))
-            if key in self.fresh:
-                known[key] = self.fresh[key]
-            else:
-                pending.append(key)
-        self.reused_gate_decisions += len(known)
-        if pending:
-            known.update(ORIGINAL_EVALUATE(db, pending, pool, args, screening, return_mapping=True))
-        return known
-
-
-def source_inputs(cli):
-    run = cli.run.resolve()
-    run_manifest = run / "run_identity.json"
-    manifest = json.loads(run_manifest.read_text())
+def source_inputs(args):
+    run, out = args.run.resolve(), args.out.resolve()
+    manifest_path = run / "run_identity.json"
+    manifest = json.loads(manifest_path.read_text())
     work = Path(manifest.get("work_directory", run / ".kovar_work")).resolve()
-    if cli.out.resolve().is_relative_to(run) or cli.out.resolve().is_relative_to(work):
-        raise ValueError("Put the benchmark output outside the source results and work directories")
-    info = json.loads((work / "prepared.json").read_text())
+    if out.is_relative_to(run) or out.is_relative_to(work) or work.is_relative_to(out):
+        raise ValueError("Put the benchmark output in a separate directory")
     settings = manifest["settings"]
-    if settings.get("search") != "hierarchy" or settings.get("coarse_screen") != "pc":
-        raise ValueError("Replay needs a source hierarchy with a completed PC screen")
-    if any(mode in V095_MODES for mode in cli.modes):
-        if settings.get("null_backend") != "tree" or settings.get("exact") or not (work / "pattern_presence.npy").is_file():
-            raise ValueError("v095 modes need a v0.9.5 non-exact tree checkpoint with a completed PC screen")
+    if (settings.get("search") != "hierarchy" or settings.get("coarse_screen") != "pc"
+            or settings.get("null_backend") != "tree" or settings.get("exact")
+            or not (work / "pattern_presence.npy").is_file()):
+        raise ValueError("Use a saved non-exact tree discovery run with a completed PC shortlist")
     with closing(sqlite3.connect((work / "work.sqlite").as_uri() + "?mode=ro", uri=True)) as source:
         screen = get_meta(source, "coarse_screen_summary")
-    if not screen or screen["selected_pairs"] <= cli.start:
-        raise ValueError("Start position is outside the completed PC-screen candidate list")
+    if not screen or args.start >= screen["selected_pairs"]:
+        raise ValueError("Start position is outside the completed PC shortlist")
     roots, selected, offsets = coarse_screen.open_candidates(work, screen["selected_pairs"])
-    end = min(cli.start + cli.pairs, len(selected))
-    array = selected[cli.start:end]
-    arrays = roots, array, np.clip(offsets, cli.start, end) - cli.start
-    identity = dict(source_run=digest(run_manifest), prepared=digest(work / "prepared.json"),
-                    benchmark=digest(Path(__file__)), scorer=digest(Path(kernels.__file__).with_name("tree_score.py")),
-                    start=cli.start, end=end, threads=cli.threads, memory_gb=cli.memory_gb,
-                    batch_size=cli.batch_size, early_check_interval=cli.early_check_interval,
-                    zero_tau=cli.zero_tau, bound_rounds=cli.bound_rounds,
-                    runtime_source={Path(module.__file__).name: digest(Path(module.__file__))
-                                    for module in (kernels, discovery_search, coarse_screen, tree_matrix_replay)})
-    if settings.get("null_backend") == "tree" and (work / "tree.npz").is_file():
-        with np.load(work / "tree.npz", allow_pickle=False) as tree:
-            sibling_nodes = tree_matrix_replay.sibling_indices(tree["left"], tree["right"], tree["tip"])
-        identity["sibling_tip_pairs"] = len(sibling_nodes)
-    return work, info, settings, screen, arrays, identity
+    end = min(args.start + args.pairs, len(selected))
+    arrays = roots, selected[args.start:end], np.clip(offsets, args.start, end) - args.start
+    prepared = work / "prepared.json"
+    identity = dict(source=digest(manifest_path), prepared=digest(prepared), script=digest(Path(__file__)),
+                    code={Path(module.__file__).name: digest(Path(module.__file__))
+                          for module in (discovery_search, discovery_score, coarse_screen, tree_score)},
+                    start=args.start, end=end, threads=args.threads, memory_gb=args.memory_gb,
+                    batch_size=args.batch_size)
+    return work, json.loads(prepared.read_text()), settings, screen, arrays, identity
 
 
-def create_seed(out, source_work, data, arrays, screen):
+def create_seed(out, work, arrays, screen):
+    pending = out / "seed.partial.sqlite"
     target = out / "seed.sqlite"
+    pending.unlink(missing_ok=True)
     root_ids = arrays[0][np.unique(arrays[1])]
-    presence = np.empty(data["patterns"], dtype=np.int32)
-    with closing(sqlite3.connect(target.as_uri(), uri=True, timeout=120)) as db:
-        db.execute("PRAGMA temp_store=FILE")
+    with closing(sqlite3.connect(pending.as_uri(), uri=True, timeout=120)) as db:
         schema(db)
-        source = (source_work / "work.sqlite").as_uri() + "?mode=ro"
+        source = (work / "work.sqlite").as_uri() + "?mode=ro"
         db.execute("ATTACH DATABASE ? AS source", (source,))
         with db:
             db.execute("CREATE TEMP TABLE wanted_roots(id INTEGER PRIMARY KEY)")
@@ -509,236 +92,176 @@ def create_seed(out, source_work, data, arrays, screen):
             ) INSERT INTO nodes SELECT n.* FROM source.nodes n JOIN keep USING (id)""")
             for table in ("members", "reps", "block_eligibility"):
                 db.execute(f"INSERT INTO {table} SELECT s.* FROM source.{table} s JOIN nodes n ON n.id=s.node")
-            db.execute("INSERT INTO external_nulls SELECT * FROM source.external_nulls")
-            db.execute("INSERT INTO null_aliases SELECT * FROM source.null_aliases")
-            for pid, present in db.execute("SELECT id,present FROM source.patterns"):
-                presence[pid] = present
+            for table in ("external_nulls", "null_aliases"):
+                db.execute(f"INSERT INTO {table} SELECT * FROM source.{table}")
             set_meta(db, "search_initialized", True)
             set_meta(db, "coarse_screen_summary", dict(screen, selected_pairs=len(arrays[1])))
             set_meta(db, "queried_pairs_count", 0)
-        db.execute("DETACH DATABASE source")
-    np.save(out / "presence.npy", presence)
+    pending.replace(target)
 
 
-def run_mode(cli, work, info, source_settings, arrays, mode):
-    destination = cli.out / mode
-    destination.mkdir(exist_ok=True)
-    database = destination / "work.sqlite"
-    if not database.exists():
-        shutil.copyfile(cli.out / "seed.sqlite", database)
+def replay(path, seed, work, info, source, arrays, cli, mode):
+    if not path.exists():
+        setup = path.with_suffix(".partial")
+        shutil.copyfile(seed, setup)
+        setup.replace(path)
+    reuse, bounds = MODES[mode]
     started = time.perf_counter()
-    incomplete = False
     budget = detect_budget(cli.memory_gb, cli.threads)
     plan = plan_workers(budget, info["n"], cli.threads, cli.batch_size)
-    family = source_settings.get("bonferroni_tests") or math.comb(info["patterns"], 2)
-    args = SimpleNamespace(**source_settings, threads=cli.threads, batch_size=cli.batch_size, tmp_dir=work,
-                           out=destination, memory_gb=budget["working_gb"], _plan=plan,
-                           compact_lookup_seconds=0.)
-    args._tiled_coarse = mode in V095_MODES
+    family = source.get("bonferroni_tests") or math.comb(info["patterns"], 2)
+    args = SimpleNamespace(**source, threads=cli.threads, tmp_dir=work, out=path.parent,
+                           batch_size=cli.batch_size, memory_gb=budget["working_gb"], _plan=plan,
+                           _tiled_coarse=True, _reuse_fresh_gates=reuse)
     settings = dict(min_cell_count=args.min_cell_count, gate_critical=float(chi2.isf(args.screen_p, 1)),
-                    final_critical=float(chi2.isf(args.alpha / family, 1)), exact=args.exact,
+                    final_critical=float(chi2.isf(args.alpha / family, 1)), exact=False,
                     require_cached_nulls=True, batch_size=args.batch_size, null_cache_format="compact",
-                    null_cache_rank=128, null_backend=getattr(args, "null_backend", "dense"), workers=cli.threads, **plan)
-    if mode in V095_MODES:
-        settings["fast_tree_scores"] = True
-    if mode in BOUNDS_MODES:
-        kinship = np.load(work / "K.npy", mmap_mode="r")
-        # The maximum absolute row sum upper-bounds the spectral radius.
-        largest = max(float(np.abs(kinship[start:start + 256]).sum(axis=1).max())
-                      for start in range(0, len(kinship), 256))
-        settings.update(bound_rounds=cli.bound_rounds,
-                        lambda_upper=largest + BOUND_MARGIN * max(1., largest))
-        del kinship
-    worker_args = (str(work), info, settings, mode, str(cli.out / "presence.npy"),
-                   cli.early_check_interval, cli.zero_tau)
-    with closing(open_replay_database(database, min(64, budget["working_gb"] * 1024 * .05))) as db:
-        if get_meta(db, "search_complete"):
-            return False
-        args._has_external_nulls = db.execute("SELECT 1 FROM external_nulls LIMIT 1").fetchone() is not None
-        with ResponsePool(cli.threads, initialize_worker, worker_args,
-                          canonical_responses=discovery_nulls.open_aliases(work)) as pool:
-            tiled = mode.startswith("tile_")
-            tiles = TileAdmission(db, pool, args, info, mode, cli.interrupt) if tiled else None
-            producer = tiles if tiled else coarse_screen.candidate_tasks
-            evaluate = evaluate_with_compact if mode == "tile_compact" else ORIGINAL_EVALUATE
-            combined = mode == "v095_bounds_io"
-            coordinator = ReplayCoordinator(combined) if mode in IO_MODES else None
-            admission = coordinator.admit if coordinator else ORIGINAL_ADMISSION
-            if coordinator:
-                evaluate = coordinator.evaluate
-            mapper = (partial(tree_matrix_replay.map_with_sibling_tiles, width=cli.batch_size)
-                      if mode == "v095_tree_matrix" else bounded_map)
-            if combined:
-                # Flush after a frontier or after this many changes at a complete
-                # production write section. A tile's cursor and rows stay atomic.
-                db.combine_limit = 16_384
-                db.interrupt_at = cli.interrupt
-            with patch.object(coarse_screen, "open_candidates", return_value=arrays), \
-                 patch.object(coarse_screen, "candidate_tasks", producer), \
-                 patch.object(discovery_search, "admit_coarse_tile", admission), \
-                 patch.object(discovery_search, "bounded_map", mapper), \
-                 patch.object(discovery_search, "evaluate", evaluate):
-                try:
+                    null_cache_rank=128, null_backend="tree", workers=cli.threads, fast_tree_scores=True, **plan)
+    if bounds:
+        settings["tree_bound_eigenvalue"] = tree_score.kinship_eigenvalue_bound(np.load(work / "K.npy", mmap_mode="r"))
+    with closing(connect(path, min(64, budget["working_gb"] * 1024 * .05))) as db:
+        if not get_meta(db, "search_complete"):
+            args._has_external_nulls = db.execute("SELECT 1 FROM external_nulls LIMIT 1").fetchone() is not None
+            with db:
+                set_meta(db, "replay_has_resumed", bool(get_meta(db, "pc_coarse_cursor", 0)))
+            pool_args = (str(work), info, settings)
+            with ResponsePool(cli.threads, initialize_worker, pool_args,
+                              canonical_responses=discovery_nulls.open_aliases(work)) as pool:
+                with patch.object(coarse_screen, "open_candidates", return_value=arrays):
                     discovery_search.search(db, info, pool, args)
-                    db.checkpoint()
-                except InterruptedReplay as error:
-                    db.rollback()
-                    print(f"[{mode}] intentional interruption {error}", flush=True)
-                    incomplete = True
-                finally:
-                    db.combine_limit = 0
-                    db.interrupt_at = None
-        seconds = time.perf_counter() - started
-        with db:
-            saved = get_meta(db, "replay_timing", {})
-            merge_metrics(saved, dict(seconds=seconds, invocations=1, interruptions=int(incomplete),
-                                      tile_seconds=tiles.seconds if tiles else 0.,
-                                      tile_write_seconds=tiles.write_seconds if tiles else 0.,
-                                      compact_lookup_seconds=args.compact_lookup_seconds,
-                                      checkpoint_commits=db.checkpoint_commits,
-                                      checkpoint_commit_seconds=db.checkpoint_commit_seconds,
-                                      write_sections=db.write_sections,
-                                      reused_gate_decisions=coordinator.reused_gate_decisions if coordinator else 0))
-            set_meta(db, "replay_timing", saved)
-        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    return incomplete
+            with db:
+                set_meta(db, "replay_wall_seconds", time.perf_counter() - started)
+        elapsed = get_meta(db, "replay_wall_seconds")
+        resumed = elapsed is None or get_meta(db, "replay_has_resumed", False)
+        return dict(mode=mode, wall_seconds=elapsed, resumed=resumed,
+                    coarse_per_second=len(arrays[1]) / elapsed if elapsed else None,
+                    runtime=get_meta(db, "runtime_totals", {}),
+                    significant=db.execute("SELECT count(*) FROM decisions WHERE final=1").fetchone()[0])
 
 
-def differences(db, reference, variant, *, defer_p=False):
-    db.execute("ATTACH DATABASE ? AS baseline", (reference.as_uri() + "?mode=ro",))
-    db.execute("ATTACH DATABASE ? AS trial", (variant.as_uri() + "?mode=ro",))
-    try:
+def compare(reference, trial):
+    with closing(sqlite3.connect(":memory:", uri=True)) as db:
+        for name, path in (("reference", reference), ("trial", trial)):
+            db.execute(f"ATTACH DATABASE ? AS {name}", (path.as_uri() + "?mode=ro",))
         queries = {
             "pair_decisions": ("SELECT u,v,gate,final FROM {db}.decisions UNION ALL "
                                "SELECT u,v,-1,final FROM {db}.compact_rejections"),
-            "child_tasks": ("SELECT a,b,t.done FROM {db}.tasks t JOIN {db}.nodes x ON x.id=t.a "
-                            "JOIN {db}.nodes y ON y.id=t.b WHERE x.parent!=0 OR y.parent!=0"),
+            "tasks": "SELECT a,b,done FROM {db}.tasks",
         }
         counts = {}
         for label, query in queries.items():
-            first, second = (query.format(db=s) for s in ("baseline", "trial"))
-            for lhs, rhs, suffix in ((first, second, "missing"), (second, first, "extra")):
+            left, right = (query.format(db=name) for name in ("reference", "trial"))
+            for first, second, suffix in ((left, right, "missing"), (right, left, "extra")):
                 counts[f"{label}_{suffix}"] = db.execute(
-                    f"SELECT count(*) FROM (SELECT * FROM ({lhs}) EXCEPT SELECT * FROM ({rhs}))").fetchone()[0]
+                    f"SELECT count(*) FROM (SELECT * FROM ({first}) EXCEPT SELECT * FROM ({second}))").fetchone()[0]
         counts["significant_p_mismatches"] = db.execute("""
-            SELECT count(*) FROM baseline.decisions r JOIN trial.decisions t USING(u,v)
+            SELECT count(*) FROM reference.decisions r JOIN trial.decisions t USING(u,v)
             WHERE r.final=1 AND t.final=1 AND (
-                ((r.p IS NULL)!=(t.p IS NULL) AND NOT (? AND t.p IS NULL AND t.status=?)) OR (r.p IS NOT NULL AND t.p IS NOT NULL
-                AND abs(r.p-t.p)>1e-8*max(abs(r.p),abs(t.p),1e-300))
-            )
-        """, (defer_p, CERTIFIED)).fetchone()[0]
+                (r.p IS NULL)!=(t.p IS NULL) OR
+                (r.p IS NOT NULL AND t.p IS NOT NULL
+                 AND abs(r.p-t.p)>1e-8*max(abs(r.p),abs(t.p),1e-300)))
+        """).fetchone()[0]
         return counts
-    finally:
-        db.execute("DETACH DATABASE baseline")
-        db.execute("DETACH DATABASE trial")
 
 
-def report(out, modes, identity, arrays):
-    results = []
-    seed_bytes = (out / "seed.sqlite").stat().st_size
-    with closing(sqlite3.connect((out / "seed.sqlite").as_uri() + "?mode=ro", uri=True)) as db:
-        singleton_nodes = {node for node, in db.execute("SELECT id FROM nodes WHERE parent=0 AND size=1")}
-    singleton = np.isin(arrays[0], list(singleton_nodes))
-    singleton_pairs = sum(int(np.count_nonzero(singleton[block].all(axis=1)))
-                          for block in (arrays[1][start:start + 100_000] for start in range(0, len(arrays[1]), 100_000)))
-    breakdown = dict(singleton_singleton=singleton_pairs, with_members=len(arrays[1]) - singleton_pairs)
-    for mode in modes:
-        path = out / mode / "work.sqlite"
-        if not path.exists():
-            continue
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
-            if not get_meta(db, "search_complete"):
+def plot(summary, out):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams["svg.fonttype"] = "none"
+
+    keys = list(MODES)
+    fig, axes = plt.subplots(1, 2, figsize=(7, 3.15), layout="constrained")
+    for ax, panel, ylabel, field in zip(
+            axes, ("A", "B"), ("Search wall time (s)", "Recursive tree contrasts (millions)"),
+            ("wall_seconds", "tree_terms")):
+        for idx, key in enumerate(keys):
+            rows = [row for row in summary["runs"] if row["mode"] == key and not row["resumed"]]
+            values = ([row[field] for row in rows] if field == "wall_seconds"
+                      else [row["runtime"].get(field, 0) / 1e6 for row in rows])
+            if not values:
                 continue
-            timing = get_meta(db, "replay_timing")
-            rows = {table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-                    for table in ("decisions", "tasks", "compact_rejections")}
-            significant = db.execute("SELECT count(*) FROM decisions WHERE final=1").fetchone()[0]
-            results.append(dict(mode=mode, coarse_per_second=len(arrays[1]) / timing["seconds"],
-                                significant=significant, db_bytes=path.stat().st_size,
-                                db_growth_bytes=path.stat().st_size - seed_bytes, rows=rows,
-                                timing=timing, runtime=get_meta(db, "runtime_totals", {}),
-                                hierarchy=get_meta(db, "hierarchy_metrics", {})))
-    by_mode = {result["mode"]: result for result in results}
-    with closing(sqlite3.connect(":memory:", uri=True)) as db:
-        for result in results:
-            mode = result["mode"]
-            reference = ("v095_bounds" if mode in IO_MODES else
-                         "v095" if mode in V095_MODES else "current")
-            comparison = {}
-            speed = ""
-            if reference in by_mode and mode != reference:
-                comparison = differences(db, out / reference / "work.sqlite", out / mode / "work.sqlite",
-                                         defer_p=mode == "v095_bounds_decision")
-                result["speedup"] = by_mode[reference]["timing"]["seconds"] / result["timing"]["seconds"]
-                result["reference_mode"] = reference
-                speed = f"; {result['speedup']:.2f}x vs {reference}"
-            result["comparison"] = comparison
-            check = f"; {sum(comparison.values()):,} discrepancies" if comparison else ""
-            diagonals = ""
-            if mode in BOUNDS_MODES:
-                metrics = result["runtime"]
-                diagonals = (f"; {metrics.get('diagonal_resolved', 0):,} diagonal decisions"
-                             f"; {metrics.get('diagonal_significant_p_deferred', 0):,} exact P-values deferred")
-            matrix = ""
-            if mode == "v095_tree_matrix":
-                metrics = result["runtime"]
-                matrix = (f"; {identity['sibling_tip_pairs']:,} sibling-tip contrasts"
-                          f"; {metrics.get('sibling_early_rejections', 0):,} sibling-bound rejections"
-                          f"; {metrics.get('sibling_dense_tiles', 0):,} dense matrix tiles")
-            timing = result["timing"]
-            io = (f"; {timing['checkpoint_commits']:,} commits ({timing['checkpoint_commit_seconds']:.2f}s)"
-                  f"; {timing['reused_gate_decisions']:,} fresh gate lookups saved")
-            print(f"{mode}: {timing['seconds']:.3f}s; "
-                  f"{result['coarse_per_second']:,.0f} coarse pairs/s; "
-                  f"{result['db_bytes'] / MIB:,.1f} MiB; {result['significant']:,} significant"
-                  f"{speed}{check}{diagonals}{matrix}{io}", flush=True)
-    atomic_json(out / "summary.json", dict(selection=identity, coarse_pairs=breakdown, modes=results))
-    return int(any(count for row in results for count in row["comparison"].values()))
+            ax.bar(idx, median(values), color="#bdd8eb", edgecolor="#185681", width=.68)
+            ax.scatter(idx + np.linspace(-.13, .13, len(values)) if len(values) > 1 else [idx],
+                       values, color="#18354a", s=15, zorder=3)
+        ax.set_xticks(range(len(keys)), [LABELS[key] for key in keys], rotation=25, ha="right")
+        ax.set_ylabel(ylabel)
+        ax.set_title(panel, loc="left", fontweight="bold")
+        ax.set_ylim(bottom=0)
+        ax.spines[["top", "right"]].set_visible(False)
+    fig.savefig(out / "search_optimization.svg")
+    fig.savefig(out / "search_optimization.png", dpi=300)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", type=Path, required=True, help="Source discovery results directory")
-    parser.add_argument("--out", type=Path, required=True, help="Separate benchmark directory")
-    parser.add_argument("--start", type=int, default=0, help="Zero-based position in the saved PC candidate list")
-    parser.add_argument("--pairs", type=int, help="Number of coarse candidates (1,000,000 for tree experiments; otherwise 100,000)")
+    parser.add_argument("--run", type=Path, help="Source discovery results directory")
+    parser.add_argument("--out", type=Path, help="Separate benchmark directory")
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--pairs", type=int, default=1_000_000)
+    parser.add_argument("--repeats", type=int, default=1, help="Use four repeats to rotate all four mode positions")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--memory-gb", type=float, default=None)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--early-check-interval", type=int, default=16)
-    parser.add_argument("--zero-tau", action="store_true", help="Enable the exact zero-tau shortcut in optimized modes")
-    parser.add_argument("--modes", nargs="+", choices=MODES, default=LEGACY_MODES)
-    parser.add_argument("--bound-rounds", type=int, choices=(1, 2), default=1,
-                        help="For v095 bounds, optionally tighten the lower bound of unresolved pairs")
-    parser.add_argument("--interrupt", choices=("before", "after"), help="Stop at the first tile or combined checkpoint commit")
-    cli = parser.parse_args()
-    if cli.pairs is None:
-        cli.pairs = 1_000_000 if any(mode in TREE_MODES for mode in cli.modes) else 100_000
-    if cli.start < 0 or min(cli.pairs, cli.threads, cli.batch_size, cli.early_check_interval) < 1:
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--plot", action="store_true", help="Write PNG and SVG after replay")
+    parser.add_argument("--plot-summary", type=Path, help="Render an existing summary.json beside that file")
+    args = parser.parse_args()
+    if args.plot_summary:
+        plot(json.loads(args.plot_summary.read_text()), args.plot_summary.parent)
+        return 0
+    if args.run is None or args.out is None:
+        parser.error("--run and --out are required to replay")
+    if args.start < 0 or min(args.pairs, args.repeats, args.threads, args.batch_size) < 1:
         parser.error("Start must be nonnegative and counts must be positive")
-    if cli.interrupt and (len(cli.modes) != 1 or
-                          not (cli.modes[0].startswith("tile_") or cli.modes[0] == "v095_bounds_io")):
-        parser.error("--interrupt requires a single tile_* or v095_bounds_io mode")
-    cli.out = cli.out.resolve()
-    work, info, settings, screen, arrays, identity = source_inputs(cli)
-    cli.out.mkdir(parents=True, exist_ok=True)
-    lock_path = cli.out / ".replay.lock.sqlite"
-    with closing(sqlite3.connect(lock_path, timeout=0)) as lock:
+    args.out = args.out.resolve()
+    work, info, source, screen, arrays, identity = source_inputs(args)
+    args.out.mkdir(parents=True, exist_ok=True)
+    lockfile = args.out / ".replay.lock.sqlite"
+    with closing(sqlite3.connect(lockfile, timeout=0)) as lock:
         lock.execute("BEGIN EXCLUSIVE")
-        manifest = cli.out / "replay_identity.json"
+        manifest = args.out / "replay_identity.json"
         if manifest.exists():
             if json.loads(manifest.read_text()) != identity:
-                raise ValueError("This benchmark belongs to a different interval, configuration or code version")
+                raise ValueError("Choose a new output folder for a different code version, interval or execution settings")
         else:
-            if any(path.name not in (lock_path.name, lock_path.name + "-journal") for path in cli.out.iterdir()):
-                raise ValueError("Choose an empty benchmark directory")
-            create_seed(cli.out, work, info, arrays, screen)
+            if any(path.name not in (lockfile.name, lockfile.name + "-journal", "seed.sqlite", "seed.partial.sqlite")
+                   for path in args.out.iterdir()):
+                raise ValueError("Choose an empty benchmark output folder")
+            create_seed(args.out, work, arrays, screen)
             atomic_json(manifest, identity)
-        for mode in dict.fromkeys(cli.modes):
-            print(f"[{mode}] replaying coarse interval [{identity['start']:,}, {identity['end']:,})", flush=True)
-            if run_mode(cli, work, info, settings, arrays, mode):
-                return 75
-        return report(cli.out, tuple(m for m in MODES if (cli.out / m).is_dir()), identity, arrays)
+        results = []
+        modes = list(MODES)
+        for repeat in range(args.repeats):
+            destination = args.out / f"repeat_{repeat + 1:02d}"
+            destination.mkdir(exist_ok=True)
+            offset = repeat % len(modes)
+            order = modes[offset:] + modes[:offset]
+            for mode in order:
+                print(f"[{repeat + 1}/{args.repeats} {mode}] PC candidates [{identity['start']:,}, {identity['end']:,})",
+                      flush=True)
+                row = replay(destination / f"{mode}.sqlite", args.out / "seed.sqlite",
+                             work, info, source, arrays, args, mode)
+                row.update(repeat=repeat + 1, order=order.index(mode) + 1)
+                results.append(row)
+            reference = destination / "v095.sqlite"
+            completed = results[-len(modes):]
+            baseline = next(row for row in completed if row["mode"] == "v095")
+            for row in completed:
+                row["comparison"] = compare(reference, destination / f"{row['mode']}.sqlite") if row["mode"] != "v095" else {}
+                elapsed = row["wall_seconds"]
+                comparable = not (baseline["resumed"] or row["resumed"])
+                speedup = baseline["wall_seconds"] / elapsed if comparable else None
+                row["speedup_vs_v095"] = speedup
+                timing = f"{elapsed:.3f}s" if elapsed is not None else "untimed"
+                ratio = f"; {speedup:.2f}x" if speedup is not None else ""
+                print(f"{row['mode']}: {timing}{ratio}; {row['significant']:,} significant; "
+                      f"{sum(row['comparison'].values()):,} discrepancies", flush=True)
+            atomic_json(args.out / "summary.json", dict(selection=identity, runs=results))
+        summary = dict(selection=identity, runs=results)
+        failed = any(any(row["comparison"].values()) for row in results)
+        if args.plot and not failed:
+            plot(summary, args.out)
+        return int(failed)
 
 
 if __name__ == "__main__":
